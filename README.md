@@ -1,49 +1,130 @@
-# MiniRedis Reference
+# MiniRedis
 
-MiniRedis is a Direct-first Python reference implementation of selected Redis
-core semantics. A `DirectClient` parses binary-safe `CommandRequest` values
-into a closed typed command union; one event-loop-owned executor prepares and
-applies immutable full-key commits in mailbox order.
+MiniRedis is a compact Redis-inspired reference project for learning typed
+in-memory data structures, serialized command atomicity, expiration, eviction,
+blocking operations, Pub/Sub, persistence, and asynchronous replication loss.
+It is not a production-compatible Redis replacement.
 
-Phase 1 implements String, Hash, List, Set, and Sorted Set values. Its command
-surface is:
+## Why Direct-first
 
-- general: `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE`;
-- String: `GET`, `SET [NX|XX] [EX seconds|PX ms]`, `INCR`, `INCRBY`;
-- Hash: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HINCRBY`;
-- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`;
-- Set: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SINTER`;
-- Sorted Set: `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE`,
-  `ZRANGEBYSCORE`;
-- expiry: `EXPIRE`, `TTL`, `PTTL`, `PERSIST`.
+The primary API accepts binary-safe `CommandRequest` values. Direct calls and
+RESP2/TCP calls meet at the same parser, typed command model, and serialized
+executor; sockets and RESP frames do not own command semantics.
 
-Every accepted command is atomic, but Phase 1 does not implement transactions.
-TTL deadlines are absolute wall-clock milliseconds with lazy and bounded active
-cleanup. Memory limits use deterministic logical byte accounting and exact LRU;
-they do not model Python allocator size or Redis's sampled eviction.
-`SMEMBERS`, `SINTER`, and `HGETALL` result order is unspecified even though the
-implementation emits deterministic test-friendly order.
+```text
+DirectClient ───────────────┐
+                            ├─> CommandRequest -> parser -> CommandExecutor
+TCP -> RESP2 decoder ───────┘                         |
+                                                       v
+                         prepare -> AOF barrier -> apply CommitBatch
+                                              -> ReplicaSink -> reply/outbox
+```
 
-Phase 1 does not claim `BLPOP`, Pub/Sub, persistence, replication, RESP, or TCP
-support. Those boundaries are added only by their later implementation phases.
+## Supported commands
 
-## Async semantics
+| Area | Commands |
+|---|---|
+| General | `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE` |
+| String | `GET`, `SET [NX\|XX] [EX seconds\|PX ms]`, `INCR`, `INCRBY` |
+| Hash | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HINCRBY` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP` |
+| Set | `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SINTER` |
+| Sorted Set | `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZRANGEBYSCORE` |
+| Expiry | `EXPIRE`, `TTL`, `PTTL`, `PERSIST` |
+| Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
 
-MiniRedis implements BLPOP with executor-owned FIFO waiter indexes and
-deterministic injected timers. Push plus all resulting blocked pops is one
-CommitBatch; cancellation, timeout, disconnect, and shutdown are ordered
-control messages.
+Keys, fields, members, values, and channels are `bytes`.
 
-Pub/Sub is exact-channel, ephemeral, bounded, and at-most-once. A full endpoint
-is closed without blocking other clients. Runtime shutdown first quiesces
-control producers, then executes one barrier and drains accepted output for a
-bounded grace period. These mechanisms do not provide reliable queues,
-delivery acknowledgment, replay, pattern subscriptions, or a general event
-bus.
+## Quick start: Direct API
 
-Run the complete suite from this directory:
+```python
+import asyncio
+
+from miniredis import CommandRequest, MiniRedis
+
+
+async def main():
+    async with MiniRedis.open() as redis:
+        client = redis.direct_client()
+        print(await client.execute(CommandRequest(b"SET", (b"k", b"1"))))
+        print(await client.execute(CommandRequest(b"INCR", (b"k",))))
+
+
+asyncio.run(main())
+```
+
+## Optional RESP2 server and redis-py
+
+```python
+import asyncio
+
+from miniredis import MiniRedis
+
+
+async def main():
+    async with MiniRedis.open() as redis:
+        server = await redis.start_tcp("127.0.0.1", 0)
+        print(server.address)
+        await asyncio.Event().wait()
+
+
+asyncio.run(main())
+```
+
+redis-py interoperability is a development smoke, forced to RESP2 with client
+metadata disabled:
+
+```bash
+uv run pytest tests/interop/test_redis_py_resp2.py -q
+```
+
+## Deterministic reliability experiments
+
+```bash
+uv run pytest tests/reliability/test_commit_barrier.py -q
+uv run pytest tests/reliability/test_restart.py -q
+uv run pytest tests/reliability/test_lost_acked_write.py -q
+uv run pytest tests/reliability/test_final_acceptance.py -q
+```
+
+These tests use injected clocks, schedulers, persistence failures, and replica
+gates. The acknowledged-write-loss test deliberately pauses replica apply,
+acknowledges a primary write, simulates primary crash without replica drain,
+and promotes the lagging replica.
+
+## Compatibility simplifications
+
+- Five values use Python containers, not Redis internal encodings.
+- Memory is a deterministic logical budget, not allocator/RSS accounting.
+- LRU is exact with a binary-key tie-break, not sampled Redis LRU.
+- AOF and snapshots are custom versioned formats, not Redis AOF or RDB.
+- Replication is one in-process `ReplicaSink`, not a network protocol.
+- RESP2/TCP is a correctness adapter with one pending request per session, not a
+  throughput target.
+
+See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
+
+## Non-goals
+
+MiniRedis does not implement RESP3, inline protocol, `MULTI`/`EXEC`/`WATCH`,
+Pipeline semantics, Lua, Streams, ACL, multiple databases, Modules, AOF
+rewrite, network replication, PSYNC, backlog, heartbeat, ACK quorum, election,
+Sentinel, Cluster, authentication, TLS, or production performance parity.
+
+## Test and SLOC commands
 
 ```bash
 uv sync --dev
 uv run pytest -q
+uv run python -m compileall -q src tests
+uv run python tools/count_sloc.py
 ```
+
+SLOC reports production Python, test Python, and Markdown documentation
+separately. It is reported, never accepted or rejected by a size range.
+
+## Course separation
+
+This repository is the finished reference project. Course material is separate
+and has not yet been generated; there is no `course/` directory or fixed
+chapter count here.

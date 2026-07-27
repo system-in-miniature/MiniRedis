@@ -72,6 +72,13 @@ class RuntimeStats:
     replica_links: int
     accepting_users: bool
     snapshot_jobs: int
+    aof_tasks: int
+    control_producers: int
+    executor_tasks: int
+    replica_tasks: int
+    tcp_servers: int
+    tcp_sessions: int
+    tcp_tasks: int
 
 
 @dataclass(slots=True)
@@ -684,6 +691,9 @@ class MiniRedis:
         return self.executor.accepted_tokens
 
     def debug_stats(self) -> RuntimeStats:
+        servers = tuple(self._tcp_servers)
+        sinks = tuple(self._owned_replica_sinks)
+        worker = self.executor.worker_task
         return RuntimeStats(
             accepted_requests=self.executor.accepted_request_count,
             pending_futures=self.executor.pending_request_count,
@@ -702,6 +712,15 @@ class MiniRedis:
                 self._snapshot_manager is not None
                 and self._snapshot_manager.active_job is not None
             ),
+            aof_tasks=(
+                0 if self._aof_writer is None else self._aof_writer.owned_task_count
+            ),
+            control_producers=len(self._control_producers),
+            executor_tasks=int(worker is not None and not worker.done()),
+            replica_tasks=sum(sink.owned_task_count for sink in sinks),
+            tcp_servers=len(servers),
+            tcp_sessions=sum(server.session_count for server in servers),
+            tcp_tasks=sum(server.owned_task_count for server in servers),
         )
 
     def _debug_notify(self) -> None:

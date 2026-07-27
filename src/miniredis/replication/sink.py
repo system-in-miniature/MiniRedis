@@ -89,6 +89,13 @@ class ReplicaSink:
             queued=len(self._queue),
         )
 
+    @property
+    def owned_task_count(self) -> int:
+        return sum(
+            task is not None and not task.done()
+            for task in (self._attach_task, self._task)
+        )
+
     def pause(self) -> None:
         self._apply_allowed.clear()
 

@@ -163,6 +163,13 @@ class AofWriter:
     def failure(self) -> BaseException | None:
         return self._failure
 
+    @property
+    def owned_task_count(self) -> int:
+        return sum(
+            task is not None and not task.done()
+            for task in (self._worker, self._sync_task)
+        )
+
     async def start(self) -> None:
         if self._worker is not None:
             return
@@ -261,9 +268,7 @@ class AofWriter:
 
     def _writer_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
-            error: BaseException | None = RuntimeError(
-                "AOF writer task was cancelled"
-            )
+            error: BaseException | None = RuntimeError("AOF writer task was cancelled")
         else:
             error = task.exception()
         if error is None:
@@ -353,11 +358,7 @@ class AofWriter:
                     await self._sync_task
                 except asyncio.CancelledError:
                     pass
-        if (
-            self._policy is AofPolicy.EVERYSEC
-            and self._dirty
-            and self._failure is None
-        ):
+        if self._policy is AofPolicy.EVERYSEC and self._dirty and self._failure is None:
             try:
                 await self._sync_dirty()
             except BaseException as exc:

@@ -1,2 +1,1 @@
-"""Command values, parsing, validation, and dispatch."""
-
+"""Typed command requests, parsing, and model package."""

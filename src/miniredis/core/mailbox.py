@@ -23,6 +23,10 @@ class EventLoopMailbox[T]:
         return self._pending_users
 
     @property
+    def accepting_users(self) -> bool:
+        return self._user_open
+
+    @property
     def pending_items(self) -> int:
         return len(self._items)
 

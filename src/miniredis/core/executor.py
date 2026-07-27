@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -12,12 +13,14 @@ from miniredis.core.commit import CommitBatch, CommitOperation, CommitTrigger
 from miniredis.core.database import Database
 from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
+from miniredis.core.outbound import (
+    Abandoned,
+    RequestOutcome,
+    RequestToken,
+    Replied,
+    RuntimeClosed,
+)
 from miniredis.core.reply import Failure, Reply
-
-
-@dataclass(frozen=True, slots=True)
-class RequestToken:
-    value: int
 
 
 @dataclass(slots=True)
@@ -35,16 +38,8 @@ class SubmittedRequest:
 
 
 @dataclass(frozen=True, slots=True)
-class Replied:
-    reply: Reply
-
-
-@dataclass(frozen=True, slots=True)
-class RuntimeClosed:
-    pass
-
-
-type RequestOutcome = Replied | RuntimeClosed
+class AbandonRequest:
+    token: RequestToken
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,7 +76,9 @@ class ActiveExpireTick:
     future: asyncio.Future[int] | None = None
 
 
-type ExecutorMessage = ExecuteRequest | ActiveExpireTick | _StopExecutor
+type ExecutorMessage = (
+    ExecuteRequest | AbandonRequest | ActiveExpireTick | _StopExecutor | object
+)
 
 
 class CommandExecutor:
@@ -94,6 +91,7 @@ class CommandExecutor:
         commit_barrier: CommitBarrier,
         max_pending_commands: int,
         active_expire_sample_size: int = 20,
+        on_debug_change: Callable[[], None],
         on_terminal_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.database = database
@@ -108,6 +106,7 @@ class CommandExecutor:
         self.mailbox: EventLoopMailbox[ExecutorMessage] = EventLoopMailbox(
             max_pending_commands
         )
+        self._on_debug_change = on_debug_change
         self._on_terminal_failure = on_terminal_failure
 
         self._worker_task: asyncio.Task[None] | None = None
@@ -116,10 +115,12 @@ class CommandExecutor:
         self._close_task: asyncio.Task[None] | None = None
         self._run_gate = asyncio.Event()
         self._run_gate.set()
-        self._next_token = 0
-        self._accepted: dict[RequestToken, asyncio.Future[RequestOutcome]] = {}
+        self._request_tokens = itertools.count(1)
+        self._requests: dict[RequestToken, ExecuteRequest] = {}
+        self._accepted_tokens: list[RequestToken] = []
         self._accepted_changed = asyncio.Event()
         self._applied_batches: list[CommitBatch] = []
+        self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
         self._stopping = False
@@ -154,27 +155,50 @@ class CommandExecutor:
         if (
             not self._started
             or self._stopping
+            or not self.mailbox.accepting_users
             or (self._worker_task is not None and self._worker_task.cancelling() != 0)
             or (self._worker_task is not None and self._worker_task.done())
         ):
             return Failure("CLOSED", "runtime is closed")
-        if len(self._accepted) >= self.max_pending_commands:
+        if len(self._requests) >= self.max_pending_commands:
             return Failure("BUSY", "command queue is full")
 
-        self._next_token += 1
-        token = RequestToken(self._next_token)
+        token = RequestToken(next(self._request_tokens))
         future: asyncio.Future[RequestOutcome] = (
             asyncio.get_running_loop().create_future()
         )
         request = ExecuteRequest(token, session_id, command, future)
+        self._requests[token] = request
         if not self.mailbox.admit_user(request):
-            return Failure("CLOSED", "runtime is closed")
-        self._accepted[token] = future
+            del self._requests[token]
+            if not self.mailbox.accepting_users:
+                return Failure("CLOSED", "runtime is closed")
+            return Failure("BUSY", "command queue is full")
+        self._accepted_tokens.append(token)
         self._accepted_changed.set()
+        self._on_debug_change()
         return SubmittedRequest(token, future)
 
-    def post_control(self, message: ActiveExpireTick | _StopExecutor) -> bool:
-        return self.mailbox.post_control(message)
+    def _finish_request(
+        self,
+        token: RequestToken,
+        outcome: RequestOutcome,
+    ) -> bool:
+        message = self._requests.pop(token, None)
+        if message is None:
+            return False
+        if message.future.done():
+            raise RuntimeError(f"executor-owned Future already done: {token.value}")
+        message.future.set_result(outcome)
+        self._accepted_changed.set()
+        self._on_debug_change()
+        return True
+
+    def post_control(self, message: object) -> bool:
+        posted = self.mailbox.post_control(message)
+        if posted:
+            self._on_debug_change()
+        return posted
 
     async def _run(self) -> None:
         failure: BaseException | None = None
@@ -184,14 +208,15 @@ class CommandExecutor:
             while True:
                 message = await self.mailbox.take()
                 await self._run_gate.wait()
-                if isinstance(message, _StopExecutor):
-                    return
-                if isinstance(message, ExecuteRequest):
-                    await self._execute(message)
-                elif isinstance(message, ActiveExpireTick):
-                    deleted = await self._active_expire_once(message.now_ms)
-                    if message.future is not None and not message.future.done():
-                        message.future.set_result(deleted)
+                self._handling_message = True
+                self._on_debug_change()
+                try:
+                    if isinstance(message, _StopExecutor):
+                        return
+                    await self._dispatch(message)
+                finally:
+                    self._handling_message = False
+                    self._on_debug_change()
         except asyncio.CancelledError as error:
             failure = error
         except Exception as error:  # noqa: BLE001 - worker failures are terminal
@@ -200,8 +225,24 @@ class CommandExecutor:
             if failure is not None:
                 self._complete_terminal_failure(failure)
             else:
-                for token in tuple(self._accepted):
-                    self._finish(token, RuntimeClosed())
+                for token in tuple(self._requests):
+                    self._finish_request(token, RuntimeClosed())
+            self._on_debug_change()
+
+    async def _dispatch(self, message: object) -> None:
+        if isinstance(message, ExecuteRequest):
+            await self._execute(message)
+        elif isinstance(message, AbandonRequest):
+            self._abandon(message)
+        elif isinstance(message, ActiveExpireTick):
+            deleted = await self._active_expire_once(message.now_ms)
+            if message.future is not None and not message.future.done():
+                message.future.set_result(deleted)
+        else:
+            raise AssertionError(f"unknown executor message: {message!r}")
+
+    def _abandon(self, event: AbandonRequest) -> None:
+        self._finish_request(event.token, Abandoned())
 
     def _complete_terminal_failure(self, failure: BaseException) -> None:
         if self._terminal_cleanup_complete:
@@ -211,9 +252,10 @@ class CommandExecutor:
         self._stopping = True
         self.mailbox.close_user_admission()
         self.mailbox.drain()
-        for token in tuple(self._accepted):
-            self._finish(token, RuntimeClosed())
+        for token in tuple(self._requests):
+            self._finish_request(token, RuntimeClosed())
         self.mailbox.close_control_admission()
+        self._on_debug_change()
         if self._on_terminal_failure is not None:
             self._on_terminal_failure(failure)
 
@@ -237,7 +279,7 @@ class CommandExecutor:
 
         if plan.reply is None:
             raise AssertionError("Phase 1 execution plan requires a reply")
-        self._finish(request.token, Replied(plan.reply))
+        self._finish_request(request.token, Replied(plan.reply))
 
     async def active_expire_once(self) -> int:
         if self._worker_task is None or self._stopping:
@@ -282,12 +324,6 @@ class CommandExecutor:
         self._applied_batches.append(batch)
         return len(operations)
 
-    def _finish(self, token: RequestToken, outcome: RequestOutcome) -> None:
-        future = self._accepted.pop(token, None)
-        if future is not None and not future.done():
-            future.set_result(outcome)
-        self._accepted_changed.set()
-
     async def close(self) -> None:
         if self._close_task is None:
             self._close_task = asyncio.create_task(
@@ -308,9 +344,10 @@ class CommandExecutor:
                 self._failure = error
         finally:
             self.mailbox.drain()
-            for token in tuple(self._accepted):
-                self._finish(token, RuntimeClosed())
+            for token in tuple(self._requests):
+                self._finish_request(token, RuntimeClosed())
             self.mailbox.close_control_admission()
+            self._on_debug_change()
 
     def debug_pause(self) -> None:
         self._run_gate.clear()
@@ -319,15 +356,35 @@ class CommandExecutor:
         self._run_gate.set()
 
     async def debug_wait_accepted_at_least(self, count: int) -> None:
-        while len(self._accepted) < count:
+        while len(self._requests) < count:
             self._accepted_changed.clear()
-            if len(self._accepted) >= count:
+            if len(self._requests) >= count:
                 return
             await self._accepted_changed.wait()
 
     @property
     def debug_accepted_count(self) -> int:
-        return len(self._accepted)
+        return len(self._requests)
+
+    @property
+    def accepted_tokens(self) -> tuple[RequestToken, ...]:
+        return tuple(self._accepted_tokens)
+
+    @property
+    def accepted_request_count(self) -> int:
+        return len(self._requests)
+
+    @property
+    def pending_request_count(self) -> int:
+        return sum(not request.future.done() for request in self._requests.values())
+
+    @property
+    def idle(self) -> bool:
+        return (
+            not self._handling_message
+            and self.mailbox.pending_items == 0
+            and not self._requests
+        )
 
     @property
     def debug_failure(self) -> BaseException | None:

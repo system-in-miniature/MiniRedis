@@ -1,12 +1,17 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Callable
+from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Self
 
 from miniredis.adapters.direct import DirectClient
 from miniredis.clock import Clock, SystemClock
 from miniredis.config import MiniRedisConfig
+from miniredis.commands.model import Command
+from miniredis.commands.parser import CommandParseError, parse_command_request
+from miniredis.commands.request import CommandRequest
 from miniredis.core.commit import CommitBatch, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
@@ -14,7 +19,9 @@ from miniredis.core.executor import (
     CommitBarrier,
     NullCommitBarrier,
 )
+from miniredis.core.outbound import RequestToken
 from miniredis.core.planner import CommandPlanner
+from miniredis.core.reply import Failure
 
 
 class RuntimeState(str, Enum):
@@ -22,6 +29,17 @@ class RuntimeState(str, Enum):
     RUNNING = "running"
     DRAINING = "draining"
     CLOSED = "closed"
+
+
+@dataclass(frozen=True, slots=True)
+class RuntimeStats:
+    accepted_requests: int
+    pending_futures: int
+    waiters: int
+    subscriptions: int
+    sessions: int
+    timer_handles: int
+    owned_tasks: int
 
 
 class MiniRedis:
@@ -37,6 +55,7 @@ class MiniRedis:
         self.commit_barrier = commit_barrier
         self.database = Database()
         self.planner = CommandPlanner(config)
+        self._debug_changed = asyncio.Event()
         self.executor = CommandExecutor(
             database=self.database,
             planner=self.planner,
@@ -44,6 +63,7 @@ class MiniRedis:
             commit_barrier=commit_barrier,
             max_pending_commands=config.max_pending_commands,
             active_expire_sample_size=config.active_expire_sample_size,
+            on_debug_change=self._debug_notify,
             on_terminal_failure=self._on_executor_terminal_failure,
         )
         self.state = RuntimeState.STARTING
@@ -103,6 +123,12 @@ class MiniRedis:
         if self.state is RuntimeState.STARTING:
             self.state = RuntimeState.RUNNING
 
+    def parse(self, request: CommandRequest) -> Command | Failure:
+        try:
+            return parse_command_request(request)
+        except CommandParseError as error:
+            return Failure("ERR", str(error))
+
     def direct_client(self) -> DirectClient:
         if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
             raise RuntimeError("runtime is closed")
@@ -161,3 +187,34 @@ class MiniRedis:
 
     async def debug_wait_accepted_at_least(self, count: int) -> None:
         await self.executor.debug_wait_accepted_at_least(count)
+
+    @property
+    def debug_accepted_tokens(self) -> tuple[RequestToken, ...]:
+        return self.executor.accepted_tokens
+
+    def debug_stats(self) -> RuntimeStats:
+        return RuntimeStats(
+            accepted_requests=self.executor.accepted_request_count,
+            pending_futures=self.executor.pending_request_count,
+            waiters=0,
+            subscriptions=0,
+            sessions=0,
+            timer_handles=0,
+            owned_tasks=0,
+        )
+
+    def _debug_notify(self) -> None:
+        self._debug_changed.set()
+
+    async def _debug_wait(self, predicate: Callable[[], bool]) -> None:
+        while not predicate():
+            self._debug_changed.clear()
+            if predicate():
+                return
+            await self._debug_changed.wait()
+
+    async def debug_wait_until_queued(self, count: int) -> None:
+        await self._debug_wait(lambda: self.executor.accepted_request_count >= count)
+
+    async def debug_wait_until_idle(self) -> None:
+        await self._debug_wait(lambda: self.executor.idle)

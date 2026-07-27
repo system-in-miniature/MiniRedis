@@ -3,6 +3,17 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import TypeAlias
 
+from miniredis.commands.request import CommandRequest
+from miniredis.core.outbound import (
+    Outbound,
+    PubSubMessage,
+    PubSubPong,
+    ReplyMessage,
+    ServerClosed,
+    SubscriptionAck,
+)
+from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
+
 
 class RespProtocolError(ValueError):
     pass
@@ -167,3 +178,62 @@ def encode_frame(frame: RespFrame) -> bytes:
                 + b"".join(encode_frame(item) for item in items)
             )
     raise TypeError(f"unsupported RESP frame: {type(frame)!r}")
+
+
+def frame_to_request(frame: RespFrame) -> CommandRequest:
+    if not isinstance(frame, RespArray) or not frame.items:
+        raise RespProtocolError("command must be a non-empty array")
+    parts: list[bytes] = []
+    for item in frame.items:
+        if not isinstance(item, RespBulk) or item.data is None:
+            raise RespProtocolError("command arguments must be bulk strings")
+        parts.append(item.data)
+    return CommandRequest(parts[0], tuple(parts[1:]))
+
+
+def _reply_frame(reply: Reply) -> RespFrame:
+    match reply:
+        case Ok(message):
+            return RespSimple(message)
+        case Bytes(value):
+            return RespBulk(value)
+        case Number(value):
+            return RespInteger(value)
+        case Items(values):
+            return RespArray(tuple(_reply_frame(value) for value in values))
+        case Failure(code, message):
+            return RespError(f"{code} {message}".encode())
+    raise TypeError(f"unsupported reply: {type(reply)!r}")
+
+
+def encode_outbound(outbound: Reply | Outbound) -> bytes:
+    if isinstance(outbound, ReplyMessage):
+        return encode_frame(_reply_frame(outbound.reply))
+    if isinstance(outbound, (Ok, Bytes, Number, Items, Failure)):
+        return encode_frame(_reply_frame(outbound))
+    if isinstance(outbound, SubscriptionAck):
+        channel = RespBulk(outbound.channel)
+        return encode_frame(
+            RespArray(
+                (
+                    RespBulk(outbound.kind.encode("ascii")),
+                    channel,
+                    RespInteger(outbound.subscription_count),
+                )
+            )
+        )
+    if isinstance(outbound, PubSubMessage):
+        return encode_frame(
+            RespArray(
+                (
+                    RespBulk(b"message"),
+                    RespBulk(outbound.channel),
+                    RespBulk(outbound.payload),
+                )
+            )
+        )
+    if isinstance(outbound, PubSubPong):
+        return encode_frame(RespArray((RespBulk(b"pong"), RespBulk(outbound.payload))))
+    if isinstance(outbound, ServerClosed):
+        return encode_frame(RespError(f"CLOSED {outbound.reason}".encode()))
+    raise TypeError(f"unsupported outbound: {type(outbound)!r}")

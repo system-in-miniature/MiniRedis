@@ -64,7 +64,7 @@ class NullCommitBarrier:
 
 class Planner(Protocol):
     def plan(
-        self, database: Database, command: Command, now_ms: int
+        self, command: Command, database: Database, now_ms: int
     ) -> ExecutionPlan: ...
 
 
@@ -201,7 +201,7 @@ class CommandExecutor:
 
     async def _execute(self, request: ExecuteRequest) -> None:
         now_ms = self.clock.now_ms()
-        plan = self.planner.plan(self.database, request.command, now_ms)
+        plan = self.planner.plan(request.command, self.database, now_ms)
         if plan.operations:
             batch = CommitBatch(
                 seq=self.database.commit_seq + 1,

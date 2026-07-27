@@ -1,22 +1,22 @@
-from __future__ import annotations
-
-from miniredis.commands.model import Command, Echo, Ping
+from miniredis.commands.model import Command
 from miniredis.config import MiniRedisConfig
 from miniredis.core.database import Database
 from miniredis.core.executor import ExecutionPlan
-from miniredis.core.reply import Bytes, Failure, Ok
+from miniredis.core.planning import plan_general_and_strings
+from miniredis.core.reply import Failure
 
 
 class CommandPlanner:
     def __init__(self, config: MiniRedisConfig) -> None:
         self.config = config
 
-    def plan(self, database: Database, command: Command, now_ms: int) -> ExecutionPlan:
-        del database, now_ms
-        match command:
-            case Ping(message=None):
-                return ExecutionPlan(Ok(b"PONG"))
-            case Ping(message=message) | Echo(message=message):
-                return ExecutionPlan(Bytes(message))
-            case _:
-                return ExecutionPlan(Failure("ERR", "unknown command"))
+    def plan(
+        self,
+        command: Command,
+        database: Database,
+        now_ms: int,
+    ) -> ExecutionPlan:
+        plan = plan_general_and_strings(command, database, now_ms)
+        if plan is not None:
+            return plan
+        return ExecutionPlan(Failure("ERR", "unknown command"))

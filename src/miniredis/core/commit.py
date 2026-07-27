@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from enum import Enum
+from typing import TypeAlias
+
+
+class CommitTrigger(str, Enum):
+    CLIENT = "client"
+    ACTIVE_EXPIRE = "active_expire"
+
+
+class DeleteReason(str, Enum):
+    CLIENT = "client"
+    EXPIRED = "expired"
+    EVICTED = "evicted"
+
+
+@dataclass(frozen=True, slots=True)
+class StoredString:
+    data: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class StoredHash:
+    items: tuple[tuple[bytes, bytes], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredList:
+    items: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredSet:
+    items: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class StoredZSet:
+    items: tuple[tuple[bytes, float], ...]
+
+
+StoredValue: TypeAlias = StoredString | StoredHash | StoredList | StoredSet | StoredZSet
+
+
+@dataclass(frozen=True, slots=True)
+class StoredEntry:
+    value: StoredValue
+    expire_at_ms: int | None
+    mutation_version: int
+
+
+@dataclass(frozen=True, slots=True)
+class PutEntry:
+    key: bytes
+    entry: StoredEntry
+
+
+@dataclass(frozen=True, slots=True)
+class DeleteKey:
+    key: bytes
+    reason: DeleteReason
+
+
+CommitOperation: TypeAlias = PutEntry | DeleteKey
+
+
+@dataclass(frozen=True, slots=True)
+class CommitBatch:
+    seq: int
+    operations: tuple[CommitOperation, ...]
+    trigger: CommitTrigger
+
+    def __post_init__(self) -> None:
+        if self.seq <= 0:
+            raise ValueError("commit seq must be positive")
+        if not self.operations:
+            raise ValueError("commit batch operations cannot be empty")

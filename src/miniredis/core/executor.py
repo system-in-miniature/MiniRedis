@@ -4,13 +4,25 @@ import asyncio
 import itertools
 from bisect import bisect_right
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Protocol
 
-from miniredis.clock import Clock
-from miniredis.commands.model import BlPop, Command
-from miniredis.core.blocking import WaiterRegistry, WaiterState
-from miniredis.core.commit import CommitBatch, CommitOperation, CommitTrigger
+from miniredis.clock import Clock, TimerScheduler
+from miniredis.commands.model import BlPop, Command, ListPush
+from miniredis.core.blocking import (
+    WaiterId,
+    WaiterRegistry,
+    WaiterState,
+    WaiterWakeup,
+    prepare_list_wakeups,
+)
+from miniredis.core.commit import (
+    CommitBatch,
+    CommitOperation,
+    CommitTrigger,
+    PutEntry,
+    StoredList,
+)
 from miniredis.core.database import Database
 from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
@@ -24,7 +36,7 @@ from miniredis.core.outbound import (
     SessionEndpoint,
     TransportClosed,
 )
-from miniredis.core.reply import Failure, Reply
+from miniredis.core.reply import Bytes, Failure, Items, Reply
 
 
 @dataclass(slots=True)
@@ -46,9 +58,16 @@ class AbandonRequest:
     token: RequestToken
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(slots=True)
 class SessionClosed:
     session_id: int
+    completion: asyncio.Future[None] | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class TimeoutWaiter:
+    waiter_id: WaiterId
+    generation: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -57,6 +76,7 @@ class ExecutionPlan:
     operations: tuple[CommitOperation, ...] = ()
     touch_keys: tuple[bytes, ...] = ()
     trigger: CommitTrigger = CommitTrigger.CLIENT
+    waiter_wakeups: tuple[WaiterWakeup, ...] = ()
 
 
 class CommitBarrier(Protocol):
@@ -100,6 +120,7 @@ class CommandExecutor:
         commit_barrier: CommitBarrier,
         max_pending_commands: int,
         active_expire_sample_size: int = 20,
+        scheduler: TimerScheduler,
         on_debug_change: Callable[[], None],
         on_terminal_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
@@ -118,6 +139,7 @@ class CommandExecutor:
         self._on_debug_change = on_debug_change
         self._on_terminal_failure = on_terminal_failure
         self.waiters = WaiterRegistry(self._on_debug_change)
+        self.scheduler = scheduler
 
         self._worker_task: asyncio.Task[None] | None = None
         self._worker_started_or_done = asyncio.Event()
@@ -265,8 +287,10 @@ class CommandExecutor:
             deleted = await self._active_expire_once(message.now_ms)
             if message.future is not None and not message.future.done():
                 message.future.set_result(deleted)
+        elif isinstance(message, TimeoutWaiter):
+            self._timeout_waiter(message)
         elif isinstance(message, SessionClosed):
-            self._close_session(message.session_id)
+            self._close_session(message)
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -283,11 +307,30 @@ class CommandExecutor:
                 return
         self._finish_request(event.token, Abandoned())
 
-    def _close_session(self, session_id: int) -> None:
-        self._endpoints.pop(session_id, None)
-        for token, request in tuple(self._requests.items()):
-            if request.session_id == session_id:
-                self._finish_request(token, TransportClosed())
+    def _timeout_waiter(self, event: TimeoutWaiter) -> None:
+        waiter = self.waiters.transition(
+            event.waiter_id,
+            event.generation,
+            WaiterState.TIMED_OUT,
+        )
+        if waiter is not None:
+            self._finish_reply(waiter.token, Bytes(None))
+
+    def _close_session(self, event: SessionClosed) -> None:
+        for waiter in self.waiters.for_session(event.session_id):
+            closed = self.waiters.transition(
+                waiter.waiter_id,
+                waiter.generation,
+                WaiterState.CLOSED,
+            )
+            if closed is not None:
+                self._finish_request(closed.token, TransportClosed())
+        endpoint = self._endpoints.pop(event.session_id, None)
+        if endpoint is not None:
+            endpoint.outbox.abort("session closed")
+            endpoint.request_transport_close("session closed")
+        if event.completion is not None and not event.completion.done():
+            event.completion.set_result(None)
         self._on_debug_change()
 
     def _complete_terminal_failure(self, failure: BaseException) -> None:
@@ -315,16 +358,55 @@ class CommandExecutor:
                     if request.command.timeout_ms == 0
                     else now_ms + request.command.timeout_ms
                 )
-                self.waiters.register(
+                waiter = self.waiters.register(
                     request.token,
                     request.session_id,
                     request.command.keys,
                     deadline,
                 )
+                if waiter.deadline_ms is not None:
+                    waiter.timer = self.scheduler.call_at_ms(
+                        waiter.deadline_ms,
+                        lambda: self.post_control(
+                            TimeoutWaiter(
+                                waiter.waiter_id,
+                                waiter.generation,
+                            )
+                        ),
+                    )
+                    self._on_debug_change()
                 return
         else:
             plan = self.planner.plan(request.command, self.database, now_ms)
+            plan = self._attach_push_wakeups(request.command, plan)
         await self._apply_plan(request, plan, now_ms)
+
+    def _attach_push_wakeups(
+        self,
+        command: Command,
+        plan: ExecutionPlan,
+    ) -> ExecutionPlan:
+        if not isinstance(command, ListPush) or isinstance(plan.reply, Failure):
+            return plan
+        operations = list(plan.operations)
+        for index, operation in enumerate(operations):
+            if (
+                isinstance(operation, PutEntry)
+                and operation.key == command.key
+                and isinstance(operation.entry.value, StoredList)
+            ):
+                final, wakeups = prepare_list_wakeups(
+                    command.key,
+                    operation,
+                    self.waiters,
+                )
+                operations[index] = final
+                return replace(
+                    plan,
+                    operations=tuple(operations),
+                    waiter_wakeups=wakeups,
+                )
+        raise AssertionError("successful list push has no target PutEntry")
 
     async def _apply_plan(
         self,
@@ -348,6 +430,17 @@ class CommandExecutor:
         for key in dict.fromkeys(plan.touch_keys):
             self.database.touch_if_live(key, now_ms)
 
+        for wakeup in plan.waiter_wakeups:
+            waiter = self.waiters.transition(
+                wakeup.waiter_id,
+                wakeup.generation,
+                WaiterState.FULFILLED,
+            )
+            if waiter is not None:
+                self._finish_reply(
+                    waiter.token,
+                    Items((Bytes(wakeup.key), Bytes(wakeup.item))),
+                )
         self._finish_reply(request.token, plan.reply)
 
     async def active_expire_once(self) -> int:

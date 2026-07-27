@@ -4,7 +4,12 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from miniredis.commands.request import CommandRequest
-from miniredis.core.executor import AbandonRequest, SubmittedRequest
+from miniredis.commands.model import BlPop
+from miniredis.core.executor import (
+    AbandonRequest,
+    SessionClosed,
+    SubmittedRequest,
+)
 from miniredis.core.outbound import (
     Abandoned,
     Outbound,
@@ -14,7 +19,7 @@ from miniredis.core.outbound import (
     SessionEndpoint,
     TransportClosed,
 )
-from miniredis.core.reply import Failure, Reply
+from miniredis.core.reply import Bytes, Failure, Reply
 
 if TYPE_CHECKING:
     from miniredis.runtime import MiniRedis
@@ -60,6 +65,8 @@ class DirectClient:
                 return reply
             case RuntimeClosed():
                 return Failure("CLOSED", "runtime closed before reply")
+            case TransportClosed() if isinstance(parsed, BlPop):
+                return Bytes(None)
             case TransportClosed():
                 return Failure("CLOSED", "session closed")
             case RuntimeFailed(reason):
@@ -73,3 +80,18 @@ class DirectClient:
 
     async def close(self) -> None:
         self._closed = True
+        if self._close_task is None:
+            self._close_task = asyncio.create_task(
+                self._close_once(),
+                name=f"miniredis:direct-close:{self.session_id}",
+            )
+        await asyncio.shield(self._close_task)
+
+    async def _close_once(self) -> None:
+        completion = asyncio.get_running_loop().create_future()
+        if not self._runtime.executor.post_control(
+            SessionClosed(self.session_id, completion)
+        ):
+            self.endpoint.outbox.abort("runtime closed")
+            return
+        await asyncio.shield(completion)

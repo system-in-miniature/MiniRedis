@@ -8,7 +8,12 @@ from enum import Enum
 from typing import Any, Self
 
 from miniredis.adapters.direct import DirectClient
-from miniredis.clock import Clock, SystemClock
+from miniredis.clock import (
+    AsyncioTimerScheduler,
+    Clock,
+    SystemClock,
+    TimerScheduler,
+)
 from miniredis.config import MiniRedisConfig
 from miniredis.commands.model import Command
 from miniredis.commands.parser import CommandParseError, parse_command_request
@@ -56,9 +61,13 @@ class MiniRedis:
         *,
         clock: Clock,
         commit_barrier: CommitBarrier,
+        scheduler: TimerScheduler | None,
     ) -> None:
         self.config = config
         self.clock = clock
+        self.scheduler = (
+            AsyncioTimerScheduler(clock) if scheduler is None else scheduler
+        )
         self.commit_barrier = commit_barrier
         self.database = Database()
         self.planner = CommandPlanner(config)
@@ -70,6 +79,7 @@ class MiniRedis:
             commit_barrier=commit_barrier,
             max_pending_commands=config.max_pending_commands,
             active_expire_sample_size=config.active_expire_sample_size,
+            scheduler=self.scheduler,
             on_debug_change=self._debug_notify,
             on_terminal_failure=self._on_executor_terminal_failure,
         )
@@ -84,6 +94,7 @@ class MiniRedis:
         config: MiniRedisConfig | None = None,
         *,
         clock: Clock | None = None,
+        scheduler: TimerScheduler | None = None,
         commit_barrier: CommitBarrier | None = None,
         **options: Any,
     ) -> MiniRedis:
@@ -93,6 +104,7 @@ class MiniRedis:
         return cls(
             resolved,
             clock=clock if clock is not None else SystemClock(),
+            scheduler=scheduler,
             commit_barrier=(
                 commit_barrier if commit_barrier is not None else NullCommitBarrier()
             ),
@@ -104,12 +116,14 @@ class MiniRedis:
         config: MiniRedisConfig | None = None,
         *,
         clock: Clock | None = None,
+        scheduler: TimerScheduler | None = None,
         commit_barrier: CommitBarrier | None = None,
         **options: Any,
     ) -> MiniRedis:
         return cls.open(
             config,
             clock=clock,
+            scheduler=scheduler,
             commit_barrier=commit_barrier,
             **options,
         )
@@ -217,7 +231,7 @@ class MiniRedis:
             waiters=self.executor.waiters.active_count,
             subscriptions=0,
             sessions=self.executor.endpoint_count,
-            timer_handles=0,
+            timer_handles=self.executor.waiters.timer_count,
             owned_tasks=0,
         )
 

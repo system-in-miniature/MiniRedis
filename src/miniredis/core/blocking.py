@@ -6,6 +6,14 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Protocol
 
+from miniredis.core.commit import (
+    CommitOperation,
+    DeleteKey,
+    DeleteReason,
+    PutEntry,
+    StoredEntry,
+    StoredList,
+)
 from miniredis.core.outbound import RequestToken
 
 
@@ -152,3 +160,41 @@ class WaiterRegistry:
     @property
     def index_counts(self) -> tuple[int, int, int]:
         return len(self._by_id), len(self._by_key), len(self._by_session)
+
+
+def prepare_list_wakeups(
+    key: bytes,
+    pushed: PutEntry,
+    waiters: WaiterRegistry,
+) -> tuple[CommitOperation, tuple[WaiterWakeup, ...]]:
+    stored = pushed.entry.value
+    if not isinstance(stored, StoredList):
+        raise TypeError("push operation must contain StoredList")
+    remaining = deque(stored.items)
+    reserved: set[WaiterId] = set()
+    wakeups: list[WaiterWakeup] = []
+    while remaining:
+        waiter = waiters.peek(key, reserved)
+        if waiter is None:
+            break
+        reserved.add(waiter.waiter_id)
+        wakeups.append(
+            WaiterWakeup(
+                waiter.waiter_id,
+                waiter.generation,
+                key,
+                remaining.popleft(),
+            )
+        )
+    if remaining:
+        final: CommitOperation = PutEntry(
+            key,
+            StoredEntry(
+                StoredList(tuple(remaining)),
+                pushed.entry.expire_at_ms,
+                pushed.entry.mutation_version,
+            ),
+        )
+    else:
+        final = DeleteKey(key, DeleteReason.CLIENT)
+    return final, tuple(wakeups)

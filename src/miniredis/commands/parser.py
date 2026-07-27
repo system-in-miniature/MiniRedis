@@ -2,9 +2,16 @@ from __future__ import annotations
 
 import math
 import re
+from decimal import (
+    ROUND_CEILING,
+    Decimal,
+    InvalidOperation,
+    Overflow as DecimalOverflow,
+)
 from typing import Literal
 
 from miniredis.commands.model import (
+    BlPop,
     Command,
     Delete,
     Echo,
@@ -51,6 +58,10 @@ _INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)\Z")
 _SCORE = re.compile(
     rb"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?(?:0|[1-9][0-9]*))?\Z"
 )
+_BLPOP_TIMEOUT = re.compile(
+    rb"[+-]?(?:[0-9]+(?:\.[0-9]*)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?"
+)
+_MAX_BLPOP_TIMEOUT_MS = (1 << 63) - 1
 
 
 def parse_int64(value: bytes) -> int:
@@ -145,7 +156,7 @@ def _parse_set(args: tuple[bytes, ...]) -> SetString:
     return SetString(args[0], args[1], only_if=only_if, expire_ms=expire_ms)
 
 
-def parse_command_request(request: CommandRequest) -> Command:
+def parse_request(request: CommandRequest) -> Command:
     name = request.name.upper()
     args = request.args
     match name:
@@ -201,6 +212,28 @@ def parse_command_request(request: CommandRequest) -> Command:
         case b"LRANGE":
             _require_arity(name, args, 3)
             return ListRange(args[0], parse_int64(args[1]), parse_int64(args[2]))
+        case b"BLPOP":
+            if len(args) < 2:
+                raise CommandParseError("wrong number of arguments")
+            raw_timeout = args[-1]
+            if not _BLPOP_TIMEOUT.fullmatch(raw_timeout):
+                raise CommandParseError("timeout is not a finite non-negative number")
+            try:
+                seconds = Decimal(raw_timeout.decode("ascii"))
+            except (UnicodeDecodeError, InvalidOperation):
+                raise CommandParseError(
+                    "timeout is not a finite non-negative number"
+                ) from None
+            if not seconds.is_finite() or seconds < 0:
+                raise CommandParseError("timeout is not a finite non-negative number")
+            try:
+                timeout_ms = seconds * Decimal(1000)
+            except (InvalidOperation, DecimalOverflow):
+                raise CommandParseError("timeout is out of range") from None
+            if not timeout_ms.is_finite() or timeout_ms > _MAX_BLPOP_TIMEOUT_MS:
+                raise CommandParseError("timeout is out of range")
+            milliseconds = int(timeout_ms.to_integral_value(rounding=ROUND_CEILING))
+            return BlPop(tuple(args[:-1]), milliseconds)
         case b"SADD":
             _require_min_arity(name, args, 2)
             return SetAdd(args[0], args[1:])
@@ -247,3 +280,6 @@ def parse_command_request(request: CommandRequest) -> Command:
             return Persist(args[0])
         case _:
             raise CommandParseError("unknown command")
+
+
+parse_command_request = parse_request

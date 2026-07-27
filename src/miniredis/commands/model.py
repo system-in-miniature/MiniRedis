@@ -99,6 +99,12 @@ class ListRange:
 
 
 @dataclass(frozen=True, slots=True)
+class BlPop:
+    keys: tuple[bytes, ...]
+    timeout_ms: int
+
+
+@dataclass(frozen=True, slots=True)
 class SetAdd:
     key: bytes
     members: tuple[bytes, ...]
@@ -204,6 +210,7 @@ Command: TypeAlias = (
     | ListPush
     | ListPop
     | ListRange
+    | BlPop
     | SetAdd
     | SetRemove
     | SetIsMember

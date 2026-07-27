@@ -8,7 +8,8 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from miniredis.clock import Clock
-from miniredis.commands.model import Command
+from miniredis.commands.model import BlPop, Command
+from miniredis.core.blocking import WaiterRegistry, WaiterState
 from miniredis.core.commit import CommitBatch, CommitOperation, CommitTrigger
 from miniredis.core.database import Database
 from miniredis.core.expiration import expiry_delete, is_expired
@@ -116,6 +117,7 @@ class CommandExecutor:
         )
         self._on_debug_change = on_debug_change
         self._on_terminal_failure = on_terminal_failure
+        self.waiters = WaiterRegistry(self._on_debug_change)
 
         self._worker_task: asyncio.Task[None] | None = None
         self._worker_started_or_done = asyncio.Event()
@@ -269,6 +271,16 @@ class CommandExecutor:
             raise AssertionError(f"unknown executor message: {message!r}")
 
     def _abandon(self, event: AbandonRequest) -> None:
+        waiter = self.waiters.for_token(event.token)
+        if waiter is not None:
+            transitioned = self.waiters.transition(
+                waiter.waiter_id,
+                waiter.generation,
+                WaiterState.CANCELLED,
+            )
+            if transitioned is not None:
+                self._finish_request(event.token, Abandoned())
+                return
         self._finish_request(event.token, Abandoned())
 
     def _close_session(self, session_id: int) -> None:
@@ -295,24 +307,47 @@ class CommandExecutor:
 
     async def _execute(self, request: ExecuteRequest) -> None:
         now_ms = self.clock.now_ms()
-        plan = self.planner.plan(request.command, self.database, now_ms)
+        if isinstance(request.command, BlPop):
+            plan = self.planner.plan_blpop_now(request.command, self.database, now_ms)
+            if plan is None:
+                deadline = (
+                    None
+                    if request.command.timeout_ms == 0
+                    else now_ms + request.command.timeout_ms
+                )
+                self.waiters.register(
+                    request.token,
+                    request.session_id,
+                    request.command.keys,
+                    deadline,
+                )
+                return
+        else:
+            plan = self.planner.plan(request.command, self.database, now_ms)
+        await self._apply_plan(request, plan, now_ms)
+
+    async def _apply_plan(
+        self,
+        request: ExecuteRequest,
+        plan: ExecutionPlan,
+        now_ms: int,
+    ) -> None:
         if plan.operations:
             batch = CommitBatch(
-                seq=self.database.commit_seq + 1,
-                operations=plan.operations,
-                trigger=plan.trigger,
+                self.database.commit_seq + 1,
+                plan.operations,
+                plan.trigger,
             )
             await self.commit_barrier.append(batch)
             self.database.apply_batch(
-                batch, track_access=plan.trigger is CommitTrigger.CLIENT
+                batch,
+                track_access=plan.trigger is CommitTrigger.CLIENT,
             )
             self._applied_batches.append(batch)
 
         for key in dict.fromkeys(plan.touch_keys):
             self.database.touch_if_live(key, now_ms)
 
-        if plan.reply is None:
-            raise AssertionError("Phase 1 execution plan requires a reply")
         self._finish_reply(request.token, plan.reply)
 
     async def active_expire_once(self) -> int:

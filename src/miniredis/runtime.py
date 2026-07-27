@@ -13,6 +13,7 @@ from miniredis.config import MiniRedisConfig
 from miniredis.commands.model import Command
 from miniredis.commands.parser import CommandParseError, parse_command_request
 from miniredis.commands.request import CommandRequest
+from miniredis.core.blocking import WaiterId
 from miniredis.core.commit import CommitBatch, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
@@ -213,7 +214,7 @@ class MiniRedis:
         return RuntimeStats(
             accepted_requests=self.executor.accepted_request_count,
             pending_futures=self.executor.pending_request_count,
-            waiters=0,
+            waiters=self.executor.waiters.active_count,
             subscriptions=0,
             sessions=self.executor.endpoint_count,
             timer_handles=0,
@@ -238,3 +239,13 @@ class MiniRedis:
 
     async def debug_wait_for_sessions(self, count: int) -> None:
         await self._debug_wait(lambda: self.executor.endpoint_count == count)
+
+    async def debug_wait_for_waiters(self, count: int) -> None:
+        await self._debug_wait(lambda: self.executor.waiters.active_count == count)
+
+    def debug_waiter_ids(self, key: bytes) -> tuple[WaiterId, ...]:
+        return self.executor.waiters.ids_for_key(key)
+
+    @property
+    def debug_waiter_index_counts(self) -> tuple[int, int, int]:
+        return self.executor.waiters.index_counts

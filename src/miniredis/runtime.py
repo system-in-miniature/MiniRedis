@@ -595,7 +595,7 @@ class MiniRedis:
         return self.executor.debug_applied_batches()
 
     def debug_logical_items(self) -> tuple[tuple[bytes, StoredEntry], ...]:
-        return self.database.logical_items()
+        return self.database.export_stored_entries(self.clock.now_ms())
 
     def debug_pause_executor(self) -> None:
         self.executor.debug_pause()

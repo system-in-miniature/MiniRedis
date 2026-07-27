@@ -1,6 +1,7 @@
 from miniredis.commands.model import Command
 from miniredis.config import MiniRedisConfig
 from miniredis.core.database import Database
+from miniredis.core.eviction import enforce_memory
 from miniredis.core.executor import ExecutionPlan
 from miniredis.core.hash_planner import plan_hash
 from miniredis.core.list_planner import plan_list
@@ -33,5 +34,5 @@ class CommandPlanner:
         if plan is None:
             plan = plan_ttl(command, database, now_ms)
         if plan is not None:
-            return plan
+            return enforce_memory(plan, database, self.config, now_ms)
         return ExecutionPlan(Failure("ERR", "unknown command"))

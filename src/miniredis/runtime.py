@@ -164,7 +164,10 @@ class MiniRedis:
         self.executor.register_endpoint(endpoint)
         return DirectClient(self, endpoint)
 
-    def _session_became_slow(self, session_id: int, _reason: str) -> None:
+    def _session_became_slow(self, session_id: int, reason: str) -> None:
+        endpoint = self.executor.endpoint(session_id)
+        if endpoint is not None:
+            endpoint.request_transport_close(reason)
         self.executor.post_control(SessionClosed(session_id))
 
     async def close(self) -> None:

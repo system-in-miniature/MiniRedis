@@ -12,6 +12,7 @@ class MiniRedisConfig:
     active_expire_sample_size: int = 20
     maxmemory: int | None = None
     eviction_policy: EvictionPolicy = "noeviction"
+    outbox_limit: int = 64
 
     def __post_init__(self) -> None:
         if self.max_pending_commands <= 0:
@@ -22,3 +23,5 @@ class MiniRedisConfig:
             raise ValueError("maxmemory must be positive")
         if self.eviction_policy not in {"noeviction", "allkeys-lru"}:
             raise ValueError("eviction_policy must be 'noeviction' or 'allkeys-lru'")
+        if self.outbox_limit <= 0:
+            raise ValueError("outbox_limit must be positive")

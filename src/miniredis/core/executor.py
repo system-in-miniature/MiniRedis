@@ -15,10 +15,13 @@ from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
 from miniredis.core.outbound import (
     Abandoned,
+    ReplyMessage,
     RequestOutcome,
     RequestToken,
     Replied,
     RuntimeClosed,
+    SessionEndpoint,
+    TransportClosed,
 )
 from miniredis.core.reply import Failure, Reply
 
@@ -40,6 +43,11 @@ class SubmittedRequest:
 @dataclass(frozen=True, slots=True)
 class AbandonRequest:
     token: RequestToken
+
+
+@dataclass(frozen=True, slots=True)
+class SessionClosed:
+    session_id: int
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +126,7 @@ class CommandExecutor:
         self._request_tokens = itertools.count(1)
         self._requests: dict[RequestToken, ExecuteRequest] = {}
         self._accepted_tokens: list[RequestToken] = []
+        self._endpoints: dict[int, SessionEndpoint] = {}
         self._accepted_changed = asyncio.Event()
         self._applied_batches: list[CommitBatch] = []
         self._handling_message = False
@@ -194,6 +203,22 @@ class CommandExecutor:
         self._on_debug_change()
         return True
 
+    def _finish_reply(
+        self,
+        token: RequestToken,
+        reply: Reply | None,
+    ) -> bool:
+        request = self._requests.get(token)
+        if request is None:
+            return False
+        endpoint = self._endpoints.get(request.session_id)
+        if endpoint is None:
+            return self._finish_request(token, TransportClosed())
+        if reply is not None and endpoint.reply_via_outbox:
+            if not endpoint.offer(ReplyMessage(token, reply)):
+                return self._finish_request(token, TransportClosed())
+        return self._finish_request(token, Replied(reply))
+
     def post_control(self, message: object) -> bool:
         posted = self.mailbox.post_control(message)
         if posted:
@@ -238,11 +263,20 @@ class CommandExecutor:
             deleted = await self._active_expire_once(message.now_ms)
             if message.future is not None and not message.future.done():
                 message.future.set_result(deleted)
+        elif isinstance(message, SessionClosed):
+            self._close_session(message.session_id)
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
     def _abandon(self, event: AbandonRequest) -> None:
         self._finish_request(event.token, Abandoned())
+
+    def _close_session(self, session_id: int) -> None:
+        self._endpoints.pop(session_id, None)
+        for token, request in tuple(self._requests.items()):
+            if request.session_id == session_id:
+                self._finish_request(token, TransportClosed())
+        self._on_debug_change()
 
     def _complete_terminal_failure(self, failure: BaseException) -> None:
         if self._terminal_cleanup_complete:
@@ -279,7 +313,7 @@ class CommandExecutor:
 
         if plan.reply is None:
             raise AssertionError("Phase 1 execution plan requires a reply")
-        self._finish_request(request.token, Replied(plan.reply))
+        self._finish_reply(request.token, plan.reply)
 
     async def active_expire_once(self) -> int:
         if self._worker_task is None or self._stopping:
@@ -385,6 +419,22 @@ class CommandExecutor:
             and self.mailbox.pending_items == 0
             and not self._requests
         )
+
+    def register_endpoint(self, endpoint: SessionEndpoint) -> None:
+        if endpoint.session_id in self._endpoints:
+            raise ValueError(f"duplicate session: {endpoint.session_id}")
+        self._endpoints[endpoint.session_id] = endpoint
+        self._on_debug_change()
+
+    def endpoint(self, session_id: int) -> SessionEndpoint | None:
+        return self._endpoints.get(session_id)
+
+    def endpoints(self) -> tuple[SessionEndpoint, ...]:
+        return tuple(self._endpoints.values())
+
+    @property
+    def endpoint_count(self) -> int:
+        return len(self._endpoints)
 
     @property
     def debug_failure(self) -> BaseException | None:

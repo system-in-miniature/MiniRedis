@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 from collections.abc import Callable
 from dataclasses import dataclass
 from enum import Enum
@@ -18,8 +19,9 @@ from miniredis.core.executor import (
     CommandExecutor,
     CommitBarrier,
     NullCommitBarrier,
+    SessionClosed,
 )
-from miniredis.core.outbound import RequestToken
+from miniredis.core.outbound import RequestToken, SessionEndpoint
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
 
@@ -40,6 +42,10 @@ class RuntimeStats:
     sessions: int
     timer_handles: int
     owned_tasks: int
+
+
+def _direct_transport_close(_reason: str) -> None:
+    return None
 
 
 class MiniRedis:
@@ -67,7 +73,7 @@ class MiniRedis:
             on_terminal_failure=self._on_executor_terminal_failure,
         )
         self.state = RuntimeState.STARTING
-        self._next_session_id = 0
+        self._session_ids = itertools.count(1)
         self._start_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
 
@@ -132,8 +138,19 @@ class MiniRedis:
     def direct_client(self) -> DirectClient:
         if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
             raise RuntimeError("runtime is closed")
-        self._next_session_id += 1
-        return DirectClient(self, self._next_session_id)
+        session_id = next(self._session_ids)
+        endpoint = SessionEndpoint(
+            session_id=session_id,
+            capacity=self.config.outbox_limit,
+            reply_via_outbox=False,
+            on_slow=self._session_became_slow,
+            close_transport=_direct_transport_close,
+        )
+        self.executor.register_endpoint(endpoint)
+        return DirectClient(self, endpoint)
+
+    def _session_became_slow(self, session_id: int, _reason: str) -> None:
+        self.executor.post_control(SessionClosed(session_id))
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -198,7 +215,7 @@ class MiniRedis:
             pending_futures=self.executor.pending_request_count,
             waiters=0,
             subscriptions=0,
-            sessions=0,
+            sessions=self.executor.endpoint_count,
             timer_handles=0,
             owned_tasks=0,
         )
@@ -218,3 +235,6 @@ class MiniRedis:
 
     async def debug_wait_until_idle(self) -> None:
         await self._debug_wait(lambda: self.executor.idle)
+
+    async def debug_wait_for_sessions(self, count: int) -> None:
+        await self._debug_wait(lambda: self.executor.endpoint_count == count)

@@ -7,7 +7,7 @@ from typing import Any, Self
 from miniredis.adapters.direct import DirectClient
 from miniredis.clock import Clock, SystemClock
 from miniredis.config import MiniRedisConfig
-from miniredis.core.commit import CommitBatch
+from miniredis.core.commit import CommitBatch, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
     CommandExecutor,
@@ -149,6 +149,9 @@ class MiniRedis:
 
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
         return self.executor.debug_applied_batches()
+
+    def debug_logical_items(self) -> tuple[tuple[bytes, StoredEntry], ...]:
+        return self.database.logical_items()
 
     def debug_pause_executor(self) -> None:
         self.executor.debug_pause()

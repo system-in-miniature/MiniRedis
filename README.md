@@ -1,11 +1,35 @@
 # MiniRedis Reference
 
 MiniRedis is a Direct-first Python reference implementation of selected Redis
-data-structure semantics. The reference project is under implementation; the
-authoritative scope is
-`../docs/superpowers/specs/2026-07-27-miniredis-reference-project-design.md`.
+core semantics. A `DirectClient` parses binary-safe `CommandRequest` values
+into a closed typed command union; one event-loop-owned executor prepares and
+applies immutable full-key commits in mailbox order.
 
-This repository contains the finished-project implementation and its behavior
-tests only. Learning chapters, exercise state, learner summaries, and review
-quizzes belong to a separate future repository and are intentionally absent
-here.
+Phase 1 implements String, Hash, List, Set, and Sorted Set values. Its command
+surface is:
+
+- general: `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE`;
+- String: `GET`, `SET [NX|XX] [EX seconds|PX ms]`, `INCR`, `INCRBY`;
+- Hash: `HSET`, `HGET`, `HDEL`, `HGETALL`, `HINCRBY`;
+- List: `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`;
+- Set: `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SINTER`;
+- Sorted Set: `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE`,
+  `ZRANGEBYSCORE`;
+- expiry: `EXPIRE`, `TTL`, `PTTL`, `PERSIST`.
+
+Every accepted command is atomic, but Phase 1 does not implement transactions.
+TTL deadlines are absolute wall-clock milliseconds with lazy and bounded active
+cleanup. Memory limits use deterministic logical byte accounting and exact LRU;
+they do not model Python allocator size or Redis's sampled eviction.
+`SMEMBERS`, `SINTER`, and `HGETALL` result order is unspecified even though the
+implementation emits deterministic test-friendly order.
+
+Phase 1 does not claim `BLPOP`, Pub/Sub, persistence, replication, RESP, or TCP
+support. Those boundaries are added only by their later implementation phases.
+
+Run the complete suite from this directory:
+
+```bash
+uv sync --dev
+uv run pytest -q
+```

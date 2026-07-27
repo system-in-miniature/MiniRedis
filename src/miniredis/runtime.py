@@ -46,6 +46,7 @@ from miniredis.persistence.snapshot import (
     SnapshotManager,
     SnapshotOutcome,
 )
+from miniredis.replication.sink import ReplicaSink, ReplicaStatus
 
 
 class RuntimeState(str, Enum):
@@ -65,12 +66,14 @@ class RuntimeStats:
     sessions: int
     timer_handles: int
     owned_tasks: int
+    replica_links: int
 
 
 @dataclass(slots=True)
 class _RuntimeTestHooks:
     aof_appender: CommitBarrier | None = None
     snapshot_ops: SnapshotFileOps | None = None
+    replica_apply_failure: BaseException | None = None
 
 
 def _direct_transport_close(_reason: str) -> None:
@@ -114,6 +117,11 @@ class MiniRedis:
             on_debug_change=self._debug_notify,
             on_terminal_failure=self._on_executor_terminal_failure,
             on_fatal=self._transition_failed,
+            replica_apply_failure=(
+                None
+                if self._test_hooks is None
+                else self._test_hooks.replica_apply_failure
+            ),
         )
         self._snapshot_manager = (
             SnapshotManager(
@@ -137,6 +145,7 @@ class MiniRedis:
         self._owned_tasks: set[asyncio.Task[object]] = set()
         self._failure_reason: str | None = None
         self._shutdown_complete = False
+        self._owned_replica_sinks: set[ReplicaSink] = set()
 
     @classmethod
     def open(
@@ -378,6 +387,34 @@ class MiniRedis:
         self._owned_tasks.add(task)
         task.add_done_callback(self._owned_tasks.discard)
 
+    async def attach_replica(self, sink: ReplicaSink) -> ReplicaStatus:
+        if self.state is not RuntimeState.RUNNING:
+            raise RuntimeError("primary is not running")
+        self._owned_replica_sinks.add(sink)
+        task = asyncio.create_task(
+            sink.attach(self),
+            name="miniredis:replica-attach",
+        )
+        task.add_done_callback(
+            lambda completed: self._replica_attach_done(sink, completed)
+        )
+        try:
+            return await asyncio.shield(task)
+        except BaseException:
+            if task.done() and (
+                task.cancelled() or task.exception() is not None
+            ):
+                self._owned_replica_sinks.discard(sink)
+            raise
+
+    def _replica_attach_done(
+        self,
+        sink: ReplicaSink,
+        task: asyncio.Task[ReplicaStatus],
+    ) -> None:
+        if task.cancelled() or task.exception() is not None:
+            self._owned_replica_sinks.discard(sink)
+
     async def __aenter__(self) -> Self:
         await self.start()
         return self
@@ -455,6 +492,7 @@ class MiniRedis:
                 for task in self._owned_tasks
                 if task is not asyncio.current_task()
             ),
+            replica_links=self.executor.replica_link_count,
         )
 
     def _debug_notify(self) -> None:

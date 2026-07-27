@@ -245,3 +245,57 @@ Command: TypeAlias = (
     | TimeToLive
     | Persist
 )
+
+
+_DATASET_MUTATING_TYPES = frozenset(
+    {
+        SetString,
+        Delete,
+        Increment,
+        HashSet,
+        HashDelete,
+        HashIncrement,
+        ListPush,
+        ListPop,
+        BlPop,
+        SetAdd,
+        SetRemove,
+        ZAdd,
+        ZRemove,
+        Expire,
+        Persist,
+    }
+)
+
+_NON_DATASET_MUTATING_TYPES = frozenset(
+    {
+        Ping,
+        Echo,
+        GetString,
+        Exists,
+        TypeOf,
+        HashGet,
+        HashGetAll,
+        ListRange,
+        SetIsMember,
+        SetMembers,
+        SetIntersection,
+        ZScore,
+        ZRank,
+        ZRange,
+        ZRangeByScore,
+        TimeToLive,
+        Subscribe,
+        Unsubscribe,
+        Publish,
+    }
+)
+
+
+def is_dataset_mutating(command: Command) -> bool:
+    command_type = type(command)
+    if command_type in _DATASET_MUTATING_TYPES:
+        return True
+    if command_type in _NON_DATASET_MUTATING_TYPES:
+        return False
+    raise AssertionError(f"unclassified command type: {command_type.__name__}")

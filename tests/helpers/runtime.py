@@ -39,6 +39,7 @@ async def open_test_runtime(
     aof_appender=None,
     config=None,
     snapshot_write_gate: bool = False,
+    replica_apply_failure: BaseException | None = None,
 ) -> TestMiniRedis:
     loop = asyncio.get_running_loop()
     snapshot_gate = GateSnapshotFileOps(loop) if snapshot_write_gate else None
@@ -49,6 +50,7 @@ async def open_test_runtime(
         test_hooks=_RuntimeTestHooks(
             aof_appender=aof_appender,
             snapshot_ops=snapshot_gate,
+            replica_apply_failure=replica_apply_failure,
         ),
     )
     if snapshot_gate is not None:

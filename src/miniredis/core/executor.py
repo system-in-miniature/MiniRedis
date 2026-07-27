@@ -16,6 +16,7 @@ from miniredis.commands.model import (
     Publish,
     Subscribe,
     Unsubscribe,
+    is_dataset_mutating,
 )
 from miniredis.core.blocking import (
     WaiterId,
@@ -58,6 +59,7 @@ from miniredis.persistence.aof import (
     AofAppendOk,
     AofAppendOutcome,
 )
+from miniredis.replication.sink import ReplicaAttachment
 
 if TYPE_CHECKING:
     from miniredis.replication.sink import ReplicaSink
@@ -103,6 +105,33 @@ class BeginShutdown:
 @dataclass(slots=True)
 class SnapshotBarrier:
     future: asyncio.Future[SnapshotImage]
+
+
+@dataclass(slots=True)
+class AttachReplica:
+    sink: ReplicaSink
+    future: asyncio.Future[ReplicaAttachment]
+
+
+@dataclass(slots=True)
+class DetachReplica:
+    generation: int
+    future: asyncio.Future[bool] | None
+
+
+@dataclass(slots=True)
+class InstallReplicaSnapshot:
+    sink: ReplicaSink
+    generation: int
+    image: SnapshotImage
+    future: asyncio.Future[bool]
+
+
+@dataclass(slots=True)
+class ApplyReplicaBatch:
+    generation: int
+    batch: CommitBatch
+    future: asyncio.Future[bool]
 
 
 @dataclass(frozen=True, slots=True)
@@ -170,6 +199,7 @@ class CommandExecutor:
         on_debug_change: Callable[[], None],
         on_terminal_failure: Callable[[BaseException], None] | None = None,
         on_fatal: Callable[[str], None] | None = None,
+        replica_apply_failure: BaseException | None = None,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -203,6 +233,10 @@ class CommandExecutor:
         self._accepted_changed = asyncio.Event()
         self._applied_batches: list[CommitBatch] = []
         self._replica_sinks: dict[int, ReplicaSink] = {}
+        self._next_replica_generation = 1
+        self._active_source_generation: int | None = None
+        self._replica_read_only = False
+        self._replica_apply_failure = replica_apply_failure
         self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
@@ -350,6 +384,43 @@ class CommandExecutor:
             image = self.database.snapshot_image(self.clock.now_ms())
             if not message.future.done():
                 message.future.set_result(image)
+        elif isinstance(message, AttachReplica):
+            generation = self._next_replica_generation
+            self._next_replica_generation += 1
+            image = self.database.snapshot_image(self.clock.now_ms())
+            attachment = ReplicaAttachment(generation, image)
+            message.sink.register_attachment(attachment)
+            self._replica_sinks[generation] = message.sink
+            message.future.set_result(attachment)
+        elif isinstance(message, DetachReplica):
+            removed = self._replica_sinks.pop(message.generation, None) is not None
+            if message.future is not None and not message.future.done():
+                message.future.set_result(removed)
+        elif isinstance(message, InstallReplicaSnapshot):
+            if not message.sink.install_allowed(message.generation):
+                message.future.set_result(False)
+                return
+            self.database.install_snapshot(
+                message.image,
+                now_ms=self.clock.now_ms(),
+            )
+            self._active_source_generation = message.generation
+            self._replica_read_only = True
+            message.future.set_result(True)
+        elif isinstance(message, ApplyReplicaBatch):
+            if message.generation != self._active_source_generation:
+                message.future.set_result(False)
+                return
+            try:
+                if self._replica_apply_failure is not None:
+                    error = self._replica_apply_failure
+                    self._replica_apply_failure = None
+                    raise error
+                self.database.apply_batch(message.batch, track_access=False)
+            except BaseException as exc:
+                message.future.set_exception(exc)
+            else:
+                message.future.set_result(True)
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -442,6 +513,12 @@ class CommandExecutor:
 
     async def _execute(self, request: ExecuteRequest) -> None:
         command = request.command
+        if self._replica_read_only and is_dataset_mutating(command):
+            self._finish_reply(
+                request.token,
+                Failure("READONLY", "replica is read only"),
+            )
+            return
         if self.pubsub.count(request.session_id) > 0 and not isinstance(
             command, (Ping, Subscribe, Unsubscribe)
         ):
@@ -641,6 +718,45 @@ class CommandExecutor:
             raise RuntimeError("executor control admission is closed")
         return await asyncio.shield(future)
 
+    async def attach_replica(self, sink: ReplicaSink) -> ReplicaAttachment:
+        future: asyncio.Future[ReplicaAttachment] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if not self.post_control(AttachReplica(sink, future)):
+            raise RuntimeError("executor control admission is closed")
+        return await asyncio.shield(future)
+
+    async def detach_replica(self, generation: int) -> bool:
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        if not self.post_control(DetachReplica(generation, future)):
+            return False
+        return await asyncio.shield(future)
+
+    async def install_replica_snapshot(
+        self,
+        sink: ReplicaSink,
+        generation: int,
+        image: SnapshotImage,
+    ) -> bool:
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        if not self.post_control(
+            InstallReplicaSnapshot(sink, generation, image, future)
+        ):
+            return False
+        return await asyncio.shield(future)
+
+    async def apply_replica_batch(
+        self,
+        generation: int,
+        batch: CommitBatch,
+    ) -> bool:
+        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+        if not self.post_control(
+            ApplyReplicaBatch(generation, batch, future)
+        ):
+            return False
+        return await asyncio.shield(future)
+
     async def _active_expire_once(self, now_ms: int) -> int:
         keys = sorted(
             key
@@ -753,6 +869,10 @@ class CommandExecutor:
     @property
     def endpoint_count(self) -> int:
         return len(self._endpoints)
+
+    @property
+    def replica_link_count(self) -> int:
+        return len(self._replica_sinks)
 
     @property
     def worker_task(self) -> asyncio.Task[None] | None:

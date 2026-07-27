@@ -169,11 +169,7 @@ class TcpSession:
                 ServerClosed(f"protocol error: {protocol_error}")
             )
             self.endpoint.outbox.begin_close("protocol error")
-            if self._writer_task is not None:
-                await asyncio.gather(
-                    self._writer_task,
-                    return_exceptions=True,
-                )
+            await self._drain_protocol_error_best_effort()
         if saw_eof or protocol_error is not None:
             await self.runtime.close_session(self.session_id)
             if self._pending_command is not None:
@@ -194,6 +190,18 @@ class TcpSession:
             self.runtime.request_session_close(self.session_id)
         except (ConnectionError, BrokenPipeError):
             self.runtime.request_session_close(self.session_id)
+
+    async def _drain_protocol_error_best_effort(self) -> None:
+        task = self._writer_task
+        if task is None or task is asyncio.current_task() or task.done():
+            return
+        try:
+            async with asyncio.timeout(
+                self.runtime.config.outbox_drain_grace_ms / 1000
+            ):
+                await asyncio.shield(task)
+        except TimeoutError:
+            return
 
     def request_reader_quiesce(self) -> None:
         if self._reader_quiescing:
@@ -244,14 +252,14 @@ class TcpSession:
     async def finish_runtime_close(self) -> None:
         self._closed = True
         self._writer_allowed.set()
+        self.endpoint.outbox.abort("runtime closed")
+        await self._finish_transport()
         await self._settle_reader()
         if self._pending_command is not None:
             await asyncio.gather(
                 self._pending_command,
                 return_exceptions=True,
             )
-        self.endpoint.outbox.abort("runtime closed")
-        await self._finish_transport()
 
     async def _settle_reader(self) -> None:
         if (
@@ -270,12 +278,15 @@ class TcpSession:
         self._transport_finishing = True
         self._writer_allowed.set()
         try:
-            if self._writer_task is not None:
+            self.writer.close()
+            if (
+                self._writer_task is not None
+                and self._writer_task is not asyncio.current_task()
+            ):
                 await asyncio.gather(
                     self._writer_task,
                     return_exceptions=True,
                 )
-            self.writer.close()
             try:
                 await self.writer.wait_closed()
             except ConnectionError:

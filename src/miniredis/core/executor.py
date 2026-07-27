@@ -47,7 +47,6 @@ from miniredis.core.outbound import (
     Replied,
     RuntimeClosed,
     RuntimeFailed,
-    ServerClosed,
     SessionEndpoint,
     SubscriptionAck,
     TransportClosed,
@@ -543,8 +542,6 @@ class CommandExecutor:
         self._replica_sinks.clear()
         for token in tuple(self._requests):
             self._finish_request(token, event.outcome)
-        for endpoint in self._endpoints.values():
-            endpoint.offer_best_effort(ServerClosed("runtime closed"))
         if not event.completion.done():
             event.completion.set_result(None)
         self._shutdown_barrier_held = True

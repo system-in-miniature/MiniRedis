@@ -25,6 +25,31 @@ async def close_writers(*writers):
     )
 
 
+class CloseReleasedWriter:
+    def __init__(self, inner) -> None:
+        self._inner = inner
+        self.drain_started = asyncio.Event()
+        self._closed = asyncio.Event()
+
+    def write(self, data: bytes) -> None:
+        self._inner.write(data)
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self._closed.wait()
+        raise ConnectionError("transport closed")
+
+    def close(self) -> None:
+        self._inner.close()
+        self._closed.set()
+
+    async def wait_closed(self) -> None:
+        await self._inner.wait_closed()
+
+    def force_release(self) -> None:
+        self._closed.set()
+
+
 @pytest.mark.asyncio
 async def test_blpop_does_not_block_another_connection():
     async with MiniRedis.open() as redis:
@@ -128,3 +153,32 @@ async def test_full_tcp_outbox_closes_only_the_slow_subscriber():
 
         await close_writers(fast_w, pub_w, slow_w)
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_runtime_close_does_not_spend_outbox_grace_twice():
+    redis = MiniRedis.open(outbox_drain_grace_ms=60_000)
+    await redis.start()
+    server = await redis.start_tcp("127.0.0.1", 0)
+    reader, client_writer = await asyncio.open_connection(*server.address)
+    await redis.debug_wait_for_sessions(1)
+    session = server.debug_sessions()[0]
+    gated = CloseReleasedWriter(session.writer)
+    session.writer = gated
+
+    await send(client_writer, b"*1\r\n$4\r\nPING\r\n")
+    await gated.drain_started.wait()
+    assert session.endpoint.outbox.pending_count == 0
+    try:
+        async with asyncio.timeout(1):
+            await redis.close()
+    finally:
+        gated.force_release()
+        await redis.close()
+
+    assert redis.closed
+    assert server.closed
+    assert server.owned_task_count == 0
+    assert await reader.read() == b"+PONG\r\n"
+    client_writer.close()
+    await client_writer.wait_closed()

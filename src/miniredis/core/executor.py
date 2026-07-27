@@ -5,7 +5,7 @@ import itertools
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, replace
-from typing import Protocol
+from typing import TYPE_CHECKING, Protocol
 
 from miniredis.clock import Clock, TimerScheduler
 from miniredis.commands.model import (
@@ -52,6 +52,14 @@ from miniredis.core.outbound import (
 )
 from miniredis.core.pubsub import PubSubRegistry
 from miniredis.core.reply import Bytes, Failure, Items, Number, Reply
+from miniredis.persistence.aof import (
+    AofAppendFailed,
+    AofAppendOk,
+    AofAppendOutcome,
+)
+
+if TYPE_CHECKING:
+    from miniredis.replication.sink import ReplicaSink
 
 
 @dataclass(slots=True)
@@ -107,12 +115,17 @@ class ExecutionPlan:
 
 
 class CommitBarrier(Protocol):
-    async def append(self, batch: CommitBatch) -> None: ...
+    async def append(self, batch: CommitBatch) -> AofAppendOutcome:
+        raise NotImplementedError
 
 
 class NullCommitBarrier:
-    async def append(self, batch: CommitBatch) -> None:
-        del batch
+    async def append(self, batch: CommitBatch) -> AofAppendOutcome:
+        return AofAppendOk(batch.seq)
+
+
+class DurabilityFailure(RuntimeError):
+    pass
 
 
 class Planner(Protocol):
@@ -150,6 +163,7 @@ class CommandExecutor:
         scheduler: TimerScheduler,
         on_debug_change: Callable[[], None],
         on_terminal_failure: Callable[[BaseException], None] | None = None,
+        on_fatal: Callable[[str], None] | None = None,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -165,6 +179,7 @@ class CommandExecutor:
         )
         self._on_debug_change = on_debug_change
         self._on_terminal_failure = on_terminal_failure
+        self._on_fatal = on_fatal or (lambda _reason: None)
         self.waiters = WaiterRegistry(self._on_debug_change)
         self.pubsub = PubSubRegistry(self._on_debug_change)
         self.scheduler = scheduler
@@ -181,6 +196,7 @@ class CommandExecutor:
         self._endpoints: dict[int, SessionEndpoint] = {}
         self._accepted_changed = asyncio.Event()
         self._applied_batches: list[CommitBatch] = []
+        self._replica_sinks: dict[int, ReplicaSink] = {}
         self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
@@ -468,7 +484,6 @@ class CommandExecutor:
                 return
         else:
             plan = self.planner.plan(command, self.database, now_ms)
-            plan = self._attach_push_wakeups(command, plan)
         await self._apply_plan(request, plan, now_ms)
 
     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
@@ -547,18 +562,17 @@ class CommandExecutor:
         plan: ExecutionPlan,
         now_ms: int,
     ) -> None:
-        if plan.operations:
-            batch = CommitBatch(
-                self.database.commit_seq + 1,
-                plan.operations,
-                plan.trigger,
+        plan = self._attach_push_wakeups(request.command, plan)
+        try:
+            if plan.prepared_commit is not None:
+                await self._commit_prepared(plan.prepared_commit)
+        except DurabilityFailure as exc:
+            self._finish_reply(
+                request.token,
+                Failure("ERR", f"durability failure: {exc}"),
             )
-            await self.commit_barrier.append(batch)
-            self.database.apply_batch(
-                batch,
-                track_access=plan.trigger is CommitTrigger.CLIENT,
-            )
-            self._applied_batches.append(batch)
+            self._on_fatal(str(exc))
+            return
 
         for key in dict.fromkeys(plan.touch_keys):
             self.database.touch_if_live(key, now_ms)
@@ -575,6 +589,30 @@ class CommandExecutor:
                     Items((Bytes(wakeup.key), Bytes(wakeup.item))),
                 )
         self._finish_reply(request.token, plan.reply)
+
+    async def _commit_prepared(
+        self,
+        prepared: PreparedCommit,
+    ) -> CommitBatch:
+        batch = prepared.to_batch(self.database.commit_seq + 1)
+        outcome = await self.commit_barrier.append(batch)
+        if isinstance(outcome, AofAppendFailed):
+            raise DurabilityFailure(outcome.message)
+        if outcome != AofAppendOk(batch.seq):
+            raise DurabilityFailure("AOF acknowledged the wrong sequence")
+
+        self.database.apply_batch(
+            batch,
+            track_access=prepared.trigger is CommitTrigger.CLIENT,
+        )
+        self._applied_batches.append(batch)
+        self._offer_replica_batch(batch)
+        return batch
+
+    def _offer_replica_batch(self, batch: CommitBatch) -> None:
+        for generation, sink in tuple(self._replica_sinks.items()):
+            if not sink.offer(batch):
+                self._replica_sinks.pop(generation, None)
 
     async def active_expire_once(self) -> int:
         if self._worker_task is None or self._stopping:
@@ -609,14 +647,15 @@ class CommandExecutor:
         )
         if not operations:
             return 0
-        batch = CommitBatch(
-            self.database.commit_seq + 1,
-            operations,
-            CommitTrigger.ACTIVE_EXPIRE,
-        )
-        await self.commit_barrier.append(batch)
-        self.database.apply_batch(batch, track_access=False)
-        self._applied_batches.append(batch)
+        try:
+            prepared = PreparedCommit(
+                operations,
+                CommitTrigger.ACTIVE_EXPIRE,
+            )
+            await self._commit_prepared(prepared)
+        except DurabilityFailure as exc:
+            self._on_fatal(str(exc))
+            return 0
         return len(operations)
 
     async def close(self) -> None:

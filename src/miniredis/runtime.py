@@ -39,6 +39,7 @@ from miniredis.core.outbound import (
 )
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
+from miniredis.persistence.aof import AofWriter
 
 
 class RuntimeState(str, Enum):
@@ -60,6 +61,11 @@ class RuntimeStats:
     owned_tasks: int
 
 
+@dataclass(slots=True)
+class _RuntimeTestHooks:
+    aof_appender: CommitBarrier | None = None
+
+
 def _direct_transport_close(_reason: str) -> None:
     return None
 
@@ -72,13 +78,21 @@ class MiniRedis:
         clock: Clock,
         commit_barrier: CommitBarrier,
         scheduler: TimerScheduler | None,
+        test_hooks: _RuntimeTestHooks | None = None,
     ) -> None:
         self.config = config
         self.clock = clock
         self.scheduler = (
             AsyncioTimerScheduler(clock) if scheduler is None else scheduler
         )
-        self.commit_barrier = commit_barrier
+        self._test_hooks = test_hooks
+        actual_barrier = (
+            test_hooks.aof_appender
+            if test_hooks is not None and test_hooks.aof_appender is not None
+            else commit_barrier
+        )
+        self.commit_barrier = actual_barrier
+        self._aof_writer: AofWriter | None = None
         self.database = Database()
         self.planner = CommandPlanner(config)
         self._debug_changed = asyncio.Event()
@@ -86,12 +100,13 @@ class MiniRedis:
             database=self.database,
             planner=self.planner,
             clock=clock,
-            commit_barrier=commit_barrier,
+            commit_barrier=actual_barrier,
             max_pending_commands=config.max_pending_commands,
             active_expire_sample_size=config.active_expire_sample_size,
             scheduler=self.scheduler,
             on_debug_change=self._debug_notify,
             on_terminal_failure=self._on_executor_terminal_failure,
+            on_fatal=self._transition_failed,
         )
         self.state = RuntimeState.STARTING
         self._session_ids = itertools.count(1)
@@ -123,6 +138,7 @@ class MiniRedis:
             commit_barrier=(
                 commit_barrier if commit_barrier is not None else NullCommitBarrier()
             ),
+            test_hooks=None,
         )
 
     @classmethod
@@ -133,14 +149,20 @@ class MiniRedis:
         clock: Clock | None = None,
         scheduler: TimerScheduler | None = None,
         commit_barrier: CommitBarrier | None = None,
+        test_hooks: _RuntimeTestHooks | None = None,
         **options: Any,
     ) -> MiniRedis:
-        return cls.open(
-            config,
-            clock=clock,
+        if config is not None and options:
+            raise TypeError("config cannot be combined with keyword options")
+        resolved = config if config is not None else MiniRedisConfig(**options)
+        return cls(
+            resolved,
+            clock=clock if clock is not None else SystemClock(),
             scheduler=scheduler,
-            commit_barrier=commit_barrier,
-            **options,
+            commit_barrier=(
+                commit_barrier if commit_barrier is not None else NullCommitBarrier()
+            ),
+            test_hooks=test_hooks,
         )
 
     async def start(self) -> None:
@@ -218,13 +240,16 @@ class MiniRedis:
                 self._track_owned_task(self._shutdown_task)
             task = self._shutdown_task
         await asyncio.shield(task)
+        if self.state is RuntimeState.FAILED:
+            self._set_state(RuntimeState.CLOSED)
 
     async def _shutdown_once(self, crash: bool = False) -> None:
         del crash
         if self._shutdown_complete:
             return
         failure = self._failure_reason
-        if self.state is not RuntimeState.CLOSED:
+        preserve_failed_state = self.state is RuntimeState.FAILED
+        if self.state not in {RuntimeState.CLOSED, RuntimeState.FAILED}:
             self._set_state(RuntimeState.DRAINING)
         self.executor.mailbox.close_user_admission()
         await asyncio.gather(
@@ -276,7 +301,11 @@ class MiniRedis:
             if owned.done() or owned is current:
                 self._owned_tasks.discard(owned)
         self._shutdown_complete = True
-        self._set_state(RuntimeState.CLOSED)
+        self._set_state(
+            RuntimeState.FAILED
+            if preserve_failed_state
+            else RuntimeState.CLOSED
+        )
 
     def _on_executor_terminal_failure(self, failure: BaseException) -> None:
         reason = str(failure) or type(failure).__name__

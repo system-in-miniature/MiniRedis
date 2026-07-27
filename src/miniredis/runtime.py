@@ -23,6 +23,7 @@ from miniredis.core.commit import CommitBatch, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
     ActiveExpireTick,
+    AbandonRequest,
     BeginShutdown,
     CommandExecutor,
     CommitBarrier,
@@ -31,6 +32,7 @@ from miniredis.core.executor import (
 )
 from miniredis.core.expiration import ActiveExpireProducer
 from miniredis.core.outbound import (
+    ReplyMessage,
     RequestOutcome,
     RequestToken,
     RuntimeClosed,
@@ -164,6 +166,7 @@ class MiniRedis:
         self._failure_reason: str | None = None
         self._shutdown_complete = False
         self._owned_replica_sinks: set[ReplicaSink] = set()
+        self._tcp_servers: set[Any] = set()
 
     @classmethod
     def open(
@@ -344,6 +347,71 @@ class MiniRedis:
             endpoint.request_transport_close(reason)
         self.executor.post_control(SessionClosed(session_id))
 
+    def new_session_id(self) -> int:
+        return next(self._session_ids)
+
+    def register_session(self, endpoint: SessionEndpoint) -> None:
+        self.executor.register_endpoint(endpoint)
+
+    def request_session_close(self, session_id: int) -> None:
+        self.executor.post_control(SessionClosed(session_id))
+
+    async def close_session(self, session_id: int) -> None:
+        endpoint = self.executor.endpoint(session_id)
+        if endpoint is None:
+            return
+        completion = asyncio.get_running_loop().create_future()
+        if not self.executor.post_control(SessionClosed(session_id, completion)):
+            endpoint.outbox.abort("runtime closed")
+            return
+        await asyncio.shield(completion)
+
+    def session_became_slow(
+        self,
+        session_id: int,
+        reason: str,
+    ) -> None:
+        self._session_became_slow(session_id, reason)
+
+    async def execute_for_session(
+        self,
+        session_id: int,
+        request: CommandRequest,
+    ) -> None:
+        parsed = self.parse(request)
+        endpoint = self.executor.endpoint(session_id)
+        if endpoint is None:
+            return
+        if isinstance(parsed, Failure):
+            token = self.executor.new_request_token()
+            endpoint.offer(ReplyMessage(token, parsed))
+            return
+        submitted = self.executor.submit(session_id, parsed)
+        if isinstance(submitted, Failure):
+            token = self.executor.new_request_token()
+            endpoint.offer(ReplyMessage(token, submitted))
+            return
+        try:
+            await asyncio.shield(submitted.future)
+        except asyncio.CancelledError:
+            self.executor.post_control(AbandonRequest(submitted.token))
+            raise
+
+    async def start_tcp(self, host: str, port: int) -> Any:
+        from miniredis.adapters.tcp import TcpServer
+
+        if self.state is not RuntimeState.RUNNING:
+            raise RuntimeError("runtime is not running")
+        server = TcpServer(self, host, port, self.config.outbox_limit)
+        await server.start()
+        self._tcp_servers.add(server)
+        self._control_producers.add(server)
+        return server
+
+    def unregister_tcp_server(self, server: Any) -> None:
+        self._tcp_servers.discard(server)
+        self._control_producers.discard(server)
+
     async def close(self) -> None:
         async with self._lifecycle_lock:
             if self._shutdown_task is None:
@@ -408,6 +476,11 @@ class MiniRedis:
         for endpoint in endpoints:
             endpoint.outbox.abort("runtime closed")
             endpoint.request_transport_close("runtime closed")
+        await asyncio.gather(
+            *(server.finish_runtime_close() for server in tuple(self._tcp_servers)),
+            return_exceptions=False,
+        )
+        self._tcp_servers.clear()
         self.executor.release_endpoints()
 
         if self._snapshot_manager is not None:

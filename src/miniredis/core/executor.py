@@ -321,7 +321,7 @@ class CommandExecutor:
         if len(self._requests) >= self.max_pending_commands:
             return Failure("BUSY", "command queue is full")
 
-        token = RequestToken(next(self._request_tokens))
+        token = self.new_request_token()
         future: asyncio.Future[RequestOutcome] = (
             asyncio.get_running_loop().create_future()
         )
@@ -336,6 +336,9 @@ class CommandExecutor:
         self._accepted_changed.set()
         self._on_debug_change()
         return SubmittedRequest(token, future)
+
+    def new_request_token(self) -> RequestToken:
+        return RequestToken(next(self._request_tokens))
 
     def _finish_request(
         self,

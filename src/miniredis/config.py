@@ -25,6 +25,7 @@ class MiniRedisConfig:
     snapshot_path: Path | None = None
     replica_queue_limit: int = 64
     replica_drain_grace_ms: int = 1000
+    max_session_frames: int = 128
 
     def __post_init__(self) -> None:
         if self.max_pending_commands <= 0:
@@ -47,3 +48,5 @@ class MiniRedisConfig:
             raise ValueError("replica_queue_limit must be positive")
         if self.replica_drain_grace_ms < 0:
             raise ValueError("replica_drain_grace_ms cannot be negative")
+        if self.max_session_frames <= 0:
+            raise ValueError("max_session_frames must be positive")

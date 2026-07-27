@@ -43,6 +43,7 @@ class MiniRedis:
             clock=clock,
             commit_barrier=commit_barrier,
             max_pending_commands=config.max_pending_commands,
+            active_expire_sample_size=config.active_expire_sample_size,
             on_terminal_failure=self._on_executor_terminal_failure,
         )
         self.state = RuntimeState.STARTING
@@ -52,21 +53,6 @@ class MiniRedis:
 
     @classmethod
     def open(
-        cls,
-        config: MiniRedisConfig | None = None,
-        **options: Any,
-    ) -> MiniRedis:
-        if config is not None and options:
-            raise TypeError("config cannot be combined with keyword options")
-        resolved = config if config is not None else MiniRedisConfig(**options)
-        return cls(
-            resolved,
-            clock=SystemClock(),
-            commit_barrier=NullCommitBarrier(),
-        )
-
-    @classmethod
-    def _for_test(
         cls,
         config: MiniRedisConfig | None = None,
         *,
@@ -83,6 +69,22 @@ class MiniRedis:
             commit_barrier=(
                 commit_barrier if commit_barrier is not None else NullCommitBarrier()
             ),
+        )
+
+    @classmethod
+    def _for_test(
+        cls,
+        config: MiniRedisConfig | None = None,
+        *,
+        clock: Clock | None = None,
+        commit_barrier: CommitBarrier | None = None,
+        **options: Any,
+    ) -> MiniRedis:
+        return cls.open(
+            config,
+            clock=clock,
+            commit_barrier=commit_barrier,
+            **options,
         )
 
     async def start(self) -> None:
@@ -137,8 +139,16 @@ class MiniRedis:
         return self.database.commit_seq
 
     @property
+    def debug_physical_key_count(self) -> int:
+        return len(self.database.entries)
+
+    async def debug_active_expire_once(self) -> int:
+        if self.state is not RuntimeState.RUNNING:
+            return 0
+        return await self.executor.active_expire_once()
+
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
-        return self.executor.debug_applied_batches
+        return self.executor.debug_applied_batches()
 
     def debug_pause_executor(self) -> None:
         self.executor.debug_pause()

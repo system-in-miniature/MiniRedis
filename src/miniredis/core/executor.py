@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
@@ -9,6 +10,7 @@ from miniredis.clock import Clock
 from miniredis.commands.model import Command
 from miniredis.core.commit import CommitBatch, CommitOperation, CommitTrigger
 from miniredis.core.database import Database
+from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
 from miniredis.core.reply import Failure, Reply
 
@@ -73,7 +75,13 @@ class _StopExecutor:
     pass
 
 
-type ExecutorMessage = ExecuteRequest | _StopExecutor
+@dataclass(slots=True)
+class ActiveExpireTick:
+    now_ms: int
+    future: asyncio.Future[int] | None = None
+
+
+type ExecutorMessage = ExecuteRequest | ActiveExpireTick | _StopExecutor
 
 
 class CommandExecutor:
@@ -85,6 +93,7 @@ class CommandExecutor:
         clock: Clock,
         commit_barrier: CommitBarrier,
         max_pending_commands: int,
+        active_expire_sample_size: int = 20,
         on_terminal_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         self.database = database
@@ -92,6 +101,10 @@ class CommandExecutor:
         self.clock = clock
         self.commit_barrier = commit_barrier
         self.max_pending_commands = max_pending_commands
+        if active_expire_sample_size <= 0:
+            raise ValueError("active_expire_sample_size must be positive")
+        self.active_expire_sample_size = active_expire_sample_size
+        self._active_expire_cursor: bytes | None = None
         self.mailbox: EventLoopMailbox[ExecutorMessage] = EventLoopMailbox(
             max_pending_commands
         )
@@ -160,7 +173,7 @@ class CommandExecutor:
         self._accepted_changed.set()
         return SubmittedRequest(token, future)
 
-    def post_control(self, message: _StopExecutor) -> bool:
+    def post_control(self, message: ActiveExpireTick | _StopExecutor) -> bool:
         return self.mailbox.post_control(message)
 
     async def _run(self) -> None:
@@ -173,7 +186,12 @@ class CommandExecutor:
                 await self._run_gate.wait()
                 if isinstance(message, _StopExecutor):
                     return
-                await self._execute(message)
+                if isinstance(message, ExecuteRequest):
+                    await self._execute(message)
+                elif isinstance(message, ActiveExpireTick):
+                    deleted = await self._active_expire_once(message.now_ms)
+                    if message.future is not None and not message.future.done():
+                        message.future.set_result(deleted)
         except asyncio.CancelledError as error:
             failure = error
         except Exception as error:  # noqa: BLE001 - worker failures are terminal
@@ -220,6 +238,49 @@ class CommandExecutor:
         if plan.reply is None:
             raise AssertionError("Phase 1 execution plan requires a reply")
         self._finish(request.token, Replied(plan.reply))
+
+    async def active_expire_once(self) -> int:
+        if self._worker_task is None or self._stopping:
+            return 0
+        future: asyncio.Future[int] = asyncio.get_running_loop().create_future()
+        tick = ActiveExpireTick(self.clock.now_ms(), future)
+        if not self.post_control(tick):
+            return 0
+        return await asyncio.shield(future)
+
+    async def _active_expire_once(self, now_ms: int) -> int:
+        keys = sorted(
+            key
+            for key, entry in self.database.entries.items()
+            if entry.expire_at_ms is not None
+        )
+        if not keys:
+            self._active_expire_cursor = None
+            return 0
+        start = (
+            0
+            if self._active_expire_cursor is None
+            else bisect_right(keys, self._active_expire_cursor)
+        )
+        ordered_keys = keys[start:] + keys[:start]
+        candidate_keys = ordered_keys[: self.active_expire_sample_size]
+        self._active_expire_cursor = candidate_keys[-1]
+        operations = tuple(
+            expiry_delete(key)
+            for key in candidate_keys
+            if is_expired(self.database.entries[key], now_ms)
+        )
+        if not operations:
+            return 0
+        batch = CommitBatch(
+            self.database.commit_seq + 1,
+            operations,
+            CommitTrigger.ACTIVE_EXPIRE,
+        )
+        await self.commit_barrier.append(batch)
+        self.database.apply_batch(batch, track_access=False)
+        self._applied_batches.append(batch)
+        return len(operations)
 
     def _finish(self, token: RequestToken, outcome: RequestOutcome) -> None:
         future = self._accepted.pop(token, None)
@@ -272,6 +333,5 @@ class CommandExecutor:
     def debug_failure(self) -> BaseException | None:
         return self._failure
 
-    @property
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
         return tuple(self._applied_batches)

@@ -13,6 +13,8 @@ class MiniRedisConfig:
     maxmemory: int | None = None
     eviction_policy: EvictionPolicy = "noeviction"
     outbox_limit: int = 64
+    outbox_drain_grace_ms: int = 100
+    active_expire_interval_ms: int = 100
 
     def __post_init__(self) -> None:
         if self.max_pending_commands <= 0:
@@ -25,3 +27,7 @@ class MiniRedisConfig:
             raise ValueError("eviction_policy must be 'noeviction' or 'allkeys-lru'")
         if self.outbox_limit <= 0:
             raise ValueError("outbox_limit must be positive")
+        if self.outbox_drain_grace_ms < 0:
+            raise ValueError("outbox_drain_grace_ms cannot be negative")
+        if self.active_expire_interval_ms <= 0:
+            raise ValueError("active_expire_interval_ms must be positive")

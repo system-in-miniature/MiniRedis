@@ -43,6 +43,8 @@ from miniredis.core.outbound import (
     RequestToken,
     Replied,
     RuntimeClosed,
+    RuntimeFailed,
+    ServerClosed,
     SessionEndpoint,
     SubscriptionAck,
     TransportClosed,
@@ -80,6 +82,12 @@ class SessionClosed:
 class TimeoutWaiter:
     waiter_id: WaiterId
     generation: int
+
+
+@dataclass(slots=True)
+class BeginShutdown:
+    outcome: RequestOutcome
+    completion: asyncio.Future[None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -169,6 +177,7 @@ class CommandExecutor:
         self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
+        self._stop_after_current_message = False
         self._stopping = False
         self._started = False
 
@@ -276,6 +285,8 @@ class CommandExecutor:
                     if isinstance(message, _StopExecutor):
                         return
                     await self._dispatch(message)
+                    if self._stop_after_current_message:
+                        return
                 finally:
                     self._handling_message = False
                     self._on_debug_change()
@@ -304,6 +315,8 @@ class CommandExecutor:
             self._timeout_waiter(message)
         elif isinstance(message, SessionClosed):
             self._close_session(message)
+        elif isinstance(message, BeginShutdown):
+            self._begin_shutdown(message)
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -347,6 +360,25 @@ class CommandExecutor:
             event.completion.set_result(None)
         self._on_debug_change()
 
+    def _begin_shutdown(self, event: BeginShutdown) -> None:
+        self.mailbox.close_control_admission()
+        for waiter in self.waiters.active():
+            closed = self.waiters.transition(
+                waiter.waiter_id,
+                waiter.generation,
+                WaiterState.CLOSED,
+            )
+            if closed is not None:
+                self._finish_request(closed.token, event.outcome)
+        self.pubsub.clear()
+        for token in tuple(self._requests):
+            self._finish_request(token, event.outcome)
+        for endpoint in self._endpoints.values():
+            endpoint.offer_best_effort(ServerClosed("runtime closed"))
+        if not event.completion.done():
+            event.completion.set_result(None)
+        self._stop_after_current_message = True
+
     def _complete_terminal_failure(self, failure: BaseException) -> None:
         if self._terminal_cleanup_complete:
             return
@@ -356,7 +388,20 @@ class CommandExecutor:
         self.mailbox.close_user_admission()
         self.mailbox.drain()
         for token in tuple(self._requests):
-            self._finish_request(token, RuntimeClosed())
+            waiter = self.waiters.for_token(token)
+            if waiter is not None:
+                self.waiters.transition(
+                    waiter.waiter_id,
+                    waiter.generation,
+                    WaiterState.CLOSED,
+                )
+                self._finish_request(
+                    token,
+                    RuntimeFailed(str(failure) or type(failure).__name__),
+                )
+            else:
+                self._finish_request(token, RuntimeClosed())
+        self.pubsub.clear()
         self.mailbox.close_control_admission()
         self._on_debug_change()
         if self._on_terminal_failure is not None:
@@ -644,6 +689,42 @@ class CommandExecutor:
     @property
     def endpoint_count(self) -> int:
         return len(self._endpoints)
+
+    @property
+    def worker_task(self) -> asyncio.Task[None] | None:
+        return self._worker_task
+
+    @property
+    def worker_done(self) -> bool:
+        return self._worker_task is None or self._worker_task.done()
+
+    async def join(self) -> None:
+        if self._worker_task is not None:
+            await asyncio.gather(self._worker_task, return_exceptions=True)
+
+    def fallback_terminalize(self, outcome: RequestOutcome) -> None:
+        if not self.worker_done:
+            raise RuntimeError(
+                "fallback terminalization requires a stopped worker"
+            )
+        self.mailbox.close_control_admission()
+        for waiter in self.waiters.active():
+            closed = self.waiters.transition(
+                waiter.waiter_id,
+                waiter.generation,
+                WaiterState.CLOSED,
+            )
+            if closed is not None:
+                self._finish_request(closed.token, outcome)
+        self.pubsub.clear()
+        for token in tuple(self._requests):
+            self._finish_request(token, outcome)
+        for endpoint in self._endpoints.values():
+            endpoint.outbox.abort("runtime stopped")
+
+    def release_endpoints(self) -> None:
+        self._endpoints.clear()
+        self._on_debug_change()
 
     @property
     def debug_failure(self) -> BaseException | None:

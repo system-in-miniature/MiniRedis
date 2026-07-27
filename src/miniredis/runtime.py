@@ -22,12 +22,21 @@ from miniredis.core.blocking import WaiterId
 from miniredis.core.commit import CommitBatch, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
+    ActiveExpireTick,
+    BeginShutdown,
     CommandExecutor,
     CommitBarrier,
     NullCommitBarrier,
     SessionClosed,
 )
-from miniredis.core.outbound import RequestToken, SessionEndpoint
+from miniredis.core.expiration import ActiveExpireProducer
+from miniredis.core.outbound import (
+    RequestOutcome,
+    RequestToken,
+    RuntimeClosed,
+    RuntimeFailed,
+    SessionEndpoint,
+)
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
 
@@ -37,6 +46,7 @@ class RuntimeState(str, Enum):
     RUNNING = "running"
     DRAINING = "draining"
     CLOSED = "closed"
+    FAILED = "failed"
 
 
 @dataclass(frozen=True, slots=True)
@@ -86,7 +96,12 @@ class MiniRedis:
         self.state = RuntimeState.STARTING
         self._session_ids = itertools.count(1)
         self._start_task: asyncio.Task[None] | None = None
-        self._close_task: asyncio.Task[None] | None = None
+        self._lifecycle_lock = asyncio.Lock()
+        self._shutdown_task: asyncio.Task[None] | None = None
+        self._control_producers: set[object] = set()
+        self._owned_tasks: set[asyncio.Task[object]] = set()
+        self._failure_reason: str | None = None
+        self._shutdown_complete = False
 
     @classmethod
     def open(
@@ -131,7 +146,11 @@ class MiniRedis:
     async def start(self) -> None:
         if self.state is RuntimeState.RUNNING:
             return
-        if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
+        if self.state in {
+            RuntimeState.DRAINING,
+            RuntimeState.CLOSED,
+            RuntimeState.FAILED,
+        }:
             raise RuntimeError("runtime is closed")
         if self._start_task is None:
             self._start_task = asyncio.create_task(
@@ -141,8 +160,23 @@ class MiniRedis:
 
     async def _start_once(self) -> None:
         await self.executor.start()
-        if self.state is RuntimeState.STARTING:
-            self.state = RuntimeState.RUNNING
+        if self.state is not RuntimeState.STARTING:
+            return
+        worker = self.executor.worker_task
+        if worker is None:
+            raise RuntimeError("executor did not create its worker")
+        self._track_owned_task(worker)
+        worker.add_done_callback(self._executor_stopped)
+        producer = ActiveExpireProducer(
+            self.clock,
+            self.scheduler,
+            self.config.active_expire_interval_ms,
+            self.executor.post_control,
+            lambda now_ms: ActiveExpireTick(now_ms, None),
+        )
+        self._control_producers.add(producer)
+        producer.start()
+        self._set_state(RuntimeState.RUNNING)
 
     def parse(self, request: CommandRequest) -> Command | Failure:
         try:
@@ -151,7 +185,11 @@ class MiniRedis:
             return Failure("ERR", str(error))
 
     def direct_client(self) -> DirectClient:
-        if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
+        if self.state in {
+            RuntimeState.DRAINING,
+            RuntimeState.CLOSED,
+            RuntimeState.FAILED,
+        }:
             raise RuntimeError("runtime is closed")
         session_id = next(self._session_ids)
         endpoint = SessionEndpoint(
@@ -171,22 +209,125 @@ class MiniRedis:
         self.executor.post_control(SessionClosed(session_id))
 
     async def close(self) -> None:
-        if self._close_task is None:
-            self._close_task = asyncio.create_task(
-                self._close(), name="miniredis:runtime-close"
-            )
-        await asyncio.shield(self._close_task)
+        async with self._lifecycle_lock:
+            if self._shutdown_task is None:
+                self._shutdown_task = asyncio.create_task(
+                    self._shutdown_once(),
+                    name="miniredis:shutdown",
+                )
+                self._track_owned_task(self._shutdown_task)
+            task = self._shutdown_task
+        await asyncio.shield(task)
 
-    async def _close(self) -> None:
-        if self.state is RuntimeState.CLOSED:
+    async def _shutdown_once(self, crash: bool = False) -> None:
+        del crash
+        if self._shutdown_complete:
             return
-        self.state = RuntimeState.DRAINING
-        await self.executor.close()
-        self.state = RuntimeState.CLOSED
+        failure = self._failure_reason
+        if self.state is not RuntimeState.CLOSED:
+            self._set_state(RuntimeState.DRAINING)
+        self.executor.mailbox.close_user_admission()
+        await asyncio.gather(
+            *(
+                producer.quiesce()  # type: ignore[attr-defined]
+                for producer in tuple(self._control_producers)
+            )
+        )
+        outcome: RequestOutcome = (
+            RuntimeFailed(failure) if failure is not None else RuntimeClosed()
+        )
+        if self.executor.worker_done:
+            self.executor.fallback_terminalize(outcome)
+        else:
+            completion = asyncio.get_running_loop().create_future()
+            if self.executor.post_control(BeginShutdown(outcome, completion)):
+                worker = self.executor.worker_task
+                assert worker is not None
+                await asyncio.wait(
+                    (completion, worker),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if not completion.done():
+                    self.executor.fallback_terminalize(outcome)
+            else:
+                await self.executor.join()
+                self.executor.fallback_terminalize(outcome)
+
+        endpoints = self.executor.endpoints()
+        for endpoint in endpoints:
+            endpoint.outbox.begin_close("runtime closed")
+        drainers = [endpoint.outbox.wait_empty() for endpoint in endpoints]
+        if drainers:
+            try:
+                async with asyncio.timeout(
+                    self.config.outbox_drain_grace_ms / 1000
+                ):
+                    await asyncio.gather(*drainers)
+            except TimeoutError:
+                pass
+        for endpoint in endpoints:
+            endpoint.outbox.abort("runtime closed")
+            endpoint.request_transport_close("runtime closed")
+        self.executor.release_endpoints()
+        await self.executor.join()
+        self._control_producers.clear()
+        current = asyncio.current_task()
+        for owned in tuple(self._owned_tasks):
+            if owned.done() or owned is current:
+                self._owned_tasks.discard(owned)
+        self._shutdown_complete = True
+        self._set_state(RuntimeState.CLOSED)
 
     def _on_executor_terminal_failure(self, failure: BaseException) -> None:
-        del failure
-        self.state = RuntimeState.CLOSED
+        reason = str(failure) or type(failure).__name__
+        self._failure_reason = reason
+        self._set_state(RuntimeState.CLOSED)
+        self.executor.mailbox.close_user_admission()
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._shutdown_once(),
+                name="miniredis:failed-shutdown",
+            )
+            self._track_owned_task(self._shutdown_task)
+
+    def _executor_stopped(self, task: asyncio.Task[None]) -> None:
+        if self.state in {
+            RuntimeState.DRAINING,
+            RuntimeState.CLOSED,
+            RuntimeState.FAILED,
+        }:
+            return
+        if task.cancelled():
+            reason = "executor worker cancelled"
+        else:
+            error = task.exception()
+            reason = (
+                "executor worker stopped"
+                if error is None
+                else f"executor worker failed: {error}"
+            )
+        self._transition_failed(reason)
+
+    def _transition_failed(self, reason: str) -> None:
+        if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
+            return
+        self._failure_reason = reason
+        self._set_state(RuntimeState.FAILED)
+        self.executor.mailbox.close_user_admission()
+        if self._shutdown_task is None:
+            self._shutdown_task = asyncio.create_task(
+                self._shutdown_once(),
+                name="miniredis:failed-shutdown",
+            )
+            self._track_owned_task(self._shutdown_task)
+
+    def _set_state(self, state: RuntimeState) -> None:
+        self.state = state
+        self._debug_notify()
+
+    def _track_owned_task(self, task: asyncio.Task[object]) -> None:
+        self._owned_tasks.add(task)
+        task.add_done_callback(self._owned_tasks.discard)
 
     async def __aenter__(self) -> Self:
         await self.start()
@@ -202,6 +343,24 @@ class MiniRedis:
     @property
     def debug_physical_key_count(self) -> int:
         return len(self.database.entries)
+
+    @property
+    def closed(self) -> bool:
+        return self.state is RuntimeState.CLOSED
+
+    @property
+    def accepting_commands(self) -> bool:
+        return (
+            self.state is RuntimeState.RUNNING
+            and self.executor.mailbox.accepting_users
+        )
+
+    @property
+    def normal_shutdown_started(self) -> bool:
+        return (
+            self._failure_reason is None
+            and self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}
+        )
 
     async def debug_active_expire_once(self) -> int:
         if self.state is not RuntimeState.RUNNING:
@@ -235,7 +394,11 @@ class MiniRedis:
             subscriptions=self.executor.pubsub.membership_count,
             sessions=self.executor.endpoint_count,
             timer_handles=self.executor.waiters.timer_count,
-            owned_tasks=0,
+            owned_tasks=sum(
+                not task.done()
+                for task in self._owned_tasks
+                if task is not asyncio.current_task()
+            ),
         )
 
     def _debug_notify(self) -> None:
@@ -259,6 +422,15 @@ class MiniRedis:
 
     async def debug_wait_for_waiters(self, count: int) -> None:
         await self._debug_wait(lambda: self.executor.waiters.active_count == count)
+
+    async def debug_wait_for_state(self, value: str) -> None:
+        await self._debug_wait(lambda: self.state.value == value)
+
+    def debug_register_control_producer(self, producer: object) -> None:
+        if self.state is not RuntimeState.RUNNING:
+            raise RuntimeError("control producers register only while running")
+        self._control_producers.add(producer)
+        self._debug_notify()
 
     def debug_waiter_ids(self, key: bytes) -> tuple[WaiterId, ...]:
         return self.executor.waiters.ids_for_key(key)

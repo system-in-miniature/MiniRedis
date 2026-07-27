@@ -43,6 +43,10 @@ class DirectClient:
     async def execute(self, request: CommandRequest) -> Reply | None:
         if self._closed:
             return Failure("CLOSED", "client is closed")
+        if not self._runtime.accepting_commands:
+            if self._runtime.normal_shutdown_started:
+                return Failure("CLOSED", "runtime is not accepting commands")
+            return Failure("CLOSED", "runtime is closed")
         parsed = self._runtime.parse(request)
         if isinstance(parsed, Failure):
             return parsed

@@ -191,3 +191,47 @@ class Database:
             checkpoint_seq=self.commit_seq,
             entries=self.export_stored_entries(now_ms),
         )
+
+    def install_snapshot(
+        self,
+        image: SnapshotImage,
+        *,
+        now_ms: int,
+    ) -> None:
+        staged_entries: dict[bytes, Entry] = {}
+        staged_usage = 0
+        for key, stored in image.entries:
+            if (
+                stored.expire_at_ms is not None
+                and stored.expire_at_ms <= now_ms
+            ):
+                continue
+            value = thaw_value(stored.value)
+            size = logical_entry_size(key, value, stored.expire_at_ms)
+            staged_entries[key] = Entry(
+                value=value,
+                expire_at_ms=stored.expire_at_ms,
+                mutation_version=stored.mutation_version,
+                last_access_tick=0,
+                logical_size=size,
+            )
+            staged_usage += size
+
+        self.entries = staged_entries
+        self.logical_usage = staged_usage
+        self.commit_seq = image.checkpoint_seq
+        self.access_tick = 0
+
+    def discard_expired_for_recovery(self, now_ms: int) -> None:
+        expired = tuple(
+            key
+            for key, entry in self.entries.items()
+            if entry.expire_at_ms is not None
+            and entry.expire_at_ms <= now_ms
+        )
+        for key in expired:
+            entry = self.entries.pop(key)
+            self.logical_usage -= entry.logical_size
+        self.access_tick = 0
+        for entry in self.entries.values():
+            entry.last_access_tick = 0

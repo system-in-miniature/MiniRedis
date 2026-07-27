@@ -28,6 +28,7 @@ from miniredis.core.commit import (
     CommitBatch,
     CommitOperation,
     CommitTrigger,
+    PreparedCommit,
     PutEntry,
     StoredList,
 )
@@ -97,6 +98,12 @@ class ExecutionPlan:
     touch_keys: tuple[bytes, ...] = ()
     trigger: CommitTrigger = CommitTrigger.CLIENT
     waiter_wakeups: tuple[WaiterWakeup, ...] = ()
+
+    @property
+    def prepared_commit(self) -> PreparedCommit | None:
+        if not self.operations:
+            return None
+        return PreparedCommit(self.operations, self.trigger)
 
 
 class CommitBarrier(Protocol):

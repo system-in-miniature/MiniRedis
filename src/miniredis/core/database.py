@@ -7,6 +7,7 @@ from miniredis.core.commit import (
     CommitBatch,
     DeleteKey,
     PutEntry,
+    SnapshotImage,
     StoredEntry,
     StoredHash,
     StoredList,
@@ -106,7 +107,7 @@ def thaw_value(value: StoredValue) -> RedisValue:
             raise TypeError(f"unsupported stored value: {type(value)!r}")
 
 
-def _freeze_entry(entry: Entry) -> StoredEntry:
+def freeze_entry(entry: Entry) -> StoredEntry:
     return StoredEntry(
         value=freeze_value(entry.value),
         expire_at_ms=entry.expire_at_ms,
@@ -172,5 +173,21 @@ class Database:
 
     def logical_items(self) -> tuple[tuple[bytes, StoredEntry], ...]:
         return tuple(
-            (key, _freeze_entry(entry)) for key, entry in sorted(self.entries.items())
+            (key, freeze_entry(entry)) for key, entry in sorted(self.entries.items())
+        )
+
+    def export_stored_entries(
+        self,
+        now_ms: int,
+    ) -> tuple[tuple[bytes, StoredEntry], ...]:
+        return tuple(
+            (key, freeze_entry(entry))
+            for key, entry in sorted(self.entries.items())
+            if entry.expire_at_ms is None or entry.expire_at_ms > now_ms
+        )
+
+    def snapshot_image(self, now_ms: int) -> SnapshotImage:
+        return SnapshotImage(
+            checkpoint_seq=self.commit_seq,
+            entries=self.export_stored_entries(now_ms),
         )

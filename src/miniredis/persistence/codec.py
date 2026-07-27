@@ -4,6 +4,9 @@ import base64
 import binascii
 import json
 import math
+import struct
+import zlib
+from dataclasses import dataclass
 from typing import Any, NoReturn
 
 from miniredis.core.commit import (
@@ -24,10 +27,20 @@ from miniredis.core.commit import (
 
 
 PAYLOAD_VERSION = 1
+AOF_HEADER = b"MR-AOF\x01"
+SNAPSHOT_HEADER = b"MR-SNAP\x01"
+MAX_PAYLOAD_BYTES = 64 * 1024 * 1024
 
 
 class CodecError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class AofScan:
+    batches: tuple[CommitBatch, ...]
+    valid_offset: int
+    has_truncated_tail: bool
 
 
 def _fail(message: str) -> NoReturn:
@@ -425,3 +438,82 @@ def decode_snapshot_payload(payload: bytes) -> SnapshotImage:
         )
     except ValueError as exc:
         raise CodecError(str(exc)) from exc
+
+
+def _crc(payload: bytes) -> bytes:
+    return struct.pack(">I", zlib.crc32(payload))
+
+
+def encode_aof_record(batch: CommitBatch) -> bytes:
+    payload = encode_commit_payload(batch)
+    if len(payload) > MAX_PAYLOAD_BYTES:
+        raise CodecError("AOF payload exceeds limit")
+    return struct.pack(">I", len(payload)) + payload + _crc(payload)
+
+
+def scan_aof_bytes(data: bytes) -> AofScan:
+    if not data.startswith(AOF_HEADER):
+        raise CodecError("invalid AOF header")
+    offset = len(AOF_HEADER)
+    valid_offset = offset
+    batches: list[CommitBatch] = []
+    previous_seq: int | None = None
+    while offset < len(data):
+        if len(data) - offset < 4:
+            return AofScan(tuple(batches), valid_offset, True)
+        payload_length = struct.unpack_from(">I", data, offset)[0]
+        if payload_length > MAX_PAYLOAD_BYTES:
+            raise CodecError("AOF payload exceeds limit")
+        end = offset + 4 + payload_length + 4
+        if end > len(data):
+            return AofScan(tuple(batches), valid_offset, True)
+        payload_start = offset + 4
+        payload_end = payload_start + payload_length
+        payload = data[payload_start:payload_end]
+        expected_crc = struct.unpack_from(">I", data, payload_end)[0]
+        actual_crc = zlib.crc32(payload)
+        if actual_crc != expected_crc:
+            raise CodecError(f"AOF checksum failure at offset {offset}")
+        batch = decode_commit_payload(payload)
+        if previous_seq is not None and batch.seq != previous_seq + 1:
+            raise CodecError(
+                f"expected AOF seq {previous_seq + 1}, got {batch.seq}"
+            )
+        batches.append(batch)
+        previous_seq = batch.seq
+        offset = end
+        valid_offset = end
+    return AofScan(tuple(batches), valid_offset, False)
+
+
+def encode_snapshot_file(image: SnapshotImage) -> bytes:
+    payload = encode_snapshot_payload(image)
+    if len(payload) > MAX_PAYLOAD_BYTES:
+        raise CodecError("snapshot payload exceeds limit")
+    return (
+        SNAPSHOT_HEADER
+        + struct.pack(">Q", len(payload))
+        + payload
+        + _crc(payload)
+    )
+
+
+def decode_snapshot_file(data: bytes) -> SnapshotImage:
+    if not data.startswith(SNAPSHOT_HEADER):
+        raise CodecError("invalid snapshot header")
+    prefix = len(SNAPSHOT_HEADER)
+    if len(data) < prefix + 8 + 4:
+        raise CodecError("truncated snapshot")
+    payload_length = struct.unpack_from(">Q", data, prefix)[0]
+    if payload_length > MAX_PAYLOAD_BYTES:
+        raise CodecError("snapshot payload exceeds limit")
+    expected_size = prefix + 8 + payload_length + 4
+    if len(data) != expected_size:
+        raise CodecError("invalid snapshot length")
+    payload_start = prefix + 8
+    payload_end = payload_start + payload_length
+    payload = data[payload_start:payload_end]
+    expected_crc = struct.unpack_from(">I", data, payload_end)[0]
+    if zlib.crc32(payload) != expected_crc:
+        raise CodecError("snapshot checksum failure")
+    return decode_snapshot_payload(payload)

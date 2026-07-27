@@ -229,7 +229,7 @@ class MiniRedis:
             accepted_requests=self.executor.accepted_request_count,
             pending_futures=self.executor.pending_request_count,
             waiters=self.executor.waiters.active_count,
-            subscriptions=0,
+            subscriptions=self.executor.pubsub.membership_count,
             sessions=self.executor.endpoint_count,
             timer_handles=self.executor.waiters.timer_count,
             owned_tasks=0,

@@ -29,6 +29,7 @@ from miniredis.commands.model import (
     ListRange,
     Persist,
     Ping,
+    Publish,
     ScoreBound,
     SetAdd,
     SetIntersection,
@@ -36,8 +37,10 @@ from miniredis.commands.model import (
     SetMembers,
     SetRemove,
     SetString,
+    Subscribe,
     TimeToLive,
     TypeOf,
+    Unsubscribe,
     ZAdd,
     ZRange,
     ZRangeByScore,
@@ -234,6 +237,15 @@ def parse_request(request: CommandRequest) -> Command:
                 raise CommandParseError("timeout is out of range")
             milliseconds = int(timeout_ms.to_integral_value(rounding=ROUND_CEILING))
             return BlPop(tuple(args[:-1]), milliseconds)
+        case b"SUBSCRIBE":
+            if not args:
+                raise CommandParseError("wrong number of arguments")
+            return Subscribe(tuple(args))
+        case b"UNSUBSCRIBE":
+            return Unsubscribe(tuple(args))
+        case b"PUBLISH":
+            _require_arity(name, args, 2)
+            return Publish(args[0], args[1])
         case b"SADD":
             _require_min_arity(name, args, 2)
             return SetAdd(args[0], args[1:])

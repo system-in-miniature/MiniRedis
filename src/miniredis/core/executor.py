@@ -8,7 +8,15 @@ from dataclasses import dataclass, replace
 from typing import Protocol
 
 from miniredis.clock import Clock, TimerScheduler
-from miniredis.commands.model import BlPop, Command, ListPush
+from miniredis.commands.model import (
+    BlPop,
+    Command,
+    ListPush,
+    Ping,
+    Publish,
+    Subscribe,
+    Unsubscribe,
+)
 from miniredis.core.blocking import (
     WaiterId,
     WaiterRegistry,
@@ -28,15 +36,19 @@ from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
 from miniredis.core.outbound import (
     Abandoned,
+    PubSubMessage,
+    PubSubPong,
     ReplyMessage,
     RequestOutcome,
     RequestToken,
     Replied,
     RuntimeClosed,
     SessionEndpoint,
+    SubscriptionAck,
     TransportClosed,
 )
-from miniredis.core.reply import Bytes, Failure, Items, Reply
+from miniredis.core.pubsub import PubSubRegistry
+from miniredis.core.reply import Bytes, Failure, Items, Number, Reply
 
 
 @dataclass(slots=True)
@@ -139,6 +151,7 @@ class CommandExecutor:
         self._on_debug_change = on_debug_change
         self._on_terminal_failure = on_terminal_failure
         self.waiters = WaiterRegistry(self._on_debug_change)
+        self.pubsub = PubSubRegistry(self._on_debug_change)
         self.scheduler = scheduler
 
         self._worker_task: asyncio.Task[None] | None = None
@@ -325,6 +338,7 @@ class CommandExecutor:
             )
             if closed is not None:
                 self._finish_request(closed.token, TransportClosed())
+        self.pubsub.remove_session(event.session_id)
         endpoint = self._endpoints.pop(event.session_id, None)
         if endpoint is not None:
             endpoint.outbox.abort("session closed")
@@ -349,19 +363,43 @@ class CommandExecutor:
             self._on_terminal_failure(failure)
 
     async def _execute(self, request: ExecuteRequest) -> None:
+        command = request.command
+        if self.pubsub.count(request.session_id) > 0 and not isinstance(
+            command, (Ping, Subscribe, Unsubscribe)
+        ):
+            self._finish_reply(
+                request.token,
+                Failure(
+                    "ERR",
+                    "only PING, SUBSCRIBE and UNSUBSCRIBE are allowed "
+                    "in subscribed mode",
+                ),
+            )
+            return
+        if isinstance(command, Subscribe):
+            self._subscribe(request, command)
+            return
+        if isinstance(command, Unsubscribe):
+            self._unsubscribe(request, command)
+            return
+        if isinstance(command, Publish):
+            self._publish(request, command)
+            return
+        if isinstance(command, Ping) and self.pubsub.count(request.session_id) > 0:
+            self._subscribed_ping(request, command)
+            return
+
         now_ms = self.clock.now_ms()
-        if isinstance(request.command, BlPop):
-            plan = self.planner.plan_blpop_now(request.command, self.database, now_ms)
+        if isinstance(command, BlPop):
+            plan = self.planner.plan_blpop_now(command, self.database, now_ms)
             if plan is None:
                 deadline = (
-                    None
-                    if request.command.timeout_ms == 0
-                    else now_ms + request.command.timeout_ms
+                    None if command.timeout_ms == 0 else now_ms + command.timeout_ms
                 )
                 waiter = self.waiters.register(
                     request.token,
                     request.session_id,
-                    request.command.keys,
+                    command.keys,
                     deadline,
                 )
                 if waiter.deadline_ms is not None:
@@ -377,9 +415,52 @@ class CommandExecutor:
                     self._on_debug_change()
                 return
         else:
-            plan = self.planner.plan(request.command, self.database, now_ms)
-            plan = self._attach_push_wakeups(request.command, plan)
+            plan = self.planner.plan(command, self.database, now_ms)
+            plan = self._attach_push_wakeups(command, plan)
         await self._apply_plan(request, plan, now_ms)
+
+    def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
+        endpoint = self._endpoints[request.session_id]
+        for channel in command.channels:
+            count = self.pubsub.subscribe(request.session_id, channel)
+            if not endpoint.offer(SubscriptionAck("subscribe", channel, count)):
+                self._finish_request(request.token, TransportClosed())
+                return
+        self._finish_request(request.token, Replied(None))
+
+    def _unsubscribe(self, request: ExecuteRequest, command: Unsubscribe) -> None:
+        endpoint = self._endpoints[request.session_id]
+        for channel in self.pubsub.unsubscribe_targets(
+            request.session_id,
+            command.channels,
+        ):
+            count = (
+                self.pubsub.count(request.session_id)
+                if channel is None
+                else self.pubsub.unsubscribe(request.session_id, channel)
+            )
+            if not endpoint.offer(SubscriptionAck("unsubscribe", channel, count)):
+                self._finish_request(request.token, TransportClosed())
+                return
+        self._finish_request(request.token, Replied(None))
+
+    def _publish(self, request: ExecuteRequest, command: Publish) -> None:
+        delivered = 0
+        for session_id in self.pubsub.subscribers(command.channel):
+            endpoint = self._endpoints.get(session_id)
+            if endpoint is not None and endpoint.offer(
+                PubSubMessage(command.channel, command.payload)
+            ):
+                delivered += 1
+        self._finish_reply(request.token, Number(delivered))
+
+    def _subscribed_ping(self, request: ExecuteRequest, command: Ping) -> None:
+        payload = b"" if command.message is None else command.message
+        endpoint = self._endpoints[request.session_id]
+        if endpoint.offer(PubSubPong(payload)):
+            self._finish_request(request.token, Replied(None))
+        else:
+            self._finish_request(request.token, TransportClosed())
 
     def _attach_push_wakeups(
         self,

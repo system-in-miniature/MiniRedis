@@ -105,6 +105,22 @@ class BlPop:
 
 
 @dataclass(frozen=True, slots=True)
+class Subscribe:
+    channels: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Unsubscribe:
+    channels: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Publish:
+    channel: bytes
+    payload: bytes
+
+
+@dataclass(frozen=True, slots=True)
 class SetAdd:
     key: bytes
     members: tuple[bytes, ...]
@@ -211,6 +227,9 @@ Command: TypeAlias = (
     | ListPop
     | ListRange
     | BlPop
+    | Subscribe
+    | Unsubscribe
+    | Publish
     | SetAdd
     | SetRemove
     | SetIsMember

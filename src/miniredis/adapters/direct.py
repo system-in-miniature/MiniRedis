@@ -67,6 +67,8 @@ class DirectClient:
         match outcome:
             case Replied(reply=reply):
                 return reply
+            case RuntimeClosed() if self._runtime.normal_shutdown_started:
+                return Failure("CLOSED", "runtime closed")
             case RuntimeClosed():
                 return Failure("CLOSED", "runtime closed before reply")
             case TransportClosed() if isinstance(parsed, BlPop):

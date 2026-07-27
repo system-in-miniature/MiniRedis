@@ -27,6 +27,20 @@ implementation emits deterministic test-friendly order.
 Phase 1 does not claim `BLPOP`, Pub/Sub, persistence, replication, RESP, or TCP
 support. Those boundaries are added only by their later implementation phases.
 
+## Async semantics
+
+MiniRedis implements BLPOP with executor-owned FIFO waiter indexes and
+deterministic injected timers. Push plus all resulting blocked pops is one
+CommitBatch; cancellation, timeout, disconnect, and shutdown are ordered
+control messages.
+
+Pub/Sub is exact-channel, ephemeral, bounded, and at-most-once. A full endpoint
+is closed without blocking other clients. Runtime shutdown first quiesces
+control producers, then executes one barrier and drains accepted output for a
+bounded grace period. These mechanisms do not provide reliable queues,
+delivery acknowledgment, replay, pattern subscriptions, or a general event
+bus.
+
 Run the complete suite from this directory:
 
 ```bash

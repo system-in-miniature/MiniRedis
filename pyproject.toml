@@ -13,6 +13,7 @@ dependencies = []
 dev = [
     "pytest>=9,<10",
     "pytest-asyncio>=1.3,<2",
+    "redis>=8,<9",
 ]
 
 [tool.hatch.build.targets.wheel]
@@ -22,5 +23,8 @@ packages = ["src/miniredis"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 asyncio_default_test_loop_scope = "function"
-pythonpath = ["src", "."]
+pythonpath = ["src"]
 testpaths = ["tests"]
+markers = [
+    "interop: redis-py RESP2 smoke with client metadata disabled",
+]

@@ -364,3 +364,22 @@ class AofWriter:
                 self._record_failure(exc)
         fd, self._fd = self._fd, None
         await asyncio.to_thread(self._ops.close, fd)
+
+    async def crash_close(self) -> None:
+        if self._fd is None:
+            return
+        self._accepting = False
+        if self._worker is not None and not self._worker.done():
+            self._queue.put_nowait(_STOP)
+            await asyncio.shield(self._worker)
+        if self._sync_task is not None:
+            if self._sync_inflight:
+                await asyncio.shield(self._sync_task)
+            else:
+                self._sync_task.cancel()
+                try:
+                    await self._sync_task
+                except asyncio.CancelledError:
+                    pass
+        fd, self._fd = self._fd, None
+        await asyncio.to_thread(self._ops.close, fd)

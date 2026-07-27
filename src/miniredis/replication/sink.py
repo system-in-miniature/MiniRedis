@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
 from miniredis.core.commit import CommitBatch, SnapshotImage
 
 if TYPE_CHECKING:
+    from miniredis.core.executor import PromotionResult
     from miniredis.runtime import MiniRedis
 
 
@@ -234,3 +235,71 @@ class ReplicaSink:
         task = self._task
         if task is not None:
             await asyncio.shield(task)
+
+    async def promote(self, *, source_alive: bool) -> PromotionResult:
+        if self._generation is None:
+            raise RuntimeError("replica sink has no generation")
+        if self._state not in {
+            ReplicaSinkState.BOOTSTRAPPING,
+            ReplicaSinkState.STREAMING,
+            ReplicaSinkState.NEEDS_RESYNC,
+            ReplicaSinkState.SOURCE_LOST,
+        }:
+            raise RuntimeError(f"cannot promote sink in state {self._state}")
+        self._state = ReplicaSinkState.PROMOTING
+        self._signal_status_change()
+
+        if source_alive:
+            if self._primary is None:
+                raise RuntimeError("live source is unavailable")
+            primary = self._primary
+            await primary.executor.detach_replica(self._generation)
+            primary._release_replica_sink(self)
+
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._queue.clear()
+        result = await self._replica.executor.promote_replica(
+            self._generation
+        )
+        if not result.writable:
+            self._state = ReplicaSinkState.FAILED
+            self._signal_status_change()
+            raise RuntimeError("replica generation is no longer promotable")
+        self._applied_seq = result.applied_seq
+        self._primary_seq = max(self._primary_seq, result.applied_seq)
+        self._state = ReplicaSinkState.PROMOTED
+        self._primary = None
+        self._signal_status_change()
+        return result
+
+    async def source_crashed(self) -> None:
+        self._state = ReplicaSinkState.SOURCE_LOST
+        self._signal_status_change()
+        attach_task = self._attach_task
+        current = asyncio.current_task()
+        if (
+            attach_task is not None
+            and attach_task is not current
+            and not attach_task.done()
+        ):
+            attach_task.cancel()
+            try:
+                await attach_task
+            except asyncio.CancelledError:
+                pass
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._queue.clear()
+        self._primary = None
+        self._signal_status_change()

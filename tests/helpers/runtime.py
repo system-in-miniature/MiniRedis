@@ -30,6 +30,8 @@ class GateSnapshotFileOps:
 class TestMiniRedis(MiniRedis):
     debug_snapshot_write_entered: asyncio.Event
     debug_snapshot_write_release: threading.Event
+    debug_replica_apply_entered: asyncio.Event
+    debug_replica_apply_release: asyncio.Event
 
 
 async def open_test_runtime(
@@ -40,9 +42,12 @@ async def open_test_runtime(
     config=None,
     snapshot_write_gate: bool = False,
     replica_apply_failure: BaseException | None = None,
+    replica_apply_gate: bool = False,
 ) -> TestMiniRedis:
     loop = asyncio.get_running_loop()
     snapshot_gate = GateSnapshotFileOps(loop) if snapshot_write_gate else None
+    apply_entered = asyncio.Event() if replica_apply_gate else None
+    apply_release = asyncio.Event() if replica_apply_gate else None
     runtime = TestMiniRedis._for_test(
         config=config,
         clock=clock,
@@ -51,10 +56,15 @@ async def open_test_runtime(
             aof_appender=aof_appender,
             snapshot_ops=snapshot_gate,
             replica_apply_failure=replica_apply_failure,
+            replica_apply_entered=apply_entered,
+            replica_apply_release=apply_release,
         ),
     )
     if snapshot_gate is not None:
         runtime.debug_snapshot_write_entered = snapshot_gate.entered
         runtime.debug_snapshot_write_release = snapshot_gate.release
+    if apply_entered is not None and apply_release is not None:
+        runtime.debug_replica_apply_entered = apply_entered
+        runtime.debug_replica_apply_release = apply_release
     await runtime.start()
     return runtime

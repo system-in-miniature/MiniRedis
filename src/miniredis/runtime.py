@@ -74,6 +74,8 @@ class _RuntimeTestHooks:
     aof_appender: CommitBarrier | None = None
     snapshot_ops: SnapshotFileOps | None = None
     replica_apply_failure: BaseException | None = None
+    replica_apply_entered: asyncio.Event | None = None
+    replica_apply_release: asyncio.Event | None = None
 
 
 def _direct_transport_close(_reason: str) -> None:
@@ -121,6 +123,16 @@ class MiniRedis:
                 None
                 if self._test_hooks is None
                 else self._test_hooks.replica_apply_failure
+            ),
+            replica_apply_entered=(
+                None
+                if self._test_hooks is None
+                else self._test_hooks.replica_apply_entered
+            ),
+            replica_apply_release=(
+                None
+                if self._test_hooks is None
+                else self._test_hooks.replica_apply_release
             ),
         )
         self._snapshot_manager = (
@@ -273,7 +285,6 @@ class MiniRedis:
             self._set_state(RuntimeState.CLOSED)
 
     async def _shutdown_once(self, crash: bool = False) -> None:
-        del crash
         if self._shutdown_complete:
             return
         failure = self._failure_reason
@@ -310,7 +321,11 @@ class MiniRedis:
         endpoints = self.executor.endpoints()
         for endpoint in endpoints:
             endpoint.outbox.begin_close("runtime closed")
-        drainers = [endpoint.outbox.wait_empty() for endpoint in endpoints]
+        drainers = (
+            [endpoint.outbox.wait_empty() for endpoint in endpoints]
+            if not crash
+            else []
+        )
         if drainers:
             try:
                 async with asyncio.timeout(
@@ -324,6 +339,12 @@ class MiniRedis:
             endpoint.request_transport_close("runtime closed")
         self.executor.release_endpoints()
         await self.executor.join()
+        if crash:
+            for sink in tuple(self._owned_replica_sinks):
+                await sink.source_crashed()
+            self._owned_replica_sinks.clear()
+            if self._aof_writer is not None:
+                await asyncio.shield(self._aof_writer.crash_close())
         self._control_producers.clear()
         current = asyncio.current_task()
         for owned in tuple(self._owned_tasks):
@@ -414,6 +435,20 @@ class MiniRedis:
     ) -> None:
         if task.cancelled() or task.exception() is not None:
             self._owned_replica_sinks.discard(sink)
+
+    def _release_replica_sink(self, sink: ReplicaSink) -> None:
+        self._owned_replica_sinks.discard(sink)
+
+    async def simulate_crash(self) -> None:
+        async with self._lifecycle_lock:
+            if self._shutdown_task is None:
+                self._shutdown_task = asyncio.create_task(
+                    self._shutdown_once(crash=True),
+                    name="miniredis:simulated-crash",
+                )
+                self._track_owned_task(self._shutdown_task)
+            task = self._shutdown_task
+        await asyncio.shield(task)
 
     async def __aenter__(self) -> Self:
         await self.start()

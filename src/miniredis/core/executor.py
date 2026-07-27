@@ -135,6 +135,18 @@ class ApplyReplicaBatch:
 
 
 @dataclass(frozen=True, slots=True)
+class PromotionResult:
+    applied_seq: int
+    writable: bool
+
+
+@dataclass(slots=True)
+class PromoteReplica:
+    generation: int
+    future: asyncio.Future[PromotionResult]
+
+
+@dataclass(frozen=True, slots=True)
 class ExecutionPlan:
     reply: Reply | None
     operations: tuple[CommitOperation, ...] = ()
@@ -200,6 +212,8 @@ class CommandExecutor:
         on_terminal_failure: Callable[[BaseException], None] | None = None,
         on_fatal: Callable[[str], None] | None = None,
         replica_apply_failure: BaseException | None = None,
+        replica_apply_entered: asyncio.Event | None = None,
+        replica_apply_release: asyncio.Event | None = None,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -237,6 +251,12 @@ class CommandExecutor:
         self._active_source_generation: int | None = None
         self._replica_read_only = False
         self._replica_apply_failure = replica_apply_failure
+        if (replica_apply_entered is None) != (replica_apply_release is None):
+            raise ValueError(
+                "replica apply gate requires both entered and release events"
+            )
+        self._replica_apply_entered = replica_apply_entered
+        self._replica_apply_release = replica_apply_release
         self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
@@ -412,6 +432,10 @@ class CommandExecutor:
                 message.future.set_result(False)
                 return
             try:
+                if self._replica_apply_entered is not None:
+                    assert self._replica_apply_release is not None
+                    self._replica_apply_entered.set()
+                    await self._replica_apply_release.wait()
                 if self._replica_apply_failure is not None:
                     error = self._replica_apply_failure
                     self._replica_apply_failure = None
@@ -421,6 +445,17 @@ class CommandExecutor:
                 message.future.set_exception(exc)
             else:
                 message.future.set_result(True)
+        elif isinstance(message, PromoteReplica):
+            if message.generation != self._active_source_generation:
+                message.future.set_result(
+                    PromotionResult(self.database.commit_seq, False)
+                )
+                return
+            self._active_source_generation = None
+            self._replica_read_only = False
+            message.future.set_result(
+                PromotionResult(self.database.commit_seq, True)
+            )
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -755,6 +790,14 @@ class CommandExecutor:
             ApplyReplicaBatch(generation, batch, future)
         ):
             return False
+        return await asyncio.shield(future)
+
+    async def promote_replica(self, generation: int) -> PromotionResult:
+        future: asyncio.Future[PromotionResult] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if not self.post_control(PromoteReplica(generation, future)):
+            raise RuntimeError("executor control admission is closed")
         return await asyncio.shield(future)
 
     async def _active_expire_once(self, now_ms: int) -> int:

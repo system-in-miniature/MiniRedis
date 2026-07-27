@@ -30,6 +30,7 @@ from miniredis.core.commit import (
     CommitTrigger,
     PreparedCommit,
     PutEntry,
+    SnapshotImage,
     StoredList,
 )
 from miniredis.core.database import Database
@@ -97,6 +98,11 @@ class TimeoutWaiter:
 class BeginShutdown:
     outcome: RequestOutcome
     completion: asyncio.Future[None]
+
+
+@dataclass(slots=True)
+class SnapshotBarrier:
+    future: asyncio.Future[SnapshotImage]
 
 
 @dataclass(frozen=True, slots=True)
@@ -340,6 +346,10 @@ class CommandExecutor:
             self._close_session(message)
         elif isinstance(message, BeginShutdown):
             self._begin_shutdown(message)
+        elif isinstance(message, SnapshotBarrier):
+            image = self.database.snapshot_image(self.clock.now_ms())
+            if not message.future.done():
+                message.future.set_result(image)
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -621,6 +631,14 @@ class CommandExecutor:
         tick = ActiveExpireTick(self.clock.now_ms(), future)
         if not self.post_control(tick):
             return 0
+        return await asyncio.shield(future)
+
+    async def capture_snapshot(self) -> SnapshotImage:
+        future: asyncio.Future[SnapshotImage] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if not self.post_control(SnapshotBarrier(future)):
+            raise RuntimeError("executor control admission is closed")
         return await asyncio.shield(future)
 
     async def _active_expire_once(self, now_ms: int) -> int:

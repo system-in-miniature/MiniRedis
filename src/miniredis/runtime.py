@@ -40,6 +40,12 @@ from miniredis.core.outbound import (
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
 from miniredis.persistence.aof import AofWriter
+from miniredis.persistence.snapshot import (
+    SnapshotFailed,
+    SnapshotFileOps,
+    SnapshotManager,
+    SnapshotOutcome,
+)
 
 
 class RuntimeState(str, Enum):
@@ -64,6 +70,7 @@ class RuntimeStats:
 @dataclass(slots=True)
 class _RuntimeTestHooks:
     aof_appender: CommitBarrier | None = None
+    snapshot_ops: SnapshotFileOps | None = None
 
 
 def _direct_transport_close(_reason: str) -> None:
@@ -107,6 +114,19 @@ class MiniRedis:
             on_debug_change=self._debug_notify,
             on_terminal_failure=self._on_executor_terminal_failure,
             on_fatal=self._transition_failed,
+        )
+        self._snapshot_manager = (
+            SnapshotManager(
+                config.snapshot_path,
+                self.executor.capture_snapshot,
+                ops=(
+                    None
+                    if self._test_hooks is None
+                    else self._test_hooks.snapshot_ops
+                ),
+            )
+            if config.snapshot_path is not None
+            else None
         )
         self.state = RuntimeState.STARTING
         self._session_ids = itertools.count(1)
@@ -395,6 +415,13 @@ class MiniRedis:
         if self.state is not RuntimeState.RUNNING:
             return 0
         return await self.executor.active_expire_once()
+
+    async def save_snapshot(self) -> SnapshotOutcome:
+        if self.state is not RuntimeState.RUNNING:
+            return SnapshotFailed("runtime is not running")
+        if self._snapshot_manager is None:
+            return SnapshotFailed("snapshot_path is not configured")
+        return await self._snapshot_manager.save()
 
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
         return self.executor.debug_applied_batches()

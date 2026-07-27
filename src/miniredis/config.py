@@ -22,6 +22,7 @@ class MiniRedisConfig:
     aof_policy: AofPolicy = AofPolicy.EVERYSEC
     aof_repair_truncated_tail: bool = True
     aof_fsync_interval_seconds: float = 1.0
+    snapshot_path: Path | None = None
 
     def __post_init__(self) -> None:
         if self.max_pending_commands <= 0:

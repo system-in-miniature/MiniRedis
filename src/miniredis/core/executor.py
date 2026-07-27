@@ -175,6 +175,10 @@ class DurabilityFailure(RuntimeError):
     pass
 
 
+class _InjectedExecutorFailure(RuntimeError):
+    pass
+
+
 class Planner(Protocol):
     def plan(
         self, command: Command, database: Database, now_ms: int
@@ -214,6 +218,7 @@ class CommandExecutor:
         replica_apply_failure: BaseException | None = None,
         replica_apply_entered: asyncio.Event | None = None,
         replica_apply_release: asyncio.Event | None = None,
+        allow_failure_injection: bool = False,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -260,9 +265,24 @@ class CommandExecutor:
         self._handling_message = False
         self._failure: BaseException | None = None
         self._terminal_cleanup_complete = False
-        self._stop_after_current_message = False
+        self._shutdown_barrier_held = False
+        self._shutdown_release = asyncio.Event()
         self._stopping = False
         self._started = False
+        self._allow_failure_injection = allow_failure_injection
+
+    def install_database_before_start(self, database: Database) -> None:
+        if self._started:
+            raise RuntimeError("database can only be installed before start")
+        self.database = database
+
+    def set_commit_barrier_before_start(
+        self,
+        commit_barrier: CommitBarrier,
+    ) -> None:
+        if self._started:
+            raise RuntimeError("commit barrier can only be installed before start")
+        self.commit_barrier = commit_barrier
 
     async def start(self) -> None:
         if self._started:
@@ -368,7 +388,8 @@ class CommandExecutor:
                     if isinstance(message, _StopExecutor):
                         return
                     await self._dispatch(message)
-                    if self._stop_after_current_message:
+                    if self._shutdown_barrier_held:
+                        await self._shutdown_release.wait()
                         return
                 finally:
                     self._handling_message = False
@@ -400,10 +421,18 @@ class CommandExecutor:
             self._close_session(message)
         elif isinstance(message, BeginShutdown):
             self._begin_shutdown(message)
+        elif isinstance(message, _InjectedExecutorFailure):
+            raise message
         elif isinstance(message, SnapshotBarrier):
-            image = self.database.snapshot_image(self.clock.now_ms())
-            if not message.future.done():
-                message.future.set_result(image)
+            try:
+                image = self.database.snapshot_image(self.clock.now_ms())
+            except BaseException as exc:
+                if not message.future.done():
+                    message.future.set_exception(exc)
+                self._on_fatal(str(exc) or type(exc).__name__)
+            else:
+                if not message.future.done():
+                    message.future.set_result(image)
         elif isinstance(message, AttachReplica):
             generation = self._next_replica_generation
             self._next_replica_generation += 1
@@ -453,9 +482,7 @@ class CommandExecutor:
                 return
             self._active_source_generation = None
             self._replica_read_only = False
-            message.future.set_result(
-                PromotionResult(self.database.commit_seq, True)
-            )
+            message.future.set_result(PromotionResult(self.database.commit_seq, True))
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 
@@ -510,13 +537,14 @@ class CommandExecutor:
             if closed is not None:
                 self._finish_request(closed.token, event.outcome)
         self.pubsub.clear()
+        self._replica_sinks.clear()
         for token in tuple(self._requests):
             self._finish_request(token, event.outcome)
         for endpoint in self._endpoints.values():
             endpoint.offer_best_effort(ServerClosed("runtime closed"))
         if not event.completion.done():
             event.completion.set_result(None)
-        self._stop_after_current_message = True
+        self._shutdown_barrier_held = True
 
     def _complete_terminal_failure(self, failure: BaseException) -> None:
         if self._terminal_cleanup_complete:
@@ -786,9 +814,7 @@ class CommandExecutor:
         batch: CommitBatch,
     ) -> bool:
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
-        if not self.post_control(
-            ApplyReplicaBatch(generation, batch, future)
-        ):
+        if not self.post_control(ApplyReplicaBatch(generation, batch, future)):
             return False
         return await asyncio.shield(future)
 
@@ -859,6 +885,17 @@ class CommandExecutor:
                 self._finish_request(token, RuntimeClosed())
             self.mailbox.close_control_admission()
             self._on_debug_change()
+
+    async def stop_after_shutdown_barrier(self) -> None:
+        self._stopping = True
+        self._shutdown_release.set()
+        await self.join()
+
+    def debug_fail(self, failure: BaseException) -> None:
+        if not self._allow_failure_injection:
+            raise RuntimeError("executor failure injection is test-only")
+        if not self.post_control(_InjectedExecutorFailure(str(failure))):
+            raise RuntimeError("executor control admission is closed")
 
     def debug_pause(self) -> None:
         self._run_gate.clear()
@@ -931,9 +968,7 @@ class CommandExecutor:
 
     def fallback_terminalize(self, outcome: RequestOutcome) -> None:
         if not self.worker_done:
-            raise RuntimeError(
-                "fallback terminalization requires a stopped worker"
-            )
+            raise RuntimeError("fallback terminalization requires a stopped worker")
         self.mailbox.close_control_admission()
         for waiter in self.waiters.active():
             closed = self.waiters.transition(

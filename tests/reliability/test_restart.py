@@ -1,0 +1,55 @@
+import pytest
+
+from miniredis import CommandRequest, MiniRedis
+from miniredis.config import MiniRedisConfig
+from miniredis.core.reply import Bytes, Ok
+from miniredis.persistence.aof import AofPolicy
+from miniredis.persistence.recovery import RecoveryError
+from miniredis.runtime import RuntimeState
+
+
+@pytest.mark.asyncio
+async def test_runtime_recovers_snapshot_then_later_aof_commits(tmp_path):
+    config = MiniRedisConfig(
+        aof_path=tmp_path / "appendonly.mraof",
+        aof_policy=AofPolicy.ALWAYS,
+        snapshot_path=tmp_path / "dump.mrsnap",
+    )
+    first = MiniRedis.open(config)
+    await first.start()
+    client = first.direct_client()
+    assert await client.execute(CommandRequest(b"SET", (b"before", b"1"))) == Ok()
+    saved = await first.save_snapshot()
+    assert saved.checkpoint_seq == 1
+    assert await client.execute(CommandRequest(b"SET", (b"after", b"2"))) == Ok()
+    await first.close()
+
+    second = MiniRedis.open(config)
+    await second.start()
+    recovered = second.direct_client()
+    assert await recovered.execute(CommandRequest(b"GET", (b"before",))) == Bytes(b"1")
+    assert await recovered.execute(CommandRequest(b"GET", (b"after",))) == Bytes(b"2")
+    assert second.debug_commit_seq == 2
+    await second.close()
+
+
+@pytest.mark.asyncio
+async def test_corrupt_startup_never_accepts_clients_or_leaks_workers(
+    tmp_path,
+):
+    snapshot = tmp_path / "dump.mrsnap"
+    snapshot.write_bytes(b"corrupt")
+    runtime = MiniRedis.open(MiniRedisConfig(snapshot_path=snapshot))
+    prestart = runtime.direct_client()
+    rejected = await prestart.execute(CommandRequest(b"PING"))
+    assert rejected.code == "CLOSED"
+
+    with pytest.raises(RecoveryError, match="snapshot"):
+        await runtime.start()
+
+    assert runtime.state is RuntimeState.FAILED
+    stats = runtime.debug_stats()
+    assert stats.accepting_users is False
+    assert stats.owned_tasks == 0
+    assert stats.sessions == 0
+    await runtime.close()

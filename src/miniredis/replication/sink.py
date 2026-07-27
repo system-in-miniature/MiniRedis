@@ -123,12 +123,10 @@ class ReplicaSink:
                 await self._install_gate.wait()
             if self._state is not ReplicaSinkState.BOOTSTRAPPING:
                 return self.status
-            installed = (
-                await self._replica.executor.install_replica_snapshot(
-                    self,
-                    attachment.generation,
-                    attachment.image,
-                )
+            installed = await self._replica.executor.install_replica_snapshot(
+                self,
+                attachment.generation,
+                attachment.image,
             )
             if not installed:
                 return self.status
@@ -189,9 +187,7 @@ class ReplicaSink:
                     self._state = ReplicaSinkState.NEEDS_RESYNC
                     self._signal_status_change()
                     if self._primary is not None:
-                        await self._primary.executor.detach_replica(
-                            self._generation
-                        )
+                        await self._primary.executor.detach_replica(self._generation)
                     return
                 self._applied_seq = batch.seq
                 self._signal_status_change()
@@ -202,9 +198,7 @@ class ReplicaSink:
             self._queue.clear()
             self._signal_status_change()
             if self._primary is not None and self._generation is not None:
-                await self._primary.executor.detach_replica(
-                    self._generation
-                )
+                await self._primary.executor.detach_replica(self._generation)
         finally:
             self._signal_status_change()
 
@@ -219,16 +213,12 @@ class ReplicaSink:
             if self._applied_seq >= seq:
                 return
             if self._state in terminal:
-                raise RuntimeError(
-                    f"replica stopped at seq {self._applied_seq}"
-                )
+                raise RuntimeError(f"replica stopped at seq {self._applied_seq}")
             self._status_changed.clear()
             if self._applied_seq >= seq:
                 return
             if self._state in terminal:
-                raise RuntimeError(
-                    f"replica stopped at seq {self._applied_seq}"
-                )
+                raise RuntimeError(f"replica stopped at seq {self._applied_seq}")
             await self._status_changed.wait()
 
     async def wait_until_stopped(self) -> None:
@@ -264,9 +254,7 @@ class ReplicaSink:
             except asyncio.CancelledError:
                 pass
         self._queue.clear()
-        result = await self._replica.executor.promote_replica(
-            self._generation
-        )
+        result = await self._replica.executor.promote_replica(self._generation)
         if not result.writable:
             self._state = ReplicaSinkState.FAILED
             self._signal_status_change()
@@ -301,5 +289,43 @@ class ReplicaSink:
             except asyncio.CancelledError:
                 pass
         self._queue.clear()
+        self._primary = None
+        self._signal_status_change()
+
+    async def drain_and_stop(self, grace_ms: int) -> None:
+        attach_task = self._attach_task
+        current = asyncio.current_task()
+        if (
+            attach_task is not None
+            and attach_task is not current
+            and not attach_task.done()
+        ):
+            attach_task.cancel()
+            try:
+                await attach_task
+            except asyncio.CancelledError:
+                pass
+
+        task = self._task
+        if task is not None and not task.done() and self._queue:
+            self._apply_allowed.set()
+            try:
+                async with asyncio.timeout(grace_ms / 1000):
+                    while self._queue and not task.done():
+                        self._status_changed.clear()
+                        if not self._queue or task.done():
+                            break
+                        await self._status_changed.wait()
+            except TimeoutError:
+                pass
+
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._queue.clear()
+        self._state = ReplicaSinkState.STOPPED
         self._primary = None
         self._signal_status_change()

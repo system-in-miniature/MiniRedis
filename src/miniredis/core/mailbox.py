@@ -86,6 +86,12 @@ class EventLoopMailbox[T]:
         self._user_open = False
         self._changed.set()
 
+    def open_user_admission(self) -> None:
+        if not self._control_open:
+            raise RuntimeError("cannot reopen user admission after control close")
+        self._user_open = True
+        self._changed.set()
+
     def close_control_admission(self) -> None:
         self._control_open = False
         self._changed.set()

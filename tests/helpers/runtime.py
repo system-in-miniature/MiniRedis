@@ -1,11 +1,13 @@
 import asyncio
 import threading
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from miniredis.persistence.snapshot import (
     PosixSnapshotFileOps,
     SnapshotFileOps,
 )
+from miniredis.persistence.aof import AofFileOps
 from miniredis.runtime import MiniRedis, _RuntimeTestHooks
 
 
@@ -43,6 +45,9 @@ async def open_test_runtime(
     snapshot_write_gate: bool = False,
     replica_apply_failure: BaseException | None = None,
     replica_apply_gate: bool = False,
+    aof_ops: AofFileOps | None = None,
+    aof_sleep: Callable[[float], Awaitable[None]] | None = None,
+    lifecycle_trace: bool = False,
 ) -> TestMiniRedis:
     loop = asyncio.get_running_loop()
     snapshot_gate = GateSnapshotFileOps(loop) if snapshot_write_gate else None
@@ -58,6 +63,9 @@ async def open_test_runtime(
             replica_apply_failure=replica_apply_failure,
             replica_apply_entered=apply_entered,
             replica_apply_release=apply_release,
+            aof_ops=aof_ops,
+            aof_sleep=aof_sleep,
+            lifecycle_trace=[] if lifecycle_trace else None,
         ),
     )
     if snapshot_gate is not None:

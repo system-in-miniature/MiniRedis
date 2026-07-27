@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Self
@@ -39,7 +39,8 @@ from miniredis.core.outbound import (
 )
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
-from miniredis.persistence.aof import AofWriter
+from miniredis.persistence.aof import AofFileOps, AofWriter
+from miniredis.persistence.recovery import recover_database
 from miniredis.persistence.snapshot import (
     SnapshotFailed,
     SnapshotFileOps,
@@ -67,6 +68,8 @@ class RuntimeStats:
     timer_handles: int
     owned_tasks: int
     replica_links: int
+    accepting_users: bool
+    snapshot_jobs: int
 
 
 @dataclass(slots=True)
@@ -76,6 +79,9 @@ class _RuntimeTestHooks:
     replica_apply_failure: BaseException | None = None
     replica_apply_entered: asyncio.Event | None = None
     replica_apply_release: asyncio.Event | None = None
+    aof_ops: AofFileOps | None = None
+    aof_sleep: Callable[[float], Awaitable[None]] | None = None
+    lifecycle_trace: list[str] | None = None
 
 
 def _direct_transport_close(_reason: str) -> None:
@@ -134,15 +140,15 @@ class MiniRedis:
                 if self._test_hooks is None
                 else self._test_hooks.replica_apply_release
             ),
+            allow_failure_injection=self._test_hooks is not None,
         )
+        self.executor.mailbox.close_user_admission()
         self._snapshot_manager = (
             SnapshotManager(
                 config.snapshot_path,
                 self.executor.capture_snapshot,
                 ops=(
-                    None
-                    if self._test_hooks is None
-                    else self._test_hooks.snapshot_ops
+                    None if self._test_hooks is None else self._test_hooks.snapshot_ops
                 ),
             )
             if config.snapshot_path is not None
@@ -217,29 +223,96 @@ class MiniRedis:
             raise RuntimeError("runtime is closed")
         if self._start_task is None:
             self._start_task = asyncio.create_task(
-                self._start_once(), name="miniredis:runtime-start"
+                self._start_owned(), name="miniredis:runtime-start"
             )
         await asyncio.shield(self._start_task)
 
-    async def _start_once(self) -> None:
-        await self.executor.start()
-        if self.state is not RuntimeState.STARTING:
-            return
-        worker = self.executor.worker_task
-        if worker is None:
-            raise RuntimeError("executor did not create its worker")
-        self._track_owned_task(worker)
-        worker.add_done_callback(self._executor_stopped)
-        producer = ActiveExpireProducer(
-            self.clock,
-            self.scheduler,
-            self.config.active_expire_interval_ms,
-            self.executor.post_control,
-            lambda now_ms: ActiveExpireTick(now_ms, None),
-        )
-        self._control_producers.add(producer)
-        producer.start()
-        self._set_state(RuntimeState.RUNNING)
+    async def _start_owned(self) -> None:
+        async with self._lifecycle_lock:
+            if self.state is not RuntimeState.STARTING:
+                return
+            try:
+                recovered = await asyncio.to_thread(
+                    recover_database,
+                    snapshot_path=self.config.snapshot_path,
+                    aof_path=self.config.aof_path,
+                    now_ms=self.clock.now_ms(),
+                    repair_truncated_tail=self.config.aof_repair_truncated_tail,
+                )
+                self.database = recovered
+                self.executor.install_database_before_start(recovered)
+                if self.config.aof_path is not None:
+                    hooks = self._test_hooks
+                    self._aof_writer = AofWriter(
+                        self.config.aof_path,
+                        self.config.aof_policy,
+                        fsync_interval_seconds=(self.config.aof_fsync_interval_seconds),
+                        ops=None if hooks is None else hooks.aof_ops,
+                        sleep=(
+                            asyncio.sleep
+                            if hooks is None or hooks.aof_sleep is None
+                            else hooks.aof_sleep
+                        ),
+                        on_failure=self._aof_worker_failed,
+                    )
+                    await self._aof_writer.start()
+                    self.commit_barrier = self._aof_writer
+                    self.executor.set_commit_barrier_before_start(self._aof_writer)
+                await self.executor.start()
+                if self.state is not RuntimeState.STARTING:
+                    return
+                worker = self.executor.worker_task
+                if worker is None:
+                    raise RuntimeError("executor did not create its worker")
+                self._track_owned_task(worker)
+                worker.add_done_callback(self._executor_stopped)
+                producer = ActiveExpireProducer(
+                    self.clock,
+                    self.scheduler,
+                    self.config.active_expire_interval_ms,
+                    self.executor.post_control,
+                    lambda now_ms: ActiveExpireTick(now_ms, None),
+                )
+                self._control_producers.add(producer)
+                producer.start()
+                self.executor.mailbox.open_user_admission()
+                self._set_state(RuntimeState.RUNNING)
+            except BaseException as exc:
+                self._failure_reason = str(exc) or type(exc).__name__
+                self._set_state(RuntimeState.FAILED)
+                self.executor.mailbox.close_user_admission()
+                await self._cleanup_failed_start()
+                raise
+
+    async def _cleanup_failed_start(self) -> None:
+        outcome = RuntimeFailed(self._failure_reason or "startup failed")
+        if self.executor.worker_done:
+            self.executor.fallback_terminalize(outcome)
+        else:
+            completion = asyncio.get_running_loop().create_future()
+            if self.executor.post_control(BeginShutdown(outcome, completion)):
+                worker = self.executor.worker_task
+                assert worker is not None
+                await asyncio.wait(
+                    (completion, worker),
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                if completion.done():
+                    await self.executor.stop_after_shutdown_barrier()
+                else:
+                    self.executor.fallback_terminalize(outcome)
+            else:
+                await self.executor.join()
+                self.executor.fallback_terminalize(outcome)
+        self.executor.release_endpoints()
+        if self._snapshot_manager is not None:
+            await self._snapshot_manager.close()
+        if self._aof_writer is not None:
+            await self._aof_writer.close()
+        self._control_producers.clear()
+
+    def _aof_worker_failed(self, failure: BaseException) -> None:
+        self._transition_failed(str(failure) or type(failure).__name__)
 
     def parse(self, request: CommandRequest) -> Command | Failure:
         try:
@@ -328,9 +401,7 @@ class MiniRedis:
         )
         if drainers:
             try:
-                async with asyncio.timeout(
-                    self.config.outbox_drain_grace_ms / 1000
-                ):
+                async with asyncio.timeout(self.config.outbox_drain_grace_ms / 1000):
                     await asyncio.gather(*drainers)
             except TimeoutError:
                 pass
@@ -338,13 +409,32 @@ class MiniRedis:
             endpoint.outbox.abort("runtime closed")
             endpoint.request_transport_close("runtime closed")
         self.executor.release_endpoints()
-        await self.executor.join()
-        if crash:
-            for sink in tuple(self._owned_replica_sinks):
-                await sink.source_crashed()
-            self._owned_replica_sinks.clear()
-            if self._aof_writer is not None:
+
+        if self._snapshot_manager is not None:
+            await self._snapshot_manager.close()
+        self._trace_lifecycle("snapshot-job-done")
+
+        if self._aof_writer is not None:
+            if crash:
                 await asyncio.shield(self._aof_writer.crash_close())
+            else:
+                await asyncio.shield(self._aof_writer.close())
+        self._trace_lifecycle("aof-closed")
+
+        for sink in tuple(self._owned_replica_sinks):
+            if crash:
+                await sink.source_crashed()
+            else:
+                await sink.drain_and_stop(self.config.replica_drain_grace_ms)
+        self._owned_replica_sinks.clear()
+        self._trace_lifecycle("replicas-stopped")
+
+        if self.executor.worker_done:
+            await self.executor.join()
+        else:
+            await self.executor.stop_after_shutdown_barrier()
+        self._trace_lifecycle("executor-stopped")
+
         self._control_producers.clear()
         current = asyncio.current_task()
         for owned in tuple(self._owned_tasks):
@@ -352,9 +442,7 @@ class MiniRedis:
                 self._owned_tasks.discard(owned)
         self._shutdown_complete = True
         self._set_state(
-            RuntimeState.FAILED
-            if preserve_failed_state
-            else RuntimeState.CLOSED
+            RuntimeState.FAILED if preserve_failed_state else RuntimeState.CLOSED
         )
 
     def _on_executor_terminal_failure(self, failure: BaseException) -> None:
@@ -390,15 +478,25 @@ class MiniRedis:
     def _transition_failed(self, reason: str) -> None:
         if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
             return
+        was_starting = self.state is RuntimeState.STARTING
         self._failure_reason = reason
         self._set_state(RuntimeState.FAILED)
         self.executor.mailbox.close_user_admission()
+        if was_starting:
+            return
         if self._shutdown_task is None:
             self._shutdown_task = asyncio.create_task(
                 self._shutdown_once(),
                 name="miniredis:failed-shutdown",
             )
             self._track_owned_task(self._shutdown_task)
+
+    def _trace_lifecycle(self, event: str) -> None:
+        if (
+            self._test_hooks is not None
+            and self._test_hooks.lifecycle_trace is not None
+        ):
+            self._test_hooks.lifecycle_trace.append(event)
 
     def _set_state(self, state: RuntimeState) -> None:
         self.state = state
@@ -422,9 +520,7 @@ class MiniRedis:
         try:
             return await asyncio.shield(task)
         except BaseException:
-            if task.done() and (
-                task.cancelled() or task.exception() is not None
-            ):
+            if task.done() and (task.cancelled() or task.exception() is not None):
                 self._owned_replica_sinks.discard(sink)
             raise
 
@@ -472,14 +568,14 @@ class MiniRedis:
     @property
     def accepting_commands(self) -> bool:
         return (
-            self.state is RuntimeState.RUNNING
-            and self.executor.mailbox.accepting_users
+            self.state is RuntimeState.RUNNING and self.executor.mailbox.accepting_users
         )
 
     @property
     def normal_shutdown_started(self) -> bool:
         return (
             self._failure_reason is None
+            and self.executor.debug_failure is None
             and self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}
         )
 
@@ -528,6 +624,11 @@ class MiniRedis:
                 if task is not asyncio.current_task()
             ),
             replica_links=self.executor.replica_link_count,
+            accepting_users=self.executor.mailbox.accepting_users,
+            snapshot_jobs=int(
+                self._snapshot_manager is not None
+                and self._snapshot_manager.active_job is not None
+            ),
         )
 
     def _debug_notify(self) -> None:
@@ -554,6 +655,17 @@ class MiniRedis:
 
     async def debug_wait_for_state(self, value: str) -> None:
         await self._debug_wait(lambda: self.state.value == value)
+
+    async def debug_wait_for_failure(self) -> None:
+        await self._debug_wait(lambda: self._failure_reason is not None)
+
+    def debug_fail_executor(self, failure: BaseException) -> None:
+        self.executor.debug_fail(failure)
+
+    def debug_lifecycle_trace(self) -> tuple[str, ...]:
+        if self._test_hooks is None or self._test_hooks.lifecycle_trace is None:
+            return ()
+        return tuple(self._test_hooks.lifecycle_trace)
 
     def debug_register_control_producer(self, producer: object) -> None:
         if self.state is not RuntimeState.RUNNING:

@@ -6,7 +6,11 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
-from miniredis.core.commit import CommitBatch, SnapshotImage
+from miniredis.core.commit import CommitBatch
+from miniredis.replication.backlog import (
+    FullSyncAttachment,
+    ReplicaAttachment,
+)
 
 if TYPE_CHECKING:
     from miniredis.core.executor import PromotionResult
@@ -23,12 +27,6 @@ class ReplicaSinkState(StrEnum):
     PROMOTED = "promoted"
     SOURCE_LOST = "source_lost"
     STOPPED = "stopped"
-
-
-@dataclass(frozen=True, slots=True)
-class ReplicaAttachment:
-    generation: int
-    image: SnapshotImage
 
 
 @dataclass(frozen=True, slots=True)
@@ -108,6 +106,8 @@ class ReplicaSink:
     ) -> None:
         if self._state is not ReplicaSinkState.BOOTSTRAPPING:
             raise RuntimeError("sink is not bootstrapping")
+        if not isinstance(attachment, FullSyncAttachment):
+            raise RuntimeError("partial sync is not supported by this sink")
         self._generation = attachment.generation
         self._baseline_seq = attachment.image.checkpoint_seq
         self._applied_seq = attachment.image.checkpoint_seq

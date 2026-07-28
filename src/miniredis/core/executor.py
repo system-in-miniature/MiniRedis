@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import itertools
+import uuid
 from bisect import bisect_right
 from collections.abc import Callable
 from dataclasses import dataclass, replace
@@ -69,7 +70,13 @@ from miniredis.persistence.aof import (
     AofRewriteFailed,
     AofRewriteOutcome,
 )
-from miniredis.replication.sink import ReplicaAttachment
+from miniredis.replication.backlog import (
+    FullSyncAttachment,
+    PartialSyncAttachment,
+    ReplicaAttachment,
+    ReplicationBacklog,
+    ReplicationCursor,
+)
 
 if TYPE_CHECKING:
     from miniredis.replication.sink import ReplicaSink
@@ -144,6 +151,7 @@ class BeginAofRewrite:
 @dataclass(slots=True)
 class AttachReplica:
     sink: ReplicaSink
+    cursor: ReplicationCursor | None
     future: asyncio.Future[ReplicaAttachment]
 
 
@@ -241,6 +249,10 @@ type ExecutorMessage = (
 
 
 class CommandExecutor:
+    @staticmethod
+    def _default_replication_id() -> str:
+        return uuid.uuid4().hex
+
     def __init__(
         self,
         *,
@@ -266,6 +278,8 @@ class CommandExecutor:
             ]
             | None
         ) = None,
+        replication_backlog_batches: int = 1024,
+        replication_id_factory: Callable[[], str] | None = None,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -326,6 +340,17 @@ class CommandExecutor:
         self._started = False
         self._allow_failure_injection = allow_failure_injection
         self._begin_aof_rewrite = begin_aof_rewrite
+        self._replication_id_factory = (
+            replication_id_factory
+            if replication_id_factory is not None
+            else self._default_replication_id
+        )
+        self.replication_id = self._replication_id_factory()
+        self.replication_backlog = ReplicationBacklog(
+            replication_backlog_batches
+        )
+        self.full_sync_count = 0
+        self.partial_sync_count = 0
 
     def install_database_before_start(self, database: Database) -> None:
         if self._started:
@@ -570,8 +595,35 @@ class CommandExecutor:
         elif isinstance(message, AttachReplica):
             generation = self._next_replica_generation
             self._next_replica_generation += 1
-            image = self.database.snapshot_image(self.clock.now_ms())
-            attachment = ReplicaAttachment(generation, image)
+            boundary = self.database.commit_seq
+            cursor = message.cursor
+            missing = (
+                None
+                if (
+                    cursor is None
+                    or cursor.replication_id != self.replication_id
+                )
+                else self.replication_backlog.missing_after(
+                    cursor.applied_seq,
+                    current_seq=boundary,
+                )
+            )
+            if missing is None:
+                attachment: ReplicaAttachment = FullSyncAttachment(
+                    generation,
+                    self.replication_id,
+                    self.database.snapshot_image(self.clock.now_ms()),
+                )
+                self.full_sync_count += 1
+            else:
+                attachment = PartialSyncAttachment(
+                    generation,
+                    self.replication_id,
+                    cursor,
+                    boundary,
+                    missing,
+                )
+                self.partial_sync_count += 1
             message.sink.register_attachment(attachment)
             self._replica_sinks[generation] = message.sink
             message.future.set_result(attachment)
@@ -1110,6 +1162,7 @@ class CommandExecutor:
             for operation in batch.operations
         )
         self._applied_batches.append(batch)
+        self.replication_backlog.append(batch)
         self._offer_replica_batch(batch)
         return batch
 
@@ -1161,11 +1214,15 @@ class CommandExecutor:
             return AofRewriteFailed("executor control admission is closed")
         return await asyncio.shield(future)
 
-    async def attach_replica(self, sink: ReplicaSink) -> ReplicaAttachment:
+    async def attach_replica(
+        self,
+        sink: ReplicaSink,
+        cursor: ReplicationCursor | None = None,
+    ) -> ReplicaAttachment:
         future: asyncio.Future[ReplicaAttachment] = (
             asyncio.get_running_loop().create_future()
         )
-        if not self.post_control(AttachReplica(sink, future)):
+        if not self.post_control(AttachReplica(sink, cursor, future)):
             raise RuntimeError("executor control admission is closed")
         return await asyncio.shield(future)
 

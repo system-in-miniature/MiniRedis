@@ -4,12 +4,32 @@ from collections import deque
 from dataclasses import dataclass
 
 from miniredis.core.commit import CommitBatch
+from miniredis.core.commit import SnapshotImage
 
 
 @dataclass(frozen=True, slots=True)
 class ReplicationCursor:
     replication_id: str
     applied_seq: int
+
+
+@dataclass(frozen=True, slots=True)
+class FullSyncAttachment:
+    generation: int
+    replication_id: str
+    image: SnapshotImage
+
+
+@dataclass(frozen=True, slots=True)
+class PartialSyncAttachment:
+    generation: int
+    replication_id: str
+    cursor: ReplicationCursor
+    boundary_seq: int
+    batches: tuple[CommitBatch, ...]
+
+
+ReplicaAttachment = FullSyncAttachment | PartialSyncAttachment
 
 
 class ReplicationBacklog:

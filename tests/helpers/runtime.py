@@ -69,6 +69,7 @@ async def open_test_runtime(
     aof_ops: AofFileOps | None = None,
     aof_sleep: Callable[[float], Awaitable[None]] | None = None,
     aof_rewrite_gate: bool = False,
+    replication_id_factory: Callable[[], str] | None = None,
     lifecycle_trace: bool = False,
 ) -> TestMiniRedis:
     loop = asyncio.get_running_loop()
@@ -91,6 +92,7 @@ async def open_test_runtime(
             aof_ops=rewrite_gate if rewrite_gate is not None else aof_ops,
             aof_sleep=aof_sleep,
             lifecycle_trace=[] if lifecycle_trace else None,
+            replication_id_factory=replication_id_factory,
         ),
     )
     if snapshot_gate is not None:

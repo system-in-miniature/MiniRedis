@@ -108,6 +108,7 @@ class _RuntimeTestHooks:
     aof_ops: AofFileOps | None = None
     aof_sleep: Callable[[float], Awaitable[None]] | None = None
     lifecycle_trace: list[str] | None = None
+    replication_id_factory: Callable[[], str] | None = None
 
 
 def _direct_transport_close(_reason: str) -> None:
@@ -168,6 +169,12 @@ class MiniRedis:
                 else self._test_hooks.replica_apply_release
             ),
             allow_failure_injection=self._test_hooks is not None,
+            replication_backlog_batches=config.replication_backlog_batches,
+            replication_id_factory=(
+                None
+                if self._test_hooks is None
+                else self._test_hooks.replication_id_factory
+            ),
         )
         self.executor.mailbox.close_user_admission()
         self._snapshot_manager = (

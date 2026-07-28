@@ -13,6 +13,7 @@ from miniredis.persistence.codec import (
     AOF_HEADER,
     CodecError,
     encode_aof_record,
+    encode_aof_state_base_record,
     scan_aof_bytes,
 )
 
@@ -41,6 +42,27 @@ AofAppendOutcome: TypeAlias = AofAppendOk | AofAppendFailed
 
 
 @dataclass(frozen=True, slots=True)
+class AofRewriteSaved:
+    path: Path
+    checkpoint_seq: int
+
+
+@dataclass(frozen=True, slots=True)
+class AofRewriteBusy:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class AofRewriteFailed:
+    message: str
+
+
+AofRewriteOutcome: TypeAlias = (
+    AofRewriteSaved | AofRewriteBusy | AofRewriteFailed
+)
+
+
+@dataclass(frozen=True, slots=True)
 class AofLog:
     state_base: SnapshotImage | None
     batches: tuple[CommitBatch, ...]
@@ -48,6 +70,9 @@ class AofLog:
 
 class AofFileOps(Protocol):
     def open_append(self, path: Path) -> int:
+        raise NotImplementedError
+
+    def open_rewrite(self, path: Path) -> int:
         raise NotImplementedError
 
     def size(self, fd: int) -> int:
@@ -65,6 +90,15 @@ class AofFileOps(Protocol):
     def close(self, fd: int) -> None:
         raise NotImplementedError
 
+    def replace(self, source: Path, destination: Path) -> None:
+        raise NotImplementedError
+
+    def fsync_parent(self, path: Path) -> None:
+        raise NotImplementedError
+
+    def unlink(self, path: Path) -> None:
+        raise NotImplementedError
+
 
 class PosixAofFileOps:
     def open_append(self, path: Path) -> int:
@@ -72,6 +106,13 @@ class PosixAofFileOps:
         return os.open(
             path,
             os.O_CREAT | os.O_RDWR | os.O_APPEND,
+            0o600,
+        )
+
+    def open_rewrite(self, path: Path) -> int:
+        return os.open(
+            path,
+            os.O_CREAT | os.O_EXCL | os.O_RDWR | os.O_APPEND,
             0o600,
         )
 
@@ -94,6 +135,19 @@ class PosixAofFileOps:
 
     def close(self, fd: int) -> None:
         os.close(fd)
+
+    def replace(self, source: Path, destination: Path) -> None:
+        os.replace(source, destination)
+
+    def fsync_parent(self, path: Path) -> None:
+        directory_fd = os.open(path.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+
+    def unlink(self, path: Path) -> None:
+        os.unlink(path)
 
 
 def load_aof(
@@ -132,6 +186,24 @@ class _AppendWork:
     barrier: asyncio.Future[AofAppendOutcome]
 
 
+@dataclass(frozen=True, slots=True)
+class _FinalizeRewrite:
+    generation: int
+
+
+@dataclass(slots=True)
+class _RewriteState:
+    generation: int
+    image: SnapshotImage
+    temporary: Path
+    completion: asyncio.Future[AofRewriteOutcome]
+    delta: bytearray
+    temporary_fd: int | None = None
+    base_task: asyncio.Task[None] | None = None
+    abort_reason: str | None = None
+    renamed: bool = False
+
+
 _STOP = object()
 
 
@@ -142,19 +214,25 @@ class AofWriter:
         policy: AofPolicy,
         *,
         fsync_interval_seconds: float = 1.0,
+        rewrite_delta_limit_bytes: int = 8 * 1024 * 1024,
         ops: AofFileOps | None = None,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         on_failure: Callable[[BaseException], None] | None = None,
     ) -> None:
         if fsync_interval_seconds <= 0:
             raise ValueError("fsync interval must be positive")
+        if rewrite_delta_limit_bytes <= 0:
+            raise ValueError("rewrite delta limit must be positive")
         self._path = path
         self._policy = policy
         self._interval = fsync_interval_seconds
+        self._rewrite_delta_limit_bytes = rewrite_delta_limit_bytes
         self._ops = ops or PosixAofFileOps()
         self._sleep = sleep
         self._on_failure = on_failure or (lambda _error: None)
-        self._queue: asyncio.Queue[_AppendWork | object] = asyncio.Queue()
+        self._queue: asyncio.Queue[
+            _AppendWork | _FinalizeRewrite | object
+        ] = asyncio.Queue()
         self._fd: int | None = None
         self._worker: asyncio.Task[None] | None = None
         self._sync_task: asyncio.Task[None] | None = None
@@ -164,17 +242,41 @@ class AofWriter:
         self._accepting = False
         self._failure: BaseException | None = None
         self._failure_reported = False
+        self._rewrite_generation = 0
+        self._rewrite: _RewriteState | None = None
 
     @property
     def failure(self) -> BaseException | None:
         return self._failure
 
     @property
+    def rewrite_active(self) -> bool:
+        return self._rewrite is not None
+
+    @property
+    def rewrite_delta_bytes(self) -> int:
+        state = self._rewrite
+        return len(state.delta) if state is not None else 0
+
+    @property
+    def rewrite_checkpoint_seq(self) -> int | None:
+        state = self._rewrite
+        return state.image.checkpoint_seq if state is not None else None
+
+    @property
     def owned_task_count(self) -> int:
-        return sum(
+        count = sum(
             task is not None and not task.done()
             for task in (self._worker, self._sync_task)
         )
+        state = self._rewrite
+        if (
+            state is not None
+            and state.base_task is not None
+            and not state.base_task.done()
+        ):
+            count += 1
+        return count
 
     async def start(self) -> None:
         if self._worker is not None:
@@ -227,11 +329,80 @@ class AofWriter:
         )
         return await asyncio.shield(barrier)
 
+    def begin_rewrite(
+        self,
+        image: SnapshotImage,
+    ) -> asyncio.Future[AofRewriteOutcome]:
+        loop = asyncio.get_running_loop()
+        completion: asyncio.Future[AofRewriteOutcome] = loop.create_future()
+        if (
+            self._failure is not None
+            or not self._accepting
+            or self._worker is None
+        ):
+            completion.set_result(
+                AofRewriteFailed(
+                    str(self._failure)
+                    if self._failure is not None
+                    else "AOF writer is not accepting"
+                )
+            )
+            return completion
+        if self._rewrite is not None:
+            completion.set_result(AofRewriteBusy())
+            return completion
+
+        self._rewrite_generation += 1
+        generation = self._rewrite_generation
+        temporary = self._path.with_name(
+            f".{self._path.name}.rewrite.{os.getpid()}."
+            f"{generation}.tmp"
+        )
+        state = _RewriteState(
+            generation=generation,
+            image=image,
+            temporary=temporary,
+            completion=completion,
+            delta=bytearray(),
+        )
+        self._rewrite = state
+        state.base_task = asyncio.create_task(
+            self._write_rewrite_base(state),
+            name=f"miniredis-aof-rewrite-base-{generation}",
+        )
+        return completion
+
+    async def _write_rewrite_base(self, state: _RewriteState) -> None:
+        try:
+            fd = await asyncio.to_thread(
+                self._ops.open_rewrite,
+                state.temporary,
+            )
+            state.temporary_fd = fd
+            await asyncio.to_thread(
+                self._ops.write_all,
+                fd,
+                AOF_HEADER + encode_aof_state_base_record(state.image),
+            )
+            if state.abort_reason is not None:
+                await self._cleanup_rewrite(state)
+                return
+            self._queue.put_nowait(_FinalizeRewrite(state.generation))
+        except BaseException as exc:
+            self._settle_rewrite(
+                state.completion,
+                AofRewriteFailed(str(exc)),
+            )
+            await self._cleanup_rewrite(state)
+
     async def _run_writer(self) -> None:
         while True:
             item = await self._queue.get()
             if item is _STOP:
                 return
+            if isinstance(item, _FinalizeRewrite):
+                await self._finalize_rewrite(item)
+                continue
             assert isinstance(item, _AppendWork)
             self._current_work = item
             if self._failure is not None:
@@ -269,8 +440,88 @@ class AofWriter:
                 self._fail_queued(exc)
                 self._current_work = None
                 return
+            self._capture_rewrite_delta(item.record)
             self._settle(item.barrier, AofAppendOk(item.seq))
             self._current_work = None
+
+    def _capture_rewrite_delta(self, record: bytes) -> None:
+        state = self._rewrite
+        if state is None or state.abort_reason is not None:
+            return
+        if (
+            len(state.delta) + len(record)
+            > self._rewrite_delta_limit_bytes
+        ):
+            state.abort_reason = "AOF rewrite delta limit exceeded"
+            self._settle_rewrite(
+                state.completion,
+                AofRewriteFailed(state.abort_reason),
+            )
+            return
+        state.delta.extend(record)
+
+    async def _finalize_rewrite(self, item: _FinalizeRewrite) -> None:
+        state = self._rewrite
+        if state is None or state.generation != item.generation:
+            return
+        if state.abort_reason is not None:
+            await self._cleanup_rewrite(state)
+            return
+        try:
+            temporary_fd = state.temporary_fd
+            old_fd = self._fd
+            assert temporary_fd is not None
+            assert old_fd is not None
+            await asyncio.to_thread(
+                self._ops.write_all,
+                temporary_fd,
+                bytes(state.delta),
+            )
+            await asyncio.to_thread(self._ops.fsync, temporary_fd)
+            await asyncio.to_thread(
+                self._ops.replace,
+                state.temporary,
+                self._path,
+            )
+            state.renamed = True
+            await asyncio.to_thread(self._ops.fsync_parent, self._path)
+            self._fd = temporary_fd
+            state.temporary_fd = None
+            await asyncio.to_thread(self._ops.close, old_fd)
+        except BaseException as exc:
+            self._settle_rewrite(
+                state.completion,
+                AofRewriteFailed(str(exc)),
+            )
+            await self._cleanup_rewrite(state)
+            return
+        self._settle_rewrite(
+            state.completion,
+            AofRewriteSaved(
+                path=self._path,
+                checkpoint_seq=state.image.checkpoint_seq,
+            ),
+        )
+        if self._rewrite is state:
+            self._rewrite = None
+
+    async def _cleanup_rewrite(self, state: _RewriteState) -> None:
+        fd, state.temporary_fd = state.temporary_fd, None
+        if fd is not None:
+            try:
+                await asyncio.to_thread(self._ops.close, fd)
+            except OSError:
+                pass
+        if not state.renamed:
+            try:
+                await asyncio.to_thread(
+                    self._ops.unlink,
+                    state.temporary,
+                )
+            except FileNotFoundError:
+                pass
+        if self._rewrite is state:
+            self._rewrite = None
 
     def _writer_done(self, task: asyncio.Task[None]) -> None:
         if task.cancelled():
@@ -328,6 +579,14 @@ class AofWriter:
         if not barrier.done():
             barrier.set_result(outcome)
 
+    @staticmethod
+    def _settle_rewrite(
+        completion: asyncio.Future[AofRewriteOutcome],
+        outcome: AofRewriteOutcome,
+    ) -> None:
+        if not completion.done():
+            completion.set_result(outcome)
+
     def _record_failure(self, error: BaseException) -> None:
         if self._failure is None:
             self._failure = error
@@ -352,6 +611,13 @@ class AofWriter:
         if self._fd is None:
             return
         self._accepting = False
+        rewrite = self._rewrite
+        if (
+            rewrite is not None
+            and rewrite.base_task is not None
+            and not rewrite.base_task.done()
+        ):
+            await asyncio.shield(rewrite.base_task)
         if self._worker is not None and not self._worker.done():
             self._queue.put_nowait(_STOP)
             await asyncio.shield(self._worker)

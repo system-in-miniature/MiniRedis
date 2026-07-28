@@ -23,6 +23,7 @@ class MiniRedisConfig:
     aof_policy: AofPolicy = AofPolicy.EVERYSEC
     aof_repair_truncated_tail: bool = True
     aof_fsync_interval_seconds: float = 1.0
+    aof_rewrite_delta_limit_bytes: int = 8 * 1024 * 1024
     snapshot_path: Path | None = None
     replica_queue_limit: int = 64
     replica_drain_grace_ms: int = 1000
@@ -54,6 +55,10 @@ class MiniRedisConfig:
             raise ValueError("active_expire_interval_ms must be positive")
         if self.aof_fsync_interval_seconds <= 0:
             raise ValueError("aof_fsync_interval_seconds must be positive")
+        if self.aof_rewrite_delta_limit_bytes <= 0:
+            raise ValueError(
+                "aof_rewrite_delta_limit_bytes must be positive"
+            )
         if self.replica_queue_limit <= 0:
             raise ValueError("replica_queue_limit must be positive")
         if self.replica_drain_grace_ms < 0:

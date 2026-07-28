@@ -6,7 +6,7 @@ from typing import Literal
 
 from miniredis.persistence.aof import AofPolicy
 
-EvictionPolicy = Literal["noeviction", "allkeys-lru"]
+EvictionPolicy = Literal["noeviction", "allkeys-lru", "allkeys-lfu"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -15,6 +15,7 @@ class MiniRedisConfig:
     active_expire_sample_size: int = 20
     maxmemory: int | None = None
     eviction_policy: EvictionPolicy = "noeviction"
+    lfu_decay_interval_ms: int = 60_000
     outbox_limit: int = 64
     outbox_drain_grace_ms: int = 100
     active_expire_interval_ms: int = 100
@@ -34,8 +35,17 @@ class MiniRedisConfig:
             raise ValueError("active_expire_sample_size must be positive")
         if self.maxmemory is not None and self.maxmemory <= 0:
             raise ValueError("maxmemory must be positive")
-        if self.eviction_policy not in {"noeviction", "allkeys-lru"}:
-            raise ValueError("eviction_policy must be 'noeviction' or 'allkeys-lru'")
+        if self.eviction_policy not in {
+            "noeviction",
+            "allkeys-lru",
+            "allkeys-lfu",
+        }:
+            raise ValueError(
+                "eviction_policy must be 'noeviction', 'allkeys-lru', "
+                "or 'allkeys-lfu'"
+            )
+        if self.lfu_decay_interval_ms <= 0:
+            raise ValueError("lfu_decay_interval_ms must be positive")
         if self.outbox_limit <= 0:
             raise ValueError("outbox_limit must be positive")
         if self.outbox_drain_grace_ms < 0:

@@ -1,6 +1,6 @@
 import pytest
 
-from miniredis.persistence.aof import AofCorruption, load_aof
+from miniredis.persistence.aof import AofCorruption, AofLog, load_aof
 from miniredis.persistence.codec import AOF_HEADER, encode_aof_record
 
 from tests.unit.persistence.test_framing import batch
@@ -12,9 +12,9 @@ def test_repair_enabled_truncates_one_incomplete_tail(tmp_path):
     second = encode_aof_record(batch(2, b"two"))
     path.write_bytes(AOF_HEADER + first + second[:-3])
 
-    batches = load_aof(path, repair_truncated_tail=True)
+    log = load_aof(path, repair_truncated_tail=True)
 
-    assert batches == (batch(1, b"one"),)
+    assert log == AofLog(None, (batch(1, b"one"),))
     assert path.read_bytes() == AOF_HEADER + first
 
 
@@ -42,18 +42,18 @@ def test_missing_aof_is_an_empty_stream(tmp_path):
     assert load_aof(
         tmp_path / "missing.mraof",
         repair_truncated_tail=True,
-    ) == ()
+    ) == AofLog(None, ())
 
 
 def test_existing_zero_byte_aof_is_an_empty_stream(tmp_path):
     path = tmp_path / "empty.mraof"
     path.write_bytes(b"")
-    assert load_aof(path, repair_truncated_tail=True) == ()
+    assert load_aof(path, repair_truncated_tail=True) == AofLog(None, ())
     assert path.read_bytes() == b""
 
 
 def test_header_only_aof_is_an_empty_stream(tmp_path):
     path = tmp_path / "header-only.mraof"
     path.write_bytes(AOF_HEADER)
-    assert load_aof(path, repair_truncated_tail=True) == ()
+    assert load_aof(path, repair_truncated_tail=True) == AofLog(None, ())
     assert path.read_bytes() == AOF_HEADER

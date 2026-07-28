@@ -167,7 +167,9 @@ async def test_final_acceptance_activates_components_then_leaves_no_owners(
         writer.close()
         await writer.wait_closed()
 
-    batches = load_aof(aof_path, repair_truncated_tail=False)
+    batches = load_aof(
+        aof_path, repair_truncated_tail=False
+    ).batches
     assert batches[-1].seq == primary.debug_commit_seq
     aof_entries = {
         operation.key: operation.entry

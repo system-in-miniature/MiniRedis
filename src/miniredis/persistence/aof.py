@@ -8,7 +8,7 @@ from enum import StrEnum
 from pathlib import Path
 from typing import Protocol, TypeAlias
 
-from miniredis.core.commit import CommitBatch
+from miniredis.core.commit import CommitBatch, SnapshotImage
 from miniredis.persistence.codec import (
     AOF_HEADER,
     CodecError,
@@ -38,6 +38,12 @@ class AofAppendFailed:
 
 
 AofAppendOutcome: TypeAlias = AofAppendOk | AofAppendFailed
+
+
+@dataclass(frozen=True, slots=True)
+class AofLog:
+    state_base: SnapshotImage | None
+    batches: tuple[CommitBatch, ...]
 
 
 class AofFileOps(Protocol):
@@ -94,19 +100,19 @@ def load_aof(
     path: Path,
     *,
     repair_truncated_tail: bool,
-) -> tuple[CommitBatch, ...]:
+) -> AofLog:
     try:
         data = path.read_bytes()
     except FileNotFoundError:
-        return ()
+        return AofLog(None, ())
     if data == b"":
-        return ()
+        return AofLog(None, ())
     try:
         scan = scan_aof_bytes(data)
     except CodecError as exc:
         raise AofCorruption(str(exc)) from exc
     if not scan.has_truncated_tail:
-        return scan.batches
+        return AofLog(scan.state_base, scan.batches)
     if not repair_truncated_tail:
         raise AofCorruption("incomplete final AOF record")
 
@@ -116,7 +122,7 @@ def load_aof(
         os.fsync(fd)
     finally:
         os.close(fd)
-    return scan.batches
+    return AofLog(scan.state_base, scan.batches)
 
 
 @dataclass(slots=True)

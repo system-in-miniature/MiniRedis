@@ -75,7 +75,9 @@ async def test_expiration_and_eviction_reasons_are_in_the_same_aof_stream(
 
     reasons = tuple(
         operation.reason
-        for batch in load_aof(path, repair_truncated_tail=False)
+        for batch in load_aof(
+            path, repair_truncated_tail=False
+        ).batches
         for operation in batch.operations
         if isinstance(operation, DeleteKey)
     )

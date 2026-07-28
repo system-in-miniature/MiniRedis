@@ -4,7 +4,7 @@ from pathlib import Path
 
 from miniredis.core.commit import SnapshotImage
 from miniredis.core.database import Database
-from miniredis.persistence.aof import AofCorruption, load_aof
+from miniredis.persistence.aof import AofCorruption, AofLog, load_aof
 from miniredis.persistence.codec import CodecError, decode_snapshot_file
 
 
@@ -34,23 +34,39 @@ def recover_database(
 ) -> Database:
     image = _load_snapshot(snapshot_path)
     try:
-        batches = (
+        log = (
             load_aof(
                 aof_path,
                 repair_truncated_tail=repair_truncated_tail,
             )
             if aof_path is not None
-            else ()
+            else AofLog(None, ())
         )
     except AofCorruption as exc:
         raise RecoveryError(str(exc)) from exc
 
-    post_checkpoint = tuple(
-        batch for batch in batches if batch.seq > image.checkpoint_seq
+    base = log.state_base
+    image = (
+        image
+        if base is None or image.checkpoint_seq > base.checkpoint_seq
+        else base
     )
-    if batches and batches[-1].seq < image.checkpoint_seq:
+    batches = log.batches
+    post_checkpoint = tuple(
+        batch
+        for batch in batches
+        if batch.seq > image.checkpoint_seq
+    )
+    aof_end = (
+        batches[-1].seq
+        if batches
+        else base.checkpoint_seq
+        if base is not None
+        else None
+    )
+    if aof_end is not None and aof_end < image.checkpoint_seq:
         raise RecoveryError(
-            f"AOF ends at seq {batches[-1].seq} before "
+            f"AOF ends at seq {aof_end} before "
             f"snapshot checkpoint {image.checkpoint_seq}"
         )
     if image.checkpoint_seq == 0 and batches and batches[0].seq != 1:

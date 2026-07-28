@@ -25,9 +25,14 @@ class Items:
 
 
 @dataclass(frozen=True, slots=True)
+class NullArray:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
 class Failure:
     code: str
     message: str
 
 
-Reply: TypeAlias = Ok | Bytes | Number | Items | Failure
+Reply: TypeAlias = Ok | Bytes | Number | Items | NullArray | Failure

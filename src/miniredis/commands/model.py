@@ -15,6 +15,43 @@ class Echo:
 
 
 @dataclass(frozen=True, slots=True)
+class Multi:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Exec:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Discard:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class Watch:
+    keys: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class Unwatch:
+    pass
+
+
+@dataclass(frozen=True, slots=True)
+class CompareDelete:
+    key: bytes
+    expected: bytes
+
+
+@dataclass(frozen=True, slots=True)
+class CheckDecrement:
+    key: bytes
+    amount: int
+
+
+@dataclass(frozen=True, slots=True)
 class SetString:
     key: bytes
     value: bytes
@@ -223,6 +260,13 @@ class Persist:
 Command: TypeAlias = (
     Ping
     | Echo
+    | Multi
+    | Exec
+    | Discard
+    | Watch
+    | Unwatch
+    | CompareDelete
+    | CheckDecrement
     | SetString
     | GetString
     | MultiGet
@@ -263,6 +307,8 @@ Command: TypeAlias = (
 _DATASET_MUTATING_TYPES = frozenset(
     {
         SetString,
+        CompareDelete,
+        CheckDecrement,
         MultiSet,
         Delete,
         Increment,
@@ -285,6 +331,11 @@ _NON_DATASET_MUTATING_TYPES = frozenset(
     {
         Ping,
         Echo,
+        Multi,
+        Exec,
+        Discard,
+        Watch,
+        Unwatch,
         GetString,
         MultiGet,
         Exists,

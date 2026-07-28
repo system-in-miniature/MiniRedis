@@ -12,11 +12,15 @@ from typing import Literal
 
 from miniredis.commands.model import (
     BlockingPop,
+    CheckDecrement,
     Command,
+    CompareDelete,
     Delete,
+    Discard,
     Echo,
     Exists,
     Expire,
+    Exec,
     GetString,
     HashDelete,
     HashGet,
@@ -27,6 +31,7 @@ from miniredis.commands.model import (
     ListPop,
     ListPush,
     ListRange,
+    Multi,
     MultiGet,
     MultiSet,
     Persist,
@@ -43,6 +48,8 @@ from miniredis.commands.model import (
     TimeToLive,
     TypeOf,
     Unsubscribe,
+    Unwatch,
+    Watch,
     ZAdd,
     ZRange,
     ZRangeByScore,
@@ -171,6 +178,30 @@ def parse_request(request: CommandRequest) -> Command:
         case b"ECHO":
             _require_arity(name, args, 1)
             return Echo(args[0])
+        case b"MULTI":
+            _require_arity(name, args, 0)
+            return Multi()
+        case b"EXEC":
+            _require_arity(name, args, 0)
+            return Exec()
+        case b"DISCARD":
+            _require_arity(name, args, 0)
+            return Discard()
+        case b"WATCH":
+            _require_min_arity(name, args, 1)
+            return Watch(args)
+        case b"UNWATCH":
+            _require_arity(name, args, 0)
+            return Unwatch()
+        case b"COMPAREDEL":
+            _require_arity(name, args, 2)
+            return CompareDelete(args[0], args[1])
+        case b"CHECKDECR":
+            _require_arity(name, args, 2)
+            amount = parse_int64(args[1])
+            if amount <= 0:
+                raise CommandParseError("amount must be a positive integer")
+            return CheckDecrement(args[0], amount)
         case b"DEL":
             _require_min_arity(name, args, 1)
             return Delete(args)

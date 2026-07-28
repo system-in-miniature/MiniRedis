@@ -5,7 +5,12 @@ import math
 import pytest
 
 from miniredis.commands.model import (
+    CheckDecrement,
+    CompareDelete,
+    Discard,
     Echo,
+    Exec,
+    Multi,
     Ping,
     SetString,
     TimeToLive,
@@ -19,6 +24,8 @@ from miniredis.commands.model import (
     SetMembers,
     ZRemove,
     ZRangeByScore,
+    Unwatch,
+    Watch,
 )
 from miniredis.commands.parser import CommandParseError, parse_command_request
 from miniredis.commands.request import CommandRequest
@@ -92,6 +99,34 @@ def test_parse_representative_commands_return_exact_typed_command(
     command_request: CommandRequest, expected: object
 ) -> None:
     assert parse_command_request(command_request) == expected
+
+
+def test_parse_transaction_and_atomic_commands():
+    assert parse(b"MULTI") == Multi()
+    assert parse(b"EXEC") == Exec()
+    assert parse(b"DISCARD") == Discard()
+    assert parse(b"WATCH", b"a", b"b") == Watch((b"a", b"b"))
+    assert parse(b"UNWATCH") == Unwatch()
+    assert parse(b"COMPAREDEL", b"k", b"token") == CompareDelete(b"k", b"token")
+    assert parse(b"CHECKDECR", b"stock", b"2") == CheckDecrement(b"stock", 2)
+
+
+@pytest.mark.parametrize(
+    "command_request",
+    [
+        CommandRequest(b"MULTI", (b"x",)),
+        CommandRequest(b"EXEC", (b"x",)),
+        CommandRequest(b"DISCARD", (b"x",)),
+        CommandRequest(b"WATCH"),
+        CommandRequest(b"UNWATCH", (b"x",)),
+        CommandRequest(b"COMPAREDEL", (b"k",)),
+        CommandRequest(b"CHECKDECR", (b"k", b"0")),
+        CommandRequest(b"CHECKDECR", (b"k", b"-1")),
+    ],
+)
+def test_transaction_and_atomic_command_arity_is_rejected(command_request):
+    with pytest.raises(CommandParseError):
+        parse_command_request(command_request)
 
 
 @pytest.mark.parametrize(

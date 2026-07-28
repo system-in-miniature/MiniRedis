@@ -17,7 +17,7 @@ from miniredis.core.outbound import (
     ServerClosed,
     SubscriptionAck,
 )
-from miniredis.core.reply import Bytes, Failure, Items, Number, Ok
+from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok
 
 
 def test_command_array_maps_without_text_decoding():
@@ -48,6 +48,7 @@ def test_domain_replies_encode_as_resp2():
     assert encode_outbound(Items((Bytes(b"a"), Number(1)))) == (
         b"*2\r\n$1\r\na\r\n:1\r\n"
     )
+    assert encode_outbound(NullArray()) == b"*-1\r\n"
     assert encode_outbound(Failure("WRONGTYPE", "bad")) == b"-WRONGTYPE bad\r\n"
 
 

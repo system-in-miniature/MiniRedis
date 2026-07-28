@@ -12,7 +12,7 @@ from miniredis.core.outbound import (
     ServerClosed,
     SubscriptionAck,
 )
-from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
+from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok, Reply
 
 
 class RespProtocolError(ValueError):
@@ -201,6 +201,8 @@ def _reply_frame(reply: Reply) -> RespFrame:
             return RespInteger(value)
         case Items(values):
             return RespArray(tuple(_reply_frame(value) for value in values))
+        case NullArray():
+            return RespArray(None)
         case Failure(code, message):
             return RespError(f"{code} {message}".encode())
     raise TypeError(f"unsupported reply: {type(reply)!r}")
@@ -209,7 +211,7 @@ def _reply_frame(reply: Reply) -> RespFrame:
 def encode_outbound(outbound: Reply | Outbound) -> bytes:
     if isinstance(outbound, ReplyMessage):
         return encode_frame(_reply_frame(outbound.reply))
-    if isinstance(outbound, (Ok, Bytes, Number, Items, Failure)):
+    if isinstance(outbound, (Ok, Bytes, Number, Items, NullArray, Failure)):
         return encode_frame(_reply_frame(outbound))
     if isinstance(outbound, SubscriptionAck):
         channel = RespBulk(outbound.channel)

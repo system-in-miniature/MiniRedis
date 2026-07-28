@@ -324,6 +324,56 @@ def test_database_fork_is_deep_and_preserves_runtime_metadata():
     assert fork.logical_usage == 0
 
 
+def test_client_updates_preserve_decay_and_increment_frequency():
+    database = Database()
+    database.apply_batch(
+        CommitBatch(
+            1,
+            (PutEntry(b"k", StoredEntry(StoredString(b"one"), None, 1)),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+        now_ms=0,
+        lfu_decay_interval_ms=1000,
+    )
+    assert database.entries[b"k"].frequency == 1
+    database.apply_batch(
+        CommitBatch(
+            2,
+            (PutEntry(b"k", StoredEntry(StoredString(b"two"), None, 2)),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+        now_ms=2000,
+        lfu_decay_interval_ms=1000,
+    )
+
+    assert database.entries[b"k"].frequency == 1
+    assert database.entries[b"k"].last_frequency_decay_ms == 2000
+
+
+def test_recovery_puts_start_neutral_and_fork_copies_lfu_metadata():
+    database = Database()
+    database.apply_batch(
+        CommitBatch(
+            1,
+            (PutEntry(b"k", StoredEntry(StoredString(b"v"), None, 1)),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=False,
+        now_ms=5000,
+        lfu_decay_interval_ms=1000,
+    )
+    assert database.entries[b"k"].frequency == 0
+    assert database.entries[b"k"].last_access_tick == 0
+    assert database.entries[b"k"].last_frequency_decay_ms == 5000
+
+    fork = database.fork()
+    assert fork.touch_if_live(b"k", 5000, 1000) is True
+    assert fork.entries[b"k"].frequency == 1
+    assert database.entries[b"k"].frequency == 0
+
+
 def test_apply_batch_tracks_each_put_and_touch_only_live_entries() -> None:
     database = Database()
     database.apply_batch(

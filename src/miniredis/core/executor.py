@@ -240,6 +240,7 @@ class CommandExecutor:
         clock: Clock,
         commit_barrier: CommitBarrier,
         max_pending_commands: int,
+        lfu_decay_interval_ms: int = 60_000,
         active_expire_sample_size: int = 20,
         scheduler: TimerScheduler,
         on_debug_change: Callable[[], None],
@@ -255,6 +256,9 @@ class CommandExecutor:
         self.clock = clock
         self.commit_barrier = commit_barrier
         self.max_pending_commands = max_pending_commands
+        if lfu_decay_interval_ms <= 0:
+            raise ValueError("lfu_decay_interval_ms must be positive")
+        self.lfu_decay_interval_ms = lfu_decay_interval_ms
         if active_expire_sample_size <= 0:
             raise ValueError("active_expire_sample_size must be positive")
         self.active_expire_sample_size = active_expire_sample_size
@@ -545,7 +549,12 @@ class CommandExecutor:
                     error = self._replica_apply_failure
                     self._replica_apply_failure = None
                     raise error
-                self.database.apply_batch(message.batch, track_access=False)
+                self.database.apply_batch(
+                    message.batch,
+                    track_access=False,
+                    now_ms=self.clock.now_ms(),
+                    lfu_decay_interval_ms=self.lfu_decay_interval_ms,
+                )
             except BaseException as exc:
                 message.future.set_exception(exc)
             else:
@@ -854,10 +863,16 @@ class CommandExecutor:
                             plan.trigger,
                         ),
                         track_access=plan.trigger is CommitTrigger.CLIENT,
+                        now_ms=now_ms,
+                        lfu_decay_interval_ms=self.lfu_decay_interval_ms,
                     )
                     workspace.operations.extend(plan.operations)
                 for key in dict.fromkeys(plan.touch_keys):
-                    workspace.database.touch_if_live(key, now_ms)
+                    workspace.database.touch_if_live(
+                        key,
+                        now_ms,
+                        self.lfu_decay_interval_ms,
+                    )
 
             if workspace.operations:
                 try:
@@ -875,7 +890,11 @@ class CommandExecutor:
                     self._on_fatal(str(exc))
                     return
             for key in dict.fromkeys(workspace.touch_keys):
-                self.database.touch_if_live(key, now_ms)
+                self.database.touch_if_live(
+                    key,
+                    now_ms,
+                    self.lfu_decay_interval_ms,
+                )
             for wakeup in workspace.wakeups:
                 waiter = self.waiters.transition(
                     wakeup.waiter_id,
@@ -990,7 +1009,11 @@ class CommandExecutor:
             return
 
         for key in dict.fromkeys(plan.touch_keys):
-            self.database.touch_if_live(key, now_ms)
+            self.database.touch_if_live(
+                key,
+                now_ms,
+                self.lfu_decay_interval_ms,
+            )
 
         for wakeup in plan.waiter_wakeups:
             waiter = self.waiters.transition(
@@ -1019,6 +1042,8 @@ class CommandExecutor:
         self.database.apply_batch(
             batch,
             track_access=prepared.trigger is CommitTrigger.CLIENT,
+            now_ms=self.clock.now_ms(),
+            lfu_decay_interval_ms=self.lfu_decay_interval_ms,
         )
         self._applied_batches.append(batch)
         self._offer_replica_batch(batch)

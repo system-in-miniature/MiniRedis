@@ -134,6 +134,7 @@ class MiniRedis:
             clock=clock,
             commit_barrier=actual_barrier,
             max_pending_commands=config.max_pending_commands,
+            lfu_decay_interval_ms=config.lfu_decay_interval_ms,
             active_expire_sample_size=config.active_expire_sample_size,
             scheduler=self.scheduler,
             on_debug_change=self._debug_notify,

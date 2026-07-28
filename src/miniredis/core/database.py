@@ -16,6 +16,7 @@ from miniredis.core.commit import (
     StoredValue,
     StoredZSet,
 )
+from miniredis.core.frequency import project_frequency
 from miniredis.core.values import (
     HashValue,
     ListValue,
@@ -37,6 +38,8 @@ class Entry:
     mutation_version: int
     last_access_tick: int
     logical_size: int
+    frequency: int = 0
+    last_frequency_decay_ms: int = 0
 
 
 def logical_value_size(value: RedisValue | StoredValue) -> int:
@@ -127,7 +130,14 @@ class Database:
     def revision(self, key: bytes) -> int:
         return self.key_revisions.get(key, 0)
 
-    def apply_batch(self, batch: CommitBatch, *, track_access: bool) -> None:
+    def apply_batch(
+        self,
+        batch: CommitBatch,
+        *,
+        track_access: bool,
+        now_ms: int = 0,
+        lfu_decay_interval_ms: int = 60_000,
+    ) -> None:
         next_seq = self.commit_seq + 1
         if batch.seq != next_seq:
             raise ValueError(f"expected commit seq {next_seq}, got {batch.seq}")
@@ -142,8 +152,23 @@ class Database:
                 case DeleteKey(key=key):
                     staged.pop(key, None)
                 case PutEntry(key=key, entry=entry):
+                    previous = staged.get(key)
                     if track_access:
                         staged_access_tick += 1
+                        if previous is None:
+                            frequency = 1
+                            last_frequency_decay_ms = now_ms
+                        else:
+                            frequency, last_frequency_decay_ms = project_frequency(
+                                previous.frequency,
+                                previous.last_frequency_decay_ms,
+                                now_ms,
+                                lfu_decay_interval_ms,
+                            )
+                            frequency += 1
+                    else:
+                        frequency = 0
+                        last_frequency_decay_ms = now_ms
                     value = thaw_value(entry.value)
                     staged[key] = Entry(
                         value=value,
@@ -151,6 +176,8 @@ class Database:
                         mutation_version=entry.mutation_version,
                         last_access_tick=staged_access_tick if track_access else 0,
                         logical_size=logical_entry_size(key, value, entry.expire_at_ms),
+                        frequency=frequency,
+                        last_frequency_decay_ms=last_frequency_decay_ms,
                     )
                 case _:
                     raise TypeError(
@@ -181,6 +208,8 @@ class Database:
                 mutation_version=entry.mutation_version,
                 last_access_tick=entry.last_access_tick,
                 logical_size=entry.logical_size,
+                frequency=entry.frequency,
+                last_frequency_decay_ms=entry.last_frequency_decay_ms,
             )
             for key, entry in self.entries.items()
         }
@@ -191,7 +220,12 @@ class Database:
         forked.revision_clock = self.revision_clock
         return forked
 
-    def touch_if_live(self, key: bytes, now_ms: int) -> bool:
+    def touch_if_live(
+        self,
+        key: bytes,
+        now_ms: int,
+        lfu_decay_interval_ms: int = 60_000,
+    ) -> bool:
         entry = self.entries.get(key)
         if entry is None or (
             entry.expire_at_ms is not None and entry.expire_at_ms <= now_ms
@@ -199,6 +233,13 @@ class Database:
             return False
         self.access_tick += 1
         entry.last_access_tick = self.access_tick
+        entry.frequency, entry.last_frequency_decay_ms = project_frequency(
+            entry.frequency,
+            entry.last_frequency_decay_ms,
+            now_ms,
+            lfu_decay_interval_ms,
+        )
+        entry.frequency += 1
         return True
 
     def logical_items(self) -> tuple[tuple[bytes, StoredEntry], ...]:
@@ -244,6 +285,8 @@ class Database:
                 mutation_version=stored.mutation_version,
                 last_access_tick=0,
                 logical_size=size,
+                frequency=0,
+                last_frequency_decay_ms=now_ms,
             )
             staged_usage += size
 

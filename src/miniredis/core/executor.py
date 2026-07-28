@@ -11,11 +11,16 @@ from miniredis.clock import Clock, TimerScheduler
 from miniredis.commands.model import (
     BlockingPop,
     Command,
+    Discard,
+    Exec,
     ListPush,
+    Multi,
     Ping,
     Publish,
     Subscribe,
     Unsubscribe,
+    Unwatch,
+    Watch,
     is_dataset_mutating,
 )
 from miniredis.core.blocking import (
@@ -53,7 +58,8 @@ from miniredis.core.outbound import (
     TransportClosed,
 )
 from miniredis.core.pubsub import PubSubRegistry
-from miniredis.core.reply import Bytes, Failure, Items, Number, Reply
+from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
+from miniredis.core.transactions import TransactionState
 from miniredis.persistence.aof import (
     AofAppendFailed,
     AofAppendOk,
@@ -63,6 +69,16 @@ from miniredis.replication.sink import ReplicaAttachment
 
 if TYPE_CHECKING:
     from miniredis.replication.sink import ReplicaSink
+
+
+TRANSACTION_DISALLOWED = (
+    BlockingPop,
+    Subscribe,
+    Unsubscribe,
+    Publish,
+    Multi,
+    Watch,
+)
 
 
 @dataclass(slots=True)
@@ -269,6 +285,7 @@ class CommandExecutor:
         self._next_replica_generation = 1
         self._active_source_generation: int | None = None
         self._replica_read_only = False
+        self._transactions: dict[int, TransactionState] = {}
         self._replica_apply_failure = replica_apply_failure
         if (replica_apply_entered is None) != (replica_apply_release is None):
             raise ValueError(
@@ -462,6 +479,9 @@ class CommandExecutor:
         if isinstance(message, ExecuteRequest):
             await self._execute(message)
         elif isinstance(message, RejectRequest):
+            state = self._transactions.get(message.session_id)
+            if state is not None and state.active:
+                state.dirty = True
             self._finish_reply(message.token, message.reply)
         elif isinstance(message, AbandonRequest):
             self._abandon(message)
@@ -563,6 +583,7 @@ class CommandExecutor:
             self._finish_reply(waiter.token, Bytes(None))
 
     def _close_session(self, event: SessionClosed) -> None:
+        self._transactions.pop(event.session_id, None)
         for waiter in self.waiters.for_session(event.session_id):
             closed = self.waiters.transition(
                 waiter.waiter_id,
@@ -582,6 +603,7 @@ class CommandExecutor:
 
     def _begin_shutdown(self, event: BeginShutdown) -> None:
         self.mailbox.close_control_admission()
+        self._transactions.clear()
         for waiter in self.waiters.active():
             closed = self.waiters.transition(
                 waiter.waiter_id,
@@ -604,6 +626,7 @@ class CommandExecutor:
         self._terminal_cleanup_complete = True
         self._failure = failure
         self._stopping = True
+        self._transactions.clear()
         self.mailbox.close_user_admission()
         self.mailbox.drain()
         for token in tuple(self._requests):
@@ -628,6 +651,8 @@ class CommandExecutor:
 
     async def _execute(self, request: ExecuteRequest) -> None:
         command = request.command
+        if self._route_transaction_command(request, command):
+            return
         if self._replica_read_only and is_dataset_mutating(command):
             self._finish_reply(
                 request.token,
@@ -692,6 +717,93 @@ class CommandExecutor:
         else:
             plan = self.planner.plan(command, self.database, now_ms)
         await self._apply_plan(request, plan, now_ms)
+
+    def _route_transaction_command(
+        self,
+        request: ExecuteRequest,
+        command: Command,
+    ) -> bool:
+        state = self._transactions.get(request.session_id)
+        if isinstance(command, Multi):
+            if state is None:
+                state = TransactionState()
+                self._transactions[request.session_id] = state
+            if state.active:
+                state.dirty = True
+                self._finish_reply(
+                    request.token,
+                    Failure("ERR", "MULTI calls can not be nested"),
+                )
+            else:
+                state.active = True
+                state.dirty = False
+                state.queued.clear()
+                self._finish_reply(request.token, Ok())
+            return True
+        if isinstance(command, Discard):
+            if state is None or not state.active:
+                self._finish_reply(
+                    request.token,
+                    Failure("ERR", "DISCARD without MULTI"),
+                )
+            else:
+                state.clear_all()
+                self._drop_empty_transaction_state(request.session_id, state)
+                self._finish_reply(request.token, Ok())
+            return True
+        if isinstance(command, Watch):
+            if state is None:
+                state = TransactionState()
+                self._transactions[request.session_id] = state
+            if state.active:
+                state.dirty = True
+                self._finish_reply(
+                    request.token,
+                    Failure("ERR", "WATCH inside MULTI is not allowed"),
+                )
+            else:
+                for key in command.keys:
+                    state.watched[key] = self.database.revision(key)
+                self._finish_reply(request.token, Ok())
+            return True
+        if isinstance(command, Unwatch):
+            if state is not None:
+                state.watched.clear()
+                self._drop_empty_transaction_state(request.session_id, state)
+            self._finish_reply(request.token, Ok())
+            return True
+        if isinstance(command, Exec):
+            if state is None or not state.active:
+                self._finish_reply(
+                    request.token,
+                    Failure("ERR", "EXEC without MULTI"),
+                )
+            else:
+                self._finish_reply(
+                    request.token,
+                    Failure("ERR", "EXEC is not implemented"),
+                )
+            return True
+        if state is None or not state.active:
+            return False
+        if isinstance(command, TRANSACTION_DISALLOWED):
+            state.dirty = True
+            self._finish_reply(
+                request.token,
+                Failure("ERR", "command is not allowed inside MULTI"),
+            )
+        else:
+            state.queued.append(command)
+            self._finish_reply(request.token, Ok(b"QUEUED"))
+        return True
+
+    def _drop_empty_transaction_state(
+        self,
+        session_id: int,
+        state: TransactionState,
+    ) -> None:
+        if not state.active and not state.watched:
+            self._transactions.pop(session_id, None)
 
     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
         items: list[SubscriptionAck] = []
@@ -991,6 +1103,20 @@ class CommandExecutor:
     @property
     def debug_accepted_count(self) -> int:
         return len(self._requests)
+
+    @property
+    def active_transaction_count(self) -> int:
+        return sum(state.active for state in self._transactions.values())
+
+    @property
+    def dirty_transaction_count(self) -> int:
+        return sum(
+            state.active and state.dirty for state in self._transactions.values()
+        )
+
+    @property
+    def watched_key_count(self) -> int:
+        return sum(len(state.watched) for state in self._transactions.values())
 
     @property
     def accepted_tokens(self) -> tuple[RequestToken, ...]:

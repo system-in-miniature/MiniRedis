@@ -26,6 +26,7 @@ class MiniRedisConfig:
     aof_rewrite_delta_limit_bytes: int = 8 * 1024 * 1024
     snapshot_path: Path | None = None
     replica_queue_limit: int = 64
+    replication_backlog_batches: int = 1024
     replica_drain_grace_ms: int = 1000
     max_session_frames: int = 128
 
@@ -61,6 +62,10 @@ class MiniRedisConfig:
             )
         if self.replica_queue_limit <= 0:
             raise ValueError("replica_queue_limit must be positive")
+        if self.replication_backlog_batches <= 0:
+            raise ValueError(
+                "replication_backlog_batches must be positive"
+            )
         if self.replica_drain_grace_ms < 0:
             raise ValueError("replica_drain_grace_ms cannot be negative")
         if self.max_session_frames <= 0:

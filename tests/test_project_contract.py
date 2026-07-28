@@ -17,3 +17,9 @@ def test_lfu_configuration_is_explicit_and_validated():
     )
     with pytest.raises(ValueError, match="lfu_decay_interval_ms"):
         MiniRedisConfig(lfu_decay_interval_ms=0)
+
+
+def test_replication_backlog_configuration_is_positive():
+    assert MiniRedisConfig().replication_backlog_batches == 1024
+    with pytest.raises(ValueError, match="replication_backlog_batches"):
+        MiniRedisConfig(replication_backlog_batches=0)

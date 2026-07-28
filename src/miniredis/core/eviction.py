@@ -12,6 +12,7 @@ from miniredis.core.commit import (
 from miniredis.core.database import Database, logical_entry_size
 from miniredis.core.executor import ExecutionPlan
 from miniredis.core.expiration import expiry_delete, is_expired
+from miniredis.core.frequency import project_frequency
 from miniredis.core.planning import dedupe_operations
 from miniredis.core.reply import Failure
 
@@ -47,6 +48,29 @@ def _expired_operations(
         expiry_delete(key)
         for key, entry in sorted(database.entries.items())
         if is_expired(entry, now_ms)
+    )
+
+
+def _lfu_candidates(
+    database: Database,
+    *,
+    now_ms: int,
+    decay_interval_ms: int,
+    excluded: set[bytes],
+) -> list[tuple[int, int, bytes]]:
+    return sorted(
+        (
+            project_frequency(
+                entry.frequency,
+                entry.last_frequency_decay_ms,
+                now_ms,
+                decay_interval_ms,
+            )[0],
+            entry.last_access_tick,
+            key,
+        )
+        for key, entry in database.entries.items()
+        if key not in excluded and not is_expired(entry, now_ms)
     )
 
 
@@ -102,15 +126,28 @@ def enforce_memory(
     already_deleted = {
         operation.key for operation in operations if isinstance(operation, DeleteKey)
     }
-    candidates = sorted(
-        (entry.last_access_tick, key)
-        for key, entry in database.entries.items()
-        if key not in target_keys
-        and key not in already_deleted
-        and not is_expired(entry, now_ms)
-    )
+    excluded = target_keys | already_deleted
+    if config.eviction_policy == "allkeys-lfu":
+        candidate_keys = [
+            key
+            for _frequency, _tick, key in _lfu_candidates(
+                database,
+                now_ms=now_ms,
+                decay_interval_ms=config.lfu_decay_interval_ms,
+                excluded=excluded,
+            )
+        ]
+    else:
+        candidate_keys = [
+            key
+            for _tick, key in sorted(
+                (entry.last_access_tick, key)
+                for key, entry in database.entries.items()
+                if key not in excluded and not is_expired(entry, now_ms)
+            )
+        ]
     victims: list[CommitOperation] = []
-    for _tick, key in candidates:
+    for key in candidate_keys:
         victims.append(DeleteKey(key, DeleteReason.EVICTED))
         candidate_operations = dedupe_operations(
             expired + tuple(victims) + plan.operations

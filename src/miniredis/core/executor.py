@@ -34,6 +34,8 @@ from miniredis.core.commit import (
     CommitBatch,
     CommitOperation,
     CommitTrigger,
+    DeleteKey,
+    DeleteReason,
     PreparedCommit,
     PutEntry,
     SnapshotImage,
@@ -292,6 +294,8 @@ class CommandExecutor:
         self._transactions: dict[int, TransactionState] = {}
         self._transaction_aborts = 0
         self._watch_aborts = 0
+        self.expired_key_count = 0
+        self.evicted_key_count = 0
         self._replica_apply_failure = replica_apply_failure
         if (replica_apply_entered is None) != (replica_apply_release is None):
             raise ValueError(
@@ -1044,6 +1048,16 @@ class CommandExecutor:
             track_access=prepared.trigger is CommitTrigger.CLIENT,
             now_ms=self.clock.now_ms(),
             lfu_decay_interval_ms=self.lfu_decay_interval_ms,
+        )
+        self.expired_key_count += sum(
+            isinstance(operation, DeleteKey)
+            and operation.reason is DeleteReason.EXPIRED
+            for operation in batch.operations
+        )
+        self.evicted_key_count += sum(
+            isinstance(operation, DeleteKey)
+            and operation.reason is DeleteReason.EVICTED
+            for operation in batch.operations
         )
         self._applied_batches.append(batch)
         self._offer_replica_batch(batch)

@@ -85,3 +85,82 @@ async def test_expired_budget_is_purged_in_same_batch_before_noeviction_check():
             for operation in batch.operations
         )
         assert r.debug_physical_key_count == 1
+        assert r.debug_stats().expired_key_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lfu_evicts_lowest_effective_frequency():
+    clock = FakeClock(0)
+    async with MiniRedis.open(
+        clock=clock,
+        maxmemory=260,
+        eviction_policy="allkeys-lfu",
+        lfu_decay_interval_ms=1000,
+    ) as runtime:
+        client = runtime.direct_client()
+        await client.execute(CommandRequest(b"SET", (b"hot", b"x")))
+        for _ in range(4):
+            await client.execute(CommandRequest(b"GET", (b"hot",)))
+        await client.execute(CommandRequest(b"SET", (b"cold", b"x")))
+
+        assert await client.execute(
+            CommandRequest(b"SET", (b"new", b"x" * 60))
+        ) == Ok()
+        assert await client.execute(CommandRequest(b"GET", (b"cold",))) == Bytes(None)
+        assert await client.execute(CommandRequest(b"GET", (b"hot",))) == Bytes(b"x")
+        assert runtime.debug_stats().evicted_key_count == 1
+
+
+@pytest.mark.asyncio
+async def test_lfu_decay_can_cool_an_old_hot_key_below_recent_key():
+    clock = FakeClock(0)
+    async with MiniRedis.open(
+        clock=clock,
+        maxmemory=260,
+        eviction_policy="allkeys-lfu",
+        lfu_decay_interval_ms=1000,
+    ) as runtime:
+        client = runtime.direct_client()
+        await client.execute(CommandRequest(b"SET", (b"old", b"x")))
+        for _ in range(7):
+            await client.execute(CommandRequest(b"GET", (b"old",)))
+        old_anchor = runtime.database.entries[b"old"].last_frequency_decay_ms
+        clock.advance(3_000)
+        await client.execute(CommandRequest(b"SET", (b"recent", b"x")))
+
+        assert await client.execute(
+            CommandRequest(b"SET", (b"new", b"x" * 60))
+        ) == Ok()
+        assert await client.execute(CommandRequest(b"GET", (b"old",))) == Bytes(None)
+        assert await client.execute(CommandRequest(b"GET", (b"recent",))) == Bytes(
+            b"x"
+        )
+        assert old_anchor == 0
+
+
+@pytest.mark.asyncio
+async def test_lfu_planning_projects_without_materializing_survivor_decay():
+    clock = FakeClock(0)
+    async with MiniRedis.open(
+        clock=clock,
+        maxmemory=260,
+        eviction_policy="allkeys-lfu",
+        lfu_decay_interval_ms=1000,
+    ) as runtime:
+        client = runtime.direct_client()
+        await client.execute(CommandRequest(b"SET", (b"hot", b"x")))
+        for _ in range(7):
+            await client.execute(CommandRequest(b"GET", (b"hot",)))
+        await client.execute(CommandRequest(b"SET", (b"cold", b"x")))
+        clock.advance(2_000)
+        before = (
+            runtime.database.entries[b"hot"].frequency,
+            runtime.database.entries[b"hot"].last_frequency_decay_ms,
+        )
+
+        assert await client.execute(
+            CommandRequest(b"SET", (b"new", b"x" * 60))
+        ) == Ok()
+
+        survivor = runtime.database.entries[b"hot"]
+        assert (survivor.frequency, survivor.last_frequency_decay_ms) == before

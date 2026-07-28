@@ -84,6 +84,10 @@ class RuntimeStats:
     watched_keys: int
     transaction_aborts: int
     watch_aborts: int
+    key_count: int
+    logical_memory_usage: int
+    expired_key_count: int
+    evicted_key_count: int
 
 
 @dataclass(slots=True)
@@ -748,6 +752,10 @@ class MiniRedis:
             watched_keys=self.executor.watched_key_count,
             transaction_aborts=self.executor.transaction_abort_count,
             watch_aborts=self.executor.watch_abort_count,
+            key_count=len(self.database.entries),
+            logical_memory_usage=self.database.logical_usage,
+            expired_key_count=self.executor.expired_key_count,
+            evicted_key_count=self.executor.evicted_key_count,
         )
 
     def _debug_notify(self) -> None:

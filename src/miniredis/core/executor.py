@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Protocol
 
 from miniredis.clock import Clock, TimerScheduler
 from miniredis.commands.model import (
-    BlPop,
+    BlockingPop,
     Command,
     ListPush,
     Ping,
@@ -608,8 +608,12 @@ class CommandExecutor:
             return
 
         now_ms = self.clock.now_ms()
-        if isinstance(command, BlPop):
-            plan = self.planner.plan_blpop_now(command, self.database, now_ms)
+        if isinstance(command, BlockingPop):
+            plan = self.planner.plan_blocking_pop_now(
+                command,
+                self.database,
+                now_ms,
+            )
             if plan is None:
                 deadline = (
                     None if command.timeout_ms == 0 else now_ms + command.timeout_ms
@@ -619,6 +623,7 @@ class CommandExecutor:
                     request.session_id,
                     command.keys,
                     deadline,
+                    command.left,
                 )
                 if waiter.deadline_ms is not None:
                     waiter.timer = self.scheduler.call_at_ms(

@@ -109,9 +109,10 @@ class ListRange:
 
 
 @dataclass(frozen=True, slots=True)
-class BlPop:
+class BlockingPop:
     keys: tuple[bytes, ...]
     timeout_ms: int
+    left: bool
 
 
 @dataclass(frozen=True, slots=True)
@@ -238,7 +239,7 @@ Command: TypeAlias = (
     | ListPush
     | ListPop
     | ListRange
-    | BlPop
+    | BlockingPop
     | Subscribe
     | Unsubscribe
     | Publish
@@ -270,7 +271,7 @@ _DATASET_MUTATING_TYPES = frozenset(
         HashIncrement,
         ListPush,
         ListPop,
-        BlPop,
+        BlockingPop,
         SetAdd,
         SetRemove,
         ZAdd,

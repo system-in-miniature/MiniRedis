@@ -1,6 +1,6 @@
 from collections import deque
 
-from miniredis.commands.model import BlPop
+from miniredis.commands.model import BlockingPop
 from miniredis.commands.model import Command
 from miniredis.config import MiniRedisConfig
 from miniredis.core.commit import (
@@ -49,9 +49,9 @@ class CommandPlanner:
             return enforce_memory(plan, database, self.config, now_ms)
         return ExecutionPlan(Failure("ERR", "unknown command"))
 
-    def plan_blpop_now(
+    def plan_blocking_pop_now(
         self,
-        command: BlPop,
+        command: BlockingPop,
         database: Database,
         now_ms: int,
     ) -> ExecutionPlan | None:
@@ -71,7 +71,7 @@ class CommandPlanner:
             if not entry.value.items:
                 continue
             items = deque(entry.value.items)
-            item = items.popleft()
+            item = items.popleft() if command.left else items.pop()
             if items:
                 operation: CommitOperation = PutEntry(
                     key,

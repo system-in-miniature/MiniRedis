@@ -16,7 +16,9 @@ def test_every_frozen_command_type_has_exactly_one_dataset_trait():
 
 
 def test_blpop_is_mutating_and_pubsub_is_explicitly_non_dataset():
-    assert model.is_dataset_mutating(model.BlPop((b"q",), 0)) is True
+    assert (
+        model.is_dataset_mutating(model.BlockingPop((b"q",), 0, left=True)) is True
+    )
     assert (
         model.is_dataset_mutating(model.Subscribe((b"c",))) is False
     )

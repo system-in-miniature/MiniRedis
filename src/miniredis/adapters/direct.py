@@ -4,7 +4,7 @@ import asyncio
 from typing import TYPE_CHECKING
 
 from miniredis.commands.request import CommandRequest
-from miniredis.commands.model import BlPop
+from miniredis.commands.model import BlockingPop
 from miniredis.core.executor import (
     AbandonRequest,
     SessionClosed,
@@ -71,7 +71,7 @@ class DirectClient:
                 return Failure("CLOSED", "runtime closed")
             case RuntimeClosed():
                 return Failure("CLOSED", "runtime closed before reply")
-            case TransportClosed() if isinstance(parsed, BlPop):
+            case TransportClosed() if isinstance(parsed, BlockingPop):
                 return Bytes(None)
             case TransportClosed():
                 return Failure("CLOSED", "session closed")

@@ -43,6 +43,7 @@ class BlockingWaiter:
     session_id: int
     keys: tuple[bytes, ...]
     deadline_ms: int | None
+    left: bool
     state: WaiterState = WaiterState.ACTIVE
     timer: CancelHandle | None = None
 
@@ -69,9 +70,16 @@ class WaiterRegistry:
         session_id: int,
         keys: tuple[bytes, ...],
         deadline_ms: int | None,
+        left: bool,
     ) -> BlockingWaiter:
         waiter = BlockingWaiter(
-            WaiterId(self._next_id), 1, token, session_id, keys, deadline_ms
+            WaiterId(self._next_id),
+            1,
+            token,
+            session_id,
+            keys,
+            deadline_ms,
+            left,
         )
         self._next_id += 1
         self._by_id[waiter.waiter_id] = waiter
@@ -183,7 +191,7 @@ def prepare_list_wakeups(
                 waiter.waiter_id,
                 waiter.generation,
                 key,
-                remaining.popleft(),
+                remaining.popleft() if waiter.left else remaining.pop(),
             )
         )
     if remaining:

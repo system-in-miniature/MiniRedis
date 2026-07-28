@@ -3,14 +3,18 @@ import asyncio
 import pytest
 
 from miniredis import CommandRequest, MiniRedis
-from miniredis.commands.model import BlPop
+from miniredis.commands.model import BlockingPop
 from miniredis.commands.parser import CommandParseError, parse_request
 from miniredis.core.reply import Bytes, Failure, Items
 
 
 def test_blpop_parser_freezes_keys_and_milliseconds():
-    assert parse_request(CommandRequest(b"BLPOP", (b"a", b"b", b"1.25"))) == BlPop(
-        (b"a", b"b"), 1250
+    assert parse_request(
+        CommandRequest(b"BLPOP", (b"a", b"b", b"1.25"))
+    ) == BlockingPop(
+        (b"a", b"b"),
+        1250,
+        left=True,
     )
 
 
@@ -59,3 +63,31 @@ async def test_empty_scan_registers_once_under_every_key():
         assert runtime.debug_waiter_ids(b"a") == ()
         assert runtime.debug_waiter_ids(b"b") == ()
         assert runtime.debug_waiter_index_counts == (0, 0, 0)
+
+
+@pytest.mark.asyncio
+async def test_brpop_uses_first_ready_key_and_right_side():
+    async with MiniRedis.open() as runtime:
+        c = runtime.direct_client()
+        await c.execute(CommandRequest(b"RPUSH", (b"first", b"a", b"b")))
+        await c.execute(CommandRequest(b"RPUSH", (b"second", b"c")))
+
+        assert await c.execute(
+            CommandRequest(b"BRPOP", (b"first", b"second", b"1"))
+        ) == Items((Bytes(b"first"), Bytes(b"b")))
+
+
+@pytest.mark.asyncio
+async def test_blocked_brpop_preserves_right_pop_direction_when_woken():
+    async with MiniRedis.open() as runtime:
+        consumer = runtime.direct_client()
+        producer = runtime.direct_client()
+        blocked = asyncio.create_task(
+            consumer.execute(CommandRequest(b"BRPOP", (b"q", b"0")))
+        )
+        await runtime.debug_wait_for_waiters(1)
+
+        await producer.execute(CommandRequest(b"LPUSH", (b"q", b"a", b"b")))
+
+        assert await blocked == Items((Bytes(b"q"), Bytes(b"a")))
+        assert await producer.execute(CommandRequest(b"LPOP", (b"q",))) == Bytes(b"b")

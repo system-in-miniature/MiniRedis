@@ -11,7 +11,7 @@ from decimal import (
 from typing import Literal
 
 from miniredis.commands.model import (
-    BlPop,
+    BlockingPop,
     Command,
     Delete,
     Echo,
@@ -228,7 +228,7 @@ def parse_request(request: CommandRequest) -> Command:
         case b"LRANGE":
             _require_arity(name, args, 3)
             return ListRange(args[0], parse_int64(args[1]), parse_int64(args[2]))
-        case b"BLPOP":
+        case b"BLPOP" | b"BRPOP":
             if len(args) < 2:
                 raise CommandParseError("wrong number of arguments")
             raw_timeout = args[-1]
@@ -249,7 +249,11 @@ def parse_request(request: CommandRequest) -> Command:
             if not timeout_ms.is_finite() or timeout_ms > _MAX_BLPOP_TIMEOUT_MS:
                 raise CommandParseError("timeout is out of range")
             milliseconds = int(timeout_ms.to_integral_value(rounding=ROUND_CEILING))
-            return BlPop(tuple(args[:-1]), milliseconds)
+            return BlockingPop(
+                tuple(args[:-1]),
+                milliseconds,
+                left=name == b"BLPOP",
+            )
         case b"SUBSCRIBE":
             if not args:
                 raise CommandParseError("wrong number of arguments")

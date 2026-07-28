@@ -165,7 +165,16 @@ class DetachReplica:
 class InstallReplicaSnapshot:
     sink: ReplicaSink
     generation: int
+    replication_id: str
     image: SnapshotImage
+    future: asyncio.Future[bool]
+
+
+@dataclass(slots=True)
+class PrepareReplicaResume:
+    generation: int
+    replication_id: str
+    expected_applied_seq: int
     future: asyncio.Future[bool]
 
 
@@ -318,6 +327,7 @@ class CommandExecutor:
         self._replica_sinks: dict[int, ReplicaSink] = {}
         self._next_replica_generation = 1
         self._active_source_generation: int | None = None
+        self._active_source_id: str | None = None
         self._replica_read_only = False
         self._transactions: dict[int, TransactionState] = {}
         self._transaction_aborts = 0
@@ -640,8 +650,19 @@ class CommandExecutor:
                 now_ms=self.clock.now_ms(),
             )
             self._active_source_generation = message.generation
+            self._active_source_id = message.replication_id
             self._replica_read_only = True
             message.future.set_result(True)
+        elif isinstance(message, PrepareReplicaResume):
+            allowed = (
+                self._replica_read_only
+                and self._active_source_id == message.replication_id
+                and self.database.commit_seq
+                == message.expected_applied_seq
+            )
+            if allowed:
+                self._active_source_generation = message.generation
+            message.future.set_result(allowed)
         elif isinstance(message, ApplyReplicaBatch):
             if message.generation != self._active_source_generation:
                 message.future.set_result(False)
@@ -1236,11 +1257,38 @@ class CommandExecutor:
         self,
         sink: ReplicaSink,
         generation: int,
+        replication_id: str,
         image: SnapshotImage,
     ) -> bool:
         future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
         if not self.post_control(
-            InstallReplicaSnapshot(sink, generation, image, future)
+            InstallReplicaSnapshot(
+                sink,
+                generation,
+                replication_id,
+                image,
+                future,
+            )
+        ):
+            return False
+        return await asyncio.shield(future)
+
+    async def prepare_replica_resume(
+        self,
+        generation: int,
+        replication_id: str,
+        expected_applied_seq: int,
+    ) -> bool:
+        future: asyncio.Future[bool] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if not self.post_control(
+            PrepareReplicaResume(
+                generation,
+                replication_id,
+                expected_applied_seq,
+                future,
+            )
         ):
             return False
         return await asyncio.shield(future)

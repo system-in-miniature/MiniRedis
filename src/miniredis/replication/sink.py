@@ -10,6 +10,7 @@ from miniredis.core.commit import CommitBatch
 from miniredis.replication.backlog import (
     FullSyncAttachment,
     ReplicaAttachment,
+    ReplicationCursor,
 )
 
 if TYPE_CHECKING:
@@ -20,6 +21,7 @@ if TYPE_CHECKING:
 class ReplicaSinkState(StrEnum):
     DETACHED = "detached"
     BOOTSTRAPPING = "bootstrapping"
+    CATCHING_UP = "catching_up"
     STREAMING = "streaming"
     NEEDS_RESYNC = "needs_resync"
     FAILED = "failed"
@@ -27,6 +29,11 @@ class ReplicaSinkState(StrEnum):
     PROMOTED = "promoted"
     SOURCE_LOST = "source_lost"
     STOPPED = "stopped"
+
+
+class ReplicaSyncMode(StrEnum):
+    FULL = "full"
+    PARTIAL = "partial"
 
 
 @dataclass(frozen=True, slots=True)
@@ -38,6 +45,9 @@ class ReplicaStatus:
     primary_seq: int
     lag: int
     queued: int
+    replication_id: str | None
+    sync_mode: ReplicaSyncMode | None
+    cursor: ReplicationCursor | None
 
 
 class ReplicaSink:
@@ -58,7 +68,10 @@ class ReplicaSink:
         self._baseline_seq = 0
         self._applied_seq = 0
         self._primary_seq = 0
+        self._replication_id: str | None = None
+        self._sync_mode: ReplicaSyncMode | None = None
         self._state = ReplicaSinkState.DETACHED
+        self._catch_up: deque[CommitBatch] = deque()
         self._queue: deque[CommitBatch] = deque()
         self._queue_ready = asyncio.Event()
         self._apply_allowed = asyncio.Event()
@@ -85,6 +98,18 @@ class ReplicaSink:
             primary_seq=self._primary_seq,
             lag=max(0, self._primary_seq - self._applied_seq),
             queued=len(self._queue),
+            replication_id=self._replication_id,
+            sync_mode=self._sync_mode,
+            cursor=self.cursor,
+        )
+
+    @property
+    def cursor(self) -> ReplicationCursor | None:
+        if self._replication_id is None:
+            return None
+        return ReplicationCursor(
+            self._replication_id,
+            self._applied_seq,
         )
 
     @property
@@ -106,18 +131,42 @@ class ReplicaSink:
     ) -> None:
         if self._state is not ReplicaSinkState.BOOTSTRAPPING:
             raise RuntimeError("sink is not bootstrapping")
-        if not isinstance(attachment, FullSyncAttachment):
-            raise RuntimeError("partial sync is not supported by this sink")
         self._generation = attachment.generation
-        self._baseline_seq = attachment.image.checkpoint_seq
-        self._applied_seq = attachment.image.checkpoint_seq
-        self._primary_seq = attachment.image.checkpoint_seq
+        self._replication_id = attachment.replication_id
+        if isinstance(attachment, FullSyncAttachment):
+            self._sync_mode = ReplicaSyncMode.FULL
+            self._baseline_seq = attachment.image.checkpoint_seq
+            self._applied_seq = attachment.image.checkpoint_seq
+            self._primary_seq = attachment.image.checkpoint_seq
+            self._catch_up.clear()
+        else:
+            self._sync_mode = ReplicaSyncMode.PARTIAL
+            self._baseline_seq = attachment.cursor.applied_seq
+            self._applied_seq = attachment.cursor.applied_seq
+            self._primary_seq = attachment.boundary_seq
+            self._catch_up = deque(attachment.batches)
         self._attachment_captured.set()
         self._signal_status_change()
 
     async def attach(self, primary: MiniRedis) -> ReplicaStatus:
-        if self._state is not ReplicaSinkState.DETACHED:
+        if self._state not in {
+            ReplicaSinkState.DETACHED,
+            ReplicaSinkState.NEEDS_RESYNC,
+            ReplicaSinkState.SOURCE_LOST,
+        }:
             raise RuntimeError("replica sink is already attached")
+        previous_task = self._task
+        if previous_task is not None and not previous_task.done():
+            previous_task.cancel()
+            try:
+                await previous_task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        self._queue.clear()
+        self._catch_up.clear()
+        self._queue_ready.clear()
+        self._attachment_captured.clear()
         current = asyncio.current_task()
         assert current is not None
         self._attach_task = current
@@ -125,21 +174,42 @@ class ReplicaSink:
         self._state = ReplicaSinkState.BOOTSTRAPPING
         self._signal_status_change()
         try:
-            attachment = await primary.executor.attach_replica(self)
+            attachment = await primary.executor.attach_replica(
+                self,
+                self.cursor,
+            )
             if self._install_gate is not None:
                 await self._install_gate.wait()
             if self._state is not ReplicaSinkState.BOOTSTRAPPING:
                 return self.status
-            installed = await self._replica.executor.install_replica_snapshot(
-                self,
-                attachment.generation,
-                attachment.image,
-            )
+            if isinstance(attachment, FullSyncAttachment):
+                installed = (
+                    await self._replica.executor.install_replica_snapshot(
+                        self,
+                        attachment.generation,
+                        attachment.replication_id,
+                        attachment.image,
+                    )
+                )
+            else:
+                installed = (
+                    await self._replica.executor.prepare_replica_resume(
+                        attachment.generation,
+                        attachment.replication_id,
+                        attachment.cursor.applied_seq,
+                    )
+                )
             if not installed:
+                self._state = ReplicaSinkState.NEEDS_RESYNC
+                self._signal_status_change()
                 return self.status
             if self._state is not ReplicaSinkState.BOOTSTRAPPING:
                 return self.status
-            self._state = ReplicaSinkState.STREAMING
+            self._state = (
+                ReplicaSinkState.CATCHING_UP
+                if self._catch_up
+                else ReplicaSinkState.STREAMING
+            )
             self._signal_status_change()
             self._task = asyncio.create_task(
                 self._run_apply(),
@@ -158,12 +228,14 @@ class ReplicaSink:
     def offer(self, batch: CommitBatch) -> bool:
         if self._state not in {
             ReplicaSinkState.BOOTSTRAPPING,
+            ReplicaSinkState.CATCHING_UP,
             ReplicaSinkState.STREAMING,
         }:
             return False
         self._primary_seq = batch.seq
         if len(self._queue) >= self._queue_limit:
             self._queue.clear()
+            self._catch_up.clear()
             self._state = ReplicaSinkState.NEEDS_RESYNC
             self._queue_ready.set()
             self._signal_status_change()
@@ -175,26 +247,36 @@ class ReplicaSink:
 
     async def _run_apply(self) -> None:
         try:
-            while self._state is ReplicaSinkState.STREAMING:
-                await self._queue_ready.wait()
-                await self._apply_allowed.wait()
-                if not self._queue:
-                    self._queue_ready.clear()
-                    continue
-                batch = self._queue.popleft()
-                if not self._queue:
-                    self._queue_ready.clear()
+            while self._state in {
+                ReplicaSinkState.CATCHING_UP,
+                ReplicaSinkState.STREAMING,
+            }:
+                if self._state is ReplicaSinkState.CATCHING_UP:
+                    await self._apply_allowed.wait()
+                    if not self._catch_up:
+                        self._state = ReplicaSinkState.STREAMING
+                        self._signal_status_change()
+                        continue
+                    batch = self._catch_up.popleft()
+                else:
+                    await self._queue_ready.wait()
+                    await self._apply_allowed.wait()
+                    if not self._queue:
+                        self._queue_ready.clear()
+                        continue
+                    batch = self._queue.popleft()
+                    if not self._queue:
+                        self._queue_ready.clear()
+                if batch.seq != self._applied_seq + 1:
+                    await self._mark_needs_resync()
+                    return
                 assert self._generation is not None
                 applied = await self._replica.executor.apply_replica_batch(
                     self._generation,
                     batch,
                 )
                 if not applied:
-                    self._queue.clear()
-                    self._state = ReplicaSinkState.NEEDS_RESYNC
-                    self._signal_status_change()
-                    if self._primary is not None:
-                        await self._primary.executor.detach_replica(self._generation)
+                    await self._mark_needs_resync()
                     return
                 self._applied_seq = batch.seq
                 self._signal_status_change()
@@ -208,6 +290,40 @@ class ReplicaSink:
                 await self._primary.executor.detach_replica(self._generation)
         finally:
             self._signal_status_change()
+
+    async def _mark_needs_resync(self) -> None:
+        self._queue.clear()
+        self._catch_up.clear()
+        self._state = ReplicaSinkState.NEEDS_RESYNC
+        self._signal_status_change()
+        if self._primary is not None and self._generation is not None:
+            await self._primary.executor.detach_replica(
+                self._generation
+            )
+
+    async def disconnect(self) -> ReplicaStatus:
+        generation = self._generation
+        primary = self._primary
+        if primary is not None and generation is not None:
+            await primary.executor.detach_replica(generation)
+            primary._release_replica_sink(self)
+        task = self._task
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+        self._task = None
+        self._queue.clear()
+        self._catch_up.clear()
+        self._queue_ready.clear()
+        self._attachment_captured.clear()
+        self._generation = None
+        self._primary = None
+        self._state = ReplicaSinkState.DETACHED
+        self._signal_status_change()
+        return self.status
 
     async def wait_until_applied(self, seq: int) -> None:
         terminal = {
@@ -261,6 +377,7 @@ class ReplicaSink:
             except asyncio.CancelledError:
                 pass
         self._queue.clear()
+        self._catch_up.clear()
         result = await self._replica.executor.promote_replica(self._generation)
         if not result.writable:
             self._state = ReplicaSinkState.FAILED
@@ -296,6 +413,7 @@ class ReplicaSink:
             except asyncio.CancelledError:
                 pass
         self._queue.clear()
+        self._catch_up.clear()
         self._primary = None
         self._signal_status_change()
 
@@ -333,6 +451,7 @@ class ReplicaSink:
             except asyncio.CancelledError:
                 pass
         self._queue.clear()
+        self._catch_up.clear()
         self._state = ReplicaSinkState.STOPPED
         self._primary = None
         self._signal_status_change()

@@ -286,6 +286,8 @@ class CommandExecutor:
         self._active_source_generation: int | None = None
         self._replica_read_only = False
         self._transactions: dict[int, TransactionState] = {}
+        self._transaction_aborts = 0
+        self._watch_aborts = 0
         self._replica_apply_failure = replica_apply_failure
         if (replica_apply_entered is None) != (replica_apply_release is None):
             raise ValueError(
@@ -806,6 +808,7 @@ class CommandExecutor:
             return
         try:
             if state.dirty:
+                self._transaction_aborts += 1
                 self._finish_reply(
                     request.token,
                     Failure(
@@ -818,6 +821,7 @@ class CommandExecutor:
                 self.database.revision(key) != revision
                 for key, revision in state.watched.items()
             ):
+                self._watch_aborts += 1
                 self._finish_reply(request.token, NullArray())
                 return
 
@@ -1202,6 +1206,14 @@ class CommandExecutor:
     @property
     def watched_key_count(self) -> int:
         return sum(len(state.watched) for state in self._transactions.values())
+
+    @property
+    def transaction_abort_count(self) -> int:
+        return self._transaction_aborts
+
+    @property
+    def watch_abort_count(self) -> int:
+        return self._watch_aborts
 
     @property
     def accepted_tokens(self) -> tuple[RequestToken, ...]:

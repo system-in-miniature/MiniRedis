@@ -90,6 +90,7 @@ async def test_dirty_exec_aborts_without_applying_queued_commands():
         assert await client.execute(CommandRequest(b"EXEC")) == Failure(
             "EXECABORT", "transaction discarded because of previous errors"
         )
+        assert runtime.debug_stats().transaction_aborts == 1
         assert await client.execute(CommandRequest(b"GET", (b"k",))) == Bytes(None)
 
 

@@ -45,5 +45,6 @@ async def test_watch_detects_create_then_delete():
         await owner.execute(CommandRequest(b"GET", (b"k",)))
 
         assert await owner.execute(CommandRequest(b"EXEC")) == NullArray()
+        assert runtime.debug_stats().watch_aborts == 1
         assert runtime.executor.watched_key_count == 0
         assert await owner.execute(CommandRequest(b"GET", (b"k",))) == Bytes(None)

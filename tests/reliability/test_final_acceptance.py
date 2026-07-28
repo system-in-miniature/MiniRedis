@@ -15,6 +15,7 @@ from tests.helpers.runtime import open_test_runtime
 
 OWNER_FIELDS = (
     "accepted_requests",
+    "active_transactions",
     "aof_tasks",
     "control_producers",
     "executor_tasks",
@@ -30,6 +31,7 @@ OWNER_FIELDS = (
     "tcp_tasks",
     "timer_handles",
     "waiters",
+    "watched_keys",
 )
 
 

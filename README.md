@@ -25,8 +25,8 @@ TCP -> RESP2 decoder ───────┘                         |
 
 | Area | Commands |
 |---|---|
-| General | `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE` |
-| String | `GET`, `MGET`, `SET [NX\|XX] [EX seconds\|PX ms]`, `MSET`, `INCR`, `DECR`, `INCRBY` |
+| General | `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE`, `MULTI`, `EXEC`, `DISCARD`, `WATCH`, `UNWATCH` |
+| String | `GET`, `MGET`, `SET [NX\|XX] [EX seconds\|PX ms]`, `MSET`, `INCR`, `DECR`, `INCRBY`, `COMPAREDEL`, `CHECKDECR` |
 | Hash | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HINCRBY` |
 | List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP`, `BRPOP` |
 | Set | `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SINTER` |
@@ -40,6 +40,13 @@ Keys, fields, members, values, and channels are `bytes`.
 order without waiting for each preceding result. Pipeline batches adapter
 submission only. It does not provide atomic execution, rollback, or
 cross-client isolation.
+
+Transactions queue typed commands per connection. Queue-time errors make
+`EXEC` fail with `EXECABORT`; runtime command errors retain their result slots
+and do not roll back other successful commands. All successful mutations from
+one `EXEC` cross AOF, replication, and crash recovery as one `CommitBatch`.
+`WATCH` compares a persistent per-key revision, so create-delete cycles are
+still observable.
 
 ## Quick start: Direct API
 
@@ -117,8 +124,8 @@ See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
 
 ## Non-goals
 
-MiniRedis does not implement RESP3, inline protocol, `MULTI`/`EXEC`/`WATCH`,
-Lua, Streams, ACL, multiple databases, Modules, AOF rewrite, network
+MiniRedis does not implement RESP3, inline protocol, Lua or a general script
+VM, Streams, ACL, multiple databases, Modules, AOF rewrite, network
 replication, PSYNC, backlog, heartbeat, ACK quorum, election, Sentinel,
 Cluster, authentication, TLS, or production performance parity.
 

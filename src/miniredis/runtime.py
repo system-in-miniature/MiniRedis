@@ -80,6 +80,10 @@ class RuntimeStats:
     tcp_servers: int
     tcp_sessions: int
     tcp_tasks: int
+    active_transactions: int
+    watched_keys: int
+    transaction_aborts: int
+    watch_aborts: int
 
 
 @dataclass(slots=True)
@@ -739,6 +743,10 @@ class MiniRedis:
             tcp_servers=len(servers),
             tcp_sessions=sum(server.session_count for server in servers),
             tcp_tasks=sum(server.owned_task_count for server in servers),
+            active_transactions=self.executor.active_transaction_count,
+            watched_keys=self.executor.watched_key_count,
+            transaction_aborts=self.executor.transaction_abort_count,
+            watch_aborts=self.executor.watch_abort_count,
         )
 
     def _debug_notify(self) -> None:

@@ -189,6 +189,7 @@ class ApplyReplicaBatch:
 class PromotionResult:
     applied_seq: int
     writable: bool
+    replication_id: str
 
 
 @dataclass(slots=True)
@@ -689,12 +690,25 @@ class CommandExecutor:
         elif isinstance(message, PromoteReplica):
             if message.generation != self._active_source_generation:
                 message.future.set_result(
-                    PromotionResult(self.database.commit_seq, False)
+                    PromotionResult(
+                        self.database.commit_seq,
+                        False,
+                        self.replication_id,
+                    )
                 )
                 return
             self._active_source_generation = None
+            self._active_source_id = None
             self._replica_read_only = False
-            message.future.set_result(PromotionResult(self.database.commit_seq, True))
+            self.replication_id = self._replication_id_factory()
+            self.replication_backlog.clear()
+            message.future.set_result(
+                PromotionResult(
+                    self.database.commit_seq,
+                    True,
+                    self.replication_id,
+                )
+            )
         else:
             raise AssertionError(f"unknown executor message: {message!r}")
 

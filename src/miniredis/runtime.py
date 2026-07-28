@@ -690,6 +690,14 @@ class MiniRedis:
         return len(self.database.entries)
 
     @property
+    def debug_replication_backlog_count(self) -> int:
+        return self.executor.replication_backlog.batch_count
+
+    @property
+    def debug_replication_backlog_oldest_seq(self) -> int | None:
+        return self.executor.replication_backlog.oldest_seq
+
+    @property
     def closed(self) -> bool:
         return self.state is RuntimeState.CLOSED
 

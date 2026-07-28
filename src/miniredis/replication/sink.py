@@ -385,6 +385,7 @@ class ReplicaSink:
             raise RuntimeError("replica generation is no longer promotable")
         self._applied_seq = result.applied_seq
         self._primary_seq = max(self._primary_seq, result.applied_seq)
+        self._replication_id = result.replication_id
         self._state = ReplicaSinkState.PROMOTED
         self._primary = None
         self._signal_status_change()

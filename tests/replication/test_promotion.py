@@ -1,4 +1,5 @@
 import asyncio
+from dataclasses import dataclass
 
 import pytest
 
@@ -12,6 +13,10 @@ from miniredis.core.commit import (
 )
 from miniredis.core.reply import Bytes, Ok
 from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+from miniredis.replication.backlog import (
+    FullSyncAttachment,
+    ReplicationCursor,
+)
 from tests.helpers.runtime import open_test_runtime
 
 
@@ -26,6 +31,17 @@ def batch(seq: int, value: bytes) -> CommitBatch:
         ),
         CommitTrigger.CLIENT,
     )
+
+
+@dataclass
+class AttachmentProbe:
+    attachment: object | None = None
+
+    def register_attachment(self, attachment) -> None:
+        self.attachment = attachment
+
+    def offer(self, _batch) -> bool:
+        return True
 
 
 @pytest.mark.asyncio
@@ -99,3 +115,43 @@ async def test_link_generations_are_never_reused():
     await primary.close()
     await first_replica.close()
     await second_replica.close()
+
+
+@pytest.mark.asyncio
+async def test_promotion_fences_old_history_and_starts_new_backlog():
+    promoted_ids = iter(("replica-seed", "promoted-B"))
+    primary = await open_test_runtime(
+        replication_id_factory=lambda: "primary-A"
+    )
+    promoted = await open_test_runtime(
+        replication_id_factory=lambda: next(promoted_ids)
+    )
+    sink = ReplicaSink(promoted, queue_limit=4)
+    await primary.attach_replica(sink)
+    old_id = sink.status.replication_id
+
+    result = await sink.promote(source_alive=True)
+
+    assert old_id == "primary-A"
+    assert result.replication_id == "promoted-B"
+    assert result.replication_id != old_id
+    assert sink.status.replication_id == "promoted-B"
+    assert promoted.debug_replication_backlog_count == 0
+
+    probe = AttachmentProbe()
+    attachment = await promoted.executor.attach_replica(
+        probe,
+        ReplicationCursor(old_id, result.applied_seq),
+    )
+    assert isinstance(attachment, FullSyncAttachment)
+    await promoted.executor.detach_replica(attachment.generation)
+
+    assert await promoted.direct_client().execute(
+        CommandRequest(b"SET", (b"k", b"new"))
+    ) == Ok()
+    assert promoted.debug_replication_backlog_count == 1
+    assert promoted.debug_replication_backlog_oldest_seq == (
+        result.applied_seq + 1
+    )
+    await primary.close()
+    await promoted.close()

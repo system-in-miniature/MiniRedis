@@ -42,7 +42,12 @@ from miniredis.core.outbound import (
 )
 from miniredis.core.planner import CommandPlanner
 from miniredis.core.reply import Failure
-from miniredis.persistence.aof import AofFileOps, AofWriter
+from miniredis.persistence.aof import (
+    AofFileOps,
+    AofRewriteFailed,
+    AofRewriteOutcome,
+    AofWriter,
+)
 from miniredis.persistence.recovery import recover_database
 from miniredis.persistence.snapshot import (
     SnapshotFailed,
@@ -88,6 +93,9 @@ class RuntimeStats:
     logical_memory_usage: int
     expired_key_count: int
     evicted_key_count: int
+    aof_rewrite_active: bool
+    aof_rewrite_delta_bytes: int
+    aof_rewrite_checkpoint_seq: int | None
 
 
 @dataclass(slots=True)
@@ -267,6 +275,9 @@ class MiniRedis:
                         self.config.aof_path,
                         self.config.aof_policy,
                         fsync_interval_seconds=(self.config.aof_fsync_interval_seconds),
+                        rewrite_delta_limit_bytes=(
+                            self.config.aof_rewrite_delta_limit_bytes
+                        ),
                         ops=None if hooks is None else hooks.aof_ops,
                         sleep=(
                             asyncio.sleep
@@ -278,6 +289,9 @@ class MiniRedis:
                     await self._aof_writer.start()
                     self.commit_barrier = self._aof_writer
                     self.executor.set_commit_barrier_before_start(self._aof_writer)
+                    self.executor.set_aof_rewrite_registration_before_start(
+                        self._aof_writer.begin_rewrite
+                    )
                 await self.executor.start()
                 if self.state is not RuntimeState.STARTING:
                     return
@@ -698,6 +712,13 @@ class MiniRedis:
             return SnapshotFailed("snapshot_path is not configured")
         return await self._snapshot_manager.save()
 
+    async def rewrite_aof(self) -> AofRewriteOutcome:
+        if self.state is not RuntimeState.RUNNING:
+            return AofRewriteFailed("runtime is not running")
+        if self._aof_writer is None:
+            return AofRewriteFailed("aof_path is not configured")
+        return await self.executor.begin_aof_rewrite()
+
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
         return self.executor.debug_applied_batches()
 
@@ -756,6 +777,20 @@ class MiniRedis:
             logical_memory_usage=self.database.logical_usage,
             expired_key_count=self.executor.expired_key_count,
             evicted_key_count=self.executor.evicted_key_count,
+            aof_rewrite_active=(
+                self._aof_writer is not None
+                and self._aof_writer.rewrite_active
+            ),
+            aof_rewrite_delta_bytes=(
+                0
+                if self._aof_writer is None
+                else self._aof_writer.rewrite_delta_bytes
+            ),
+            aof_rewrite_checkpoint_seq=(
+                None
+                if self._aof_writer is None
+                else self._aof_writer.rewrite_checkpoint_seq
+            ),
         )
 
     def _debug_notify(self) -> None:

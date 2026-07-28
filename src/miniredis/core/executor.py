@@ -66,6 +66,8 @@ from miniredis.persistence.aof import (
     AofAppendFailed,
     AofAppendOk,
     AofAppendOutcome,
+    AofRewriteFailed,
+    AofRewriteOutcome,
 )
 from miniredis.replication.sink import ReplicaAttachment
 
@@ -132,6 +134,11 @@ class BeginShutdown:
 @dataclass(slots=True)
 class SnapshotBarrier:
     future: asyncio.Future[SnapshotImage]
+
+
+@dataclass(slots=True)
+class BeginAofRewrite:
+    future: asyncio.Future[AofRewriteOutcome]
 
 
 @dataclass(slots=True)
@@ -252,6 +259,13 @@ class CommandExecutor:
         replica_apply_entered: asyncio.Event | None = None,
         replica_apply_release: asyncio.Event | None = None,
         allow_failure_injection: bool = False,
+        begin_aof_rewrite: (
+            Callable[
+                [SnapshotImage],
+                asyncio.Future[AofRewriteOutcome],
+            ]
+            | None
+        ) = None,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -311,6 +325,7 @@ class CommandExecutor:
         self._stopping = False
         self._started = False
         self._allow_failure_injection = allow_failure_injection
+        self._begin_aof_rewrite = begin_aof_rewrite
 
     def install_database_before_start(self, database: Database) -> None:
         if self._started:
@@ -324,6 +339,19 @@ class CommandExecutor:
         if self._started:
             raise RuntimeError("commit barrier can only be installed before start")
         self.commit_barrier = commit_barrier
+
+    def set_aof_rewrite_registration_before_start(
+        self,
+        begin_aof_rewrite: Callable[
+            [SnapshotImage],
+            asyncio.Future[AofRewriteOutcome],
+        ],
+    ) -> None:
+        if self._started:
+            raise RuntimeError(
+                "AOF rewrite registration can only be installed before start"
+            )
+        self._begin_aof_rewrite = begin_aof_rewrite
 
     async def start(self) -> None:
         if self._started:
@@ -517,6 +545,28 @@ class CommandExecutor:
             else:
                 if not message.future.done():
                     message.future.set_result(image)
+        elif isinstance(message, BeginAofRewrite):
+            if self._begin_aof_rewrite is None:
+                if not message.future.done():
+                    message.future.set_result(
+                        AofRewriteFailed("AOF writer is not configured")
+                    )
+                return
+            try:
+                image = self.database.snapshot_image(self.clock.now_ms())
+                job = self._begin_aof_rewrite(image)
+            except BaseException as exc:
+                if not message.future.done():
+                    message.future.set_result(
+                        AofRewriteFailed(str(exc))
+                    )
+            else:
+                job.add_done_callback(
+                    lambda completed: self._complete_aof_rewrite(
+                        completed,
+                        message.future,
+                    )
+                )
         elif isinstance(message, AttachReplica):
             generation = self._next_replica_generation
             self._next_replica_generation += 1
@@ -1083,6 +1133,32 @@ class CommandExecutor:
         )
         if not self.post_control(SnapshotBarrier(future)):
             raise RuntimeError("executor control admission is closed")
+        return await asyncio.shield(future)
+
+    @staticmethod
+    def _complete_aof_rewrite(
+        job: asyncio.Future[AofRewriteOutcome],
+        destination: asyncio.Future[AofRewriteOutcome],
+    ) -> None:
+        if destination.done():
+            return
+        if job.cancelled():
+            destination.set_result(
+                AofRewriteFailed("AOF rewrite was cancelled")
+            )
+            return
+        error = job.exception()
+        if error is not None:
+            destination.set_result(AofRewriteFailed(str(error)))
+            return
+        destination.set_result(job.result())
+
+    async def begin_aof_rewrite(self) -> AofRewriteOutcome:
+        future: asyncio.Future[AofRewriteOutcome] = (
+            asyncio.get_running_loop().create_future()
+        )
+        if not self.post_control(BeginAofRewrite(future)):
+            return AofRewriteFailed("executor control admission is closed")
         return await asyncio.shield(future)
 
     async def attach_replica(self, sink: ReplicaSink) -> ReplicaAttachment:

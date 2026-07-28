@@ -419,6 +419,9 @@ class MiniRedis:
             self.executor.post_control(AbandonRequest(submitted.token))
             raise
 
+    async def wait_for_submission_capacity(self) -> bool:
+        return await self.executor.wait_for_submission_capacity()
+
     async def start_tcp(self, host: str, port: int) -> Any:
         from miniredis.adapters.tcp import TcpServer
 

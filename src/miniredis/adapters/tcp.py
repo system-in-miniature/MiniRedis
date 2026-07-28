@@ -14,9 +14,11 @@ from miniredis.adapters.resp2 import (
 from miniredis.commands.request import CommandRequest
 from miniredis.core.outbound import (
     OutboxClosed,
+    ReplyMessage,
     ServerClosed,
     SessionEndpoint,
 )
+from miniredis.core.reply import Failure
 
 if TYPE_CHECKING:
     from miniredis.runtime import MiniRedis
@@ -49,7 +51,8 @@ class TcpSession:
         self._on_closed = on_closed
         self._reader_task: asyncio.Task[None] | None = None
         self._writer_task: asyncio.Task[None] | None = None
-        self._pending_command: asyncio.Task[None] | None = None
+        self._pending_commands: set[asyncio.Task[None]] = set()
+        self._admission_task: asyncio.Task[None] | None = None
         self._close_task: asyncio.Task[None] | None = None
         self._reader_quiescing = False
         self._reader_quiesced = asyncio.Event()
@@ -103,25 +106,61 @@ class TcpSession:
         if reason != "runtime closed":
             self.writer.close()
 
-    def _submit_next(self) -> None:
-        if (
-            self._closed
-            or self._reader_quiescing
-            or self._pending_command is not None
-            or not self._frames
+    def _submit_available(self) -> None:
+        while (
+            not self._closed
+            and not self._reader_quiescing
+            and self._frames
+            and self.endpoint.pending_request_count < self._max_buffered_frames
         ):
+            request = self._frames[0]
+            submitted = self.runtime.submit_request(self.session_id, request)
+            if isinstance(submitted, Failure):
+                if submitted.code == "BUSY":
+                    self._ensure_admission_waiter()
+                    return
+                self._frames.popleft()
+                token = self.runtime.executor.new_request_token()
+                self.endpoint.offer(ReplyMessage(token, submitted))
+                continue
+
+            self._frames.popleft()
+            task = asyncio.create_task(
+                self.runtime.wait_for_session_submission(submitted),
+                name=f"miniredis:tcp-command:{self.session_id}",
+            )
+            self._pending_commands.add(task)
+            task.add_done_callback(self._command_done)
+
+    def _ensure_admission_waiter(self) -> None:
+        if self._admission_task is not None and not self._admission_task.done():
             return
-        request = self._frames.popleft()
-        task = asyncio.create_task(
-            self.runtime.execute_for_session(self.session_id, request),
-            name=f"miniredis:tcp-command:{self.session_id}",
+        self._admission_task = asyncio.create_task(
+            self._wait_for_admission(),
+            name=f"miniredis:tcp-admission:{self.session_id}",
         )
-        self._pending_command = task
-        task.add_done_callback(self._command_done)
+        self._admission_task.add_done_callback(self._admission_done)
+
+    async def _wait_for_admission(self) -> None:
+        if await self.runtime.wait_for_submission_capacity():
+            self._submit_available()
+
+    def _admission_done(self, task: asyncio.Task[None]) -> None:
+        if self._admission_task is task:
+            self._admission_task = None
+        try:
+            task.result()
+        except asyncio.CancelledError:
+            return
+        except BaseException as exc:
+            self.endpoint.offer_best_effort(
+                ServerClosed(f"session admission failed: {exc}")
+            )
+            self.endpoint.outbox.begin_close("session admission failed")
+            self.request_close()
 
     def _command_done(self, task: asyncio.Task[None]) -> None:
-        if self._pending_command is task:
-            self._pending_command = None
+        self._pending_commands.discard(task)
         try:
             task.result()
         except asyncio.CancelledError:
@@ -131,7 +170,7 @@ class TcpSession:
                 ServerClosed(f"session command failed: {exc}")
             )
             self.endpoint.outbox.begin_close("session command failed")
-        self._submit_next()
+        self._submit_available()
 
     async def _read_loop(self) -> None:
         protocol_error: RespProtocolError | None = None
@@ -148,14 +187,19 @@ class TcpSession:
                     break
                 try:
                     frames = self.decoder.feed(data)
+                    if (
+                        len(self._frames)
+                        + self.endpoint.pending_request_count
+                        + len(frames)
+                        > self._max_buffered_frames
+                    ):
+                        raise RespProtocolError("too many buffered command frames")
                     for frame in frames:
                         self._frames.append(frame_to_request(frame))
-                    if len(self._frames) > self._max_buffered_frames:
-                        raise RespProtocolError("too many buffered command frames")
                 except RespProtocolError as exc:
                     protocol_error = exc
                     break
-                self._submit_next()
+                self._submit_available()
         except asyncio.CancelledError:
             if not self._reader_quiescing:
                 raise
@@ -172,11 +216,7 @@ class TcpSession:
             await self._drain_protocol_error_best_effort()
         if saw_eof or protocol_error is not None:
             await self.runtime.close_session(self.session_id)
-            if self._pending_command is not None:
-                await asyncio.gather(
-                    self._pending_command,
-                    return_exceptions=True,
-                )
+            await self._settle_commands()
             await self._finish_transport()
 
     async def _write_loop(self) -> None:
@@ -241,11 +281,7 @@ class TcpSession:
         await self.wait_reader_quiesced()
         await self._settle_reader()
         await self.runtime.close_session(self.session_id)
-        if self._pending_command is not None:
-            await asyncio.gather(
-                self._pending_command,
-                return_exceptions=True,
-            )
+        await self._settle_commands()
         self.endpoint.outbox.abort("session closed")
         await self._finish_transport()
 
@@ -255,11 +291,7 @@ class TcpSession:
         self.endpoint.outbox.abort("runtime closed")
         await self._finish_transport()
         await self._settle_reader()
-        if self._pending_command is not None:
-            await asyncio.gather(
-                self._pending_command,
-                return_exceptions=True,
-            )
+        await self._settle_commands()
 
     async def _settle_reader(self) -> None:
         if (
@@ -270,6 +302,15 @@ class TcpSession:
                 self._reader_task,
                 return_exceptions=True,
             )
+
+    async def _settle_commands(self) -> None:
+        if self._admission_task is not None:
+            self._admission_task.cancel()
+        tasks = tuple(self._pending_commands)
+        if self._admission_task is not None:
+            tasks += (self._admission_task,)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _finish_transport(self) -> None:
         if self._transport_finishing:
@@ -303,12 +344,12 @@ class TcpSession:
 
     @property
     def owned_task_count(self) -> int:
-        return sum(
+        return sum(not task.done() for task in self._pending_commands) + sum(
             task is not None and not task.done()
             for task in (
                 self._reader_task,
                 self._writer_task,
-                self._pending_command,
+                self._admission_task,
                 self._close_task,
             )
         )

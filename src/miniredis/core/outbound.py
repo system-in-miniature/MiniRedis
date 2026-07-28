@@ -182,6 +182,9 @@ class SessionEndpoint:
         self._on_slow = on_slow
         self._close_transport = close_transport
         self._transport_close_requested = False
+        self._request_order: deque[RequestToken] = deque()
+        self._request_tokens: set[RequestToken] = set()
+        self._completed_requests: dict[RequestToken, tuple[Outbound, ...]] = {}
         self.outbox = CloseAwareOutbox(capacity, self._overflow)
 
     def _overflow(self) -> None:
@@ -193,6 +196,51 @@ class SessionEndpoint:
 
     def offer_best_effort(self, item: Outbound) -> bool:
         return self.outbox.offer_best_effort(item)
+
+    def register_request(self, token: RequestToken) -> None:
+        if not self.reply_via_outbox:
+            return
+        if token in self._request_tokens:
+            raise ValueError(f"duplicate request token: {token.value}")
+        self._request_order.append(token)
+        self._request_tokens.add(token)
+
+    def complete_request(
+        self,
+        token: RequestToken,
+        items: tuple[Outbound, ...],
+    ) -> bool:
+        if not self.reply_via_outbox:
+            return True
+        if token not in self._request_tokens:
+            return not self.outbox.closed
+        if token in self._completed_requests:
+            raise ValueError(f"request already completed: {token.value}")
+        self._completed_requests[token] = items
+        return self._flush_completed_requests()
+
+    def cancel_request(self, token: RequestToken) -> bool:
+        return self.complete_request(token, ())
+
+    @property
+    def pending_request_count(self) -> int:
+        return len(self._request_order)
+
+    def _flush_completed_requests(self) -> bool:
+        while (
+            self._request_order
+            and self._request_order[0] in self._completed_requests
+        ):
+            token = self._request_order.popleft()
+            self._request_tokens.remove(token)
+            items = self._completed_requests.pop(token)
+            for item in items:
+                if not self.outbox.offer(item):
+                    self._request_order.clear()
+                    self._request_tokens.clear()
+                    self._completed_requests.clear()
+                    return False
+        return not self.outbox.closed
 
     async def receive(self) -> Outbound:
         return await self.outbox.receive()

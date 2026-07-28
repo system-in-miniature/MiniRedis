@@ -25,6 +25,92 @@ async def close_writers(*writers):
     )
 
 
+@pytest.mark.asyncio
+async def test_tcp_pipeline_preserves_reply_order_with_invalid_middle_command():
+    async with MiniRedis.open() as redis:
+        server = await redis.start_tcp("127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*server.address)
+        wire = (
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n"
+            b"*1\r\n$4\r\nNOPE\r\n"
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"
+        )
+
+        await send(writer, wire)
+
+        await expect(reader, b"+OK\r\n-ERR unknown command\r\n:2\r\n")
+        await close_writers(writer)
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_tcp_pipeline_submits_all_decoded_frames_before_first_executes():
+    async with MiniRedis.open() as redis:
+        server = await redis.start_tcp("127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*server.address)
+        redis.debug_pause_executor()
+        wire = (
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n"
+            b"*1\r\n$4\r\nNOPE\r\n"
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"
+        )
+
+        await send(writer, wire)
+        try:
+            async with asyncio.timeout(1):
+                await redis.debug_wait_accepted_at_least(3)
+        finally:
+            redis.debug_resume_executor()
+
+        await expect(reader, b"+OK\r\n-ERR unknown command\r\n:2\r\n")
+        await close_writers(writer)
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_tcp_pipeline_holds_later_reply_behind_blocking_command():
+    async with MiniRedis.open() as redis:
+        server = await redis.start_tcp("127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*server.address)
+        producer = redis.direct_client()
+        wire = (
+            b"*3\r\n$5\r\nBLPOP\r\n$1\r\nq\r\n$1\r\n0\r\n"
+            b"*1\r\n$4\r\nPING\r\n"
+        )
+
+        await send(writer, wire)
+        await redis.debug_wait_for_waiters(1)
+        assert await producer.execute(
+            CommandRequest(b"RPUSH", (b"q", b"x"))
+        ) == Number(1)
+
+        await expect(reader, b"*2\r\n$1\r\nq\r\n$1\r\nx\r\n+PONG\r\n")
+        await close_writers(writer)
+        await server.close()
+
+
+@pytest.mark.asyncio
+async def test_tcp_pipeline_retries_busy_frame_without_exposing_busy_reply():
+    async with MiniRedis.open(max_pending_commands=1) as redis:
+        server = await redis.start_tcp("127.0.0.1", 0)
+        reader, writer = await asyncio.open_connection(*server.address)
+        redis.debug_pause_executor()
+        wire = (
+            b"*3\r\n$3\r\nSET\r\n$1\r\nk\r\n$1\r\n1\r\n"
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"
+            b"*2\r\n$4\r\nINCR\r\n$1\r\nk\r\n"
+        )
+
+        await send(writer, wire)
+        await redis.debug_wait_accepted_at_least(1)
+        assert redis.executor.debug_accepted_count == 1
+        redis.debug_resume_executor()
+
+        await expect(reader, b"+OK\r\n:2\r\n:3\r\n")
+        await close_writers(writer)
+        await server.close()
+
+
 class CloseReleasedWriter:
     def __init__(self, inner) -> None:
         self._inner = inner

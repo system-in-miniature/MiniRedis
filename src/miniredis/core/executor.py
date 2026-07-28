@@ -39,6 +39,7 @@ from miniredis.core.expiration import expiry_delete, is_expired
 from miniredis.core.mailbox import EventLoopMailbox
 from miniredis.core.outbound import (
     Abandoned,
+    Outbound,
     PubSubMessage,
     PubSubPong,
     ReplyMessage,
@@ -368,6 +369,9 @@ class CommandExecutor:
             if not self.mailbox.accepting_users:
                 return Failure("CLOSED", "runtime is closed")
             return Failure("BUSY", "command queue is full")
+        endpoint = self._endpoints.get(session_id)
+        if endpoint is not None:
+            endpoint.register_request(token)
         self._accepted_tokens.append(token)
         self._accepted_changed.set()
         self._on_debug_change()
@@ -384,6 +388,10 @@ class CommandExecutor:
         message = self._requests.pop(token, None)
         if message is None:
             return False
+        if not isinstance(outcome, Replied):
+            endpoint = self._endpoints.get(message.session_id)
+            if endpoint is not None:
+                endpoint.cancel_request(token)
         if message.future.done():
             raise RuntimeError(f"executor-owned Future already done: {token.value}")
         message.future.set_result(outcome)
@@ -403,8 +411,13 @@ class CommandExecutor:
         if endpoint is None:
             return self._finish_request(token, TransportClosed())
         if reply is not None and endpoint.reply_via_outbox:
-            if not endpoint.offer(ReplyMessage(token, reply)):
+            if not endpoint.complete_request(
+                token,
+                (ReplyMessage(token, reply),),
+            ):
                 return self._finish_request(token, TransportClosed())
+        elif endpoint.reply_via_outbox:
+            endpoint.complete_request(token, ())
         return self._finish_request(token, Replied(reply))
 
     def post_control(self, message: object) -> bool:
@@ -681,16 +694,14 @@ class CommandExecutor:
         await self._apply_plan(request, plan, now_ms)
 
     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
-        endpoint = self._endpoints[request.session_id]
+        items: list[SubscriptionAck] = []
         for channel in command.channels:
             count = self.pubsub.subscribe(request.session_id, channel)
-            if not endpoint.offer(SubscriptionAck("subscribe", channel, count)):
-                self._finish_request(request.token, TransportClosed())
-                return
-        self._finish_request(request.token, Replied(None))
+            items.append(SubscriptionAck("subscribe", channel, count))
+        self._finish_outbound_request(request, tuple(items))
 
     def _unsubscribe(self, request: ExecuteRequest, command: Unsubscribe) -> None:
-        endpoint = self._endpoints[request.session_id]
+        items: list[SubscriptionAck] = []
         for channel in self.pubsub.unsubscribe_targets(
             request.session_id,
             command.channels,
@@ -700,10 +711,8 @@ class CommandExecutor:
                 if channel is None
                 else self.pubsub.unsubscribe(request.session_id, channel)
             )
-            if not endpoint.offer(SubscriptionAck("unsubscribe", channel, count)):
-                self._finish_request(request.token, TransportClosed())
-                return
-        self._finish_request(request.token, Replied(None))
+            items.append(SubscriptionAck("unsubscribe", channel, count))
+        self._finish_outbound_request(request, tuple(items))
 
     def _publish(self, request: ExecuteRequest, command: Publish) -> None:
         delivered = 0
@@ -717,8 +726,19 @@ class CommandExecutor:
 
     def _subscribed_ping(self, request: ExecuteRequest, command: Ping) -> None:
         payload = b"" if command.message is None else command.message
+        self._finish_outbound_request(request, (PubSubPong(payload),))
+
+    def _finish_outbound_request(
+        self,
+        request: ExecuteRequest,
+        items: tuple[Outbound, ...],
+    ) -> None:
         endpoint = self._endpoints[request.session_id]
-        if endpoint.offer(PubSubPong(payload)):
+        if endpoint.reply_via_outbox:
+            offered = endpoint.complete_request(request.token, items)
+        else:
+            offered = all(endpoint.offer(item) for item in items)
+        if offered:
             self._finish_request(request.token, Replied(None))
         else:
             self._finish_request(request.token, TransportClosed())
@@ -953,6 +973,20 @@ class CommandExecutor:
             if len(self._requests) >= count:
                 return
             await self._accepted_changed.wait()
+
+    async def wait_for_submission_capacity(self) -> bool:
+        while len(self._requests) >= self.max_pending_commands:
+            if (
+                self._stopping
+                or not self.mailbox.accepting_users
+                or (self._worker_task is not None and self._worker_task.done())
+            ):
+                return False
+            self._accepted_changed.clear()
+            if len(self._requests) < self.max_pending_commands:
+                break
+            await self._accepted_changed.wait()
+        return not self._stopping and self.mailbox.accepting_users
 
     @property
     def debug_accepted_count(self) -> int:

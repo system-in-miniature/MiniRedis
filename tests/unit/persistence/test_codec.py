@@ -16,8 +16,10 @@ from miniredis.core.commit import (
 )
 from miniredis.persistence.codec import (
     CodecError,
+    decode_aof_state_base_payload,
     decode_commit_payload,
     decode_snapshot_payload,
+    encode_aof_state_base_payload,
     encode_commit_payload,
     encode_snapshot_payload,
 )
@@ -94,6 +96,45 @@ def test_snapshot_payload_round_trips_sorted_entries():
         ),
     )
     assert decode_snapshot_payload(encode_snapshot_payload(image)) == image
+
+
+def test_aof_state_base_payload_round_trips_sorted_entries():
+    image = SnapshotImage(
+        checkpoint_seq=7,
+        entries=(
+            (b"a", StoredEntry(StoredString(b"1"), None, 1)),
+            (b"z", StoredEntry(StoredSet((b"a", b"b")), 8000, 2)),
+        ),
+    )
+
+    assert (
+        decode_aof_state_base_payload(encode_aof_state_base_payload(image))
+        == image
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b"{}",
+        b'{"checkpoint_seq":0,"entries":[],"record":"state_base"}',
+        (
+            b'{"checkpoint_seq":0,"entries":[],"record":"state_base",'
+            b'"version":2}'
+        ),
+        (
+            b'{"checkpoint_seq":true,"entries":[],"record":"state_base",'
+            b'"version":1}'
+        ),
+        (
+            b'{"checkpoint_seq":0,"entries":[],"record":"commit",'
+            b'"version":1}'
+        ),
+    ],
+)
+def test_invalid_aof_state_base_schema_is_rejected(payload):
+    with pytest.raises(CodecError):
+        decode_aof_state_base_payload(payload)
 
 
 @pytest.mark.parametrize(

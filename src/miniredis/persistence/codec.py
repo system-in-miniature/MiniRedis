@@ -38,6 +38,7 @@ class CodecError(ValueError):
 
 @dataclass(frozen=True, slots=True)
 class AofScan:
+    state_base: SnapshotImage | None
     batches: tuple[CommitBatch, ...]
     valid_offset: int
     has_truncated_tail: bool
@@ -440,15 +441,75 @@ def decode_snapshot_payload(payload: bytes) -> SnapshotImage:
         raise CodecError(str(exc)) from exc
 
 
+def encode_aof_state_base_payload(image: SnapshotImage) -> bytes:
+    return _dumps(
+        {
+            "record": "state_base",
+            "version": PAYLOAD_VERSION,
+            "checkpoint_seq": image.checkpoint_seq,
+            "entries": [
+                {"key": _bytes(key), "entry": _encode_entry(entry)}
+                for key, entry in image.entries
+            ],
+        }
+    )
+
+
+def decode_aof_state_base_payload(payload: bytes) -> SnapshotImage:
+    root = _object(
+        _loads(payload),
+        frozenset(
+            {"record", "version", "checkpoint_seq", "entries"}
+        ),
+        "AOF state base",
+    )
+    if _text(root["record"], "record") != "state_base":
+        _fail("unknown AOF record type")
+    if _integer(root["version"], "version", minimum=1) != PAYLOAD_VERSION:
+        _fail("unsupported AOF state base payload version")
+    entries = []
+    for index, raw_entry in enumerate(_array(root["entries"], "entries")):
+        item = _object(
+            raw_entry,
+            frozenset({"key", "entry"}),
+            f"entries[{index}]",
+        )
+        entries.append(
+            (
+                _decode_bytes(item["key"], f"entries[{index}].key"),
+                _decode_entry(item["entry"]),
+            )
+        )
+    try:
+        return SnapshotImage(
+            checkpoint_seq=_integer(
+                root["checkpoint_seq"],
+                "checkpoint_seq",
+            ),
+            entries=tuple(entries),
+        )
+    except ValueError as exc:
+        raise CodecError(str(exc)) from exc
+
+
 def _crc(payload: bytes) -> bytes:
     return struct.pack(">I", zlib.crc32(payload))
 
 
-def encode_aof_record(batch: CommitBatch) -> bytes:
-    payload = encode_commit_payload(batch)
+def _encode_aof_payload_record(payload: bytes) -> bytes:
     if len(payload) > MAX_PAYLOAD_BYTES:
         raise CodecError("AOF payload exceeds limit")
     return struct.pack(">I", len(payload)) + payload + _crc(payload)
+
+
+def encode_aof_record(batch: CommitBatch) -> bytes:
+    return _encode_aof_payload_record(encode_commit_payload(batch))
+
+
+def encode_aof_state_base_record(image: SnapshotImage) -> bytes:
+    return _encode_aof_payload_record(
+        encode_aof_state_base_payload(image)
+    )
 
 
 def scan_aof_bytes(data: bytes) -> AofScan:
@@ -456,17 +517,28 @@ def scan_aof_bytes(data: bytes) -> AofScan:
         raise CodecError("invalid AOF header")
     offset = len(AOF_HEADER)
     valid_offset = offset
+    state_base: SnapshotImage | None = None
     batches: list[CommitBatch] = []
     previous_seq: int | None = None
     while offset < len(data):
         if len(data) - offset < 4:
-            return AofScan(tuple(batches), valid_offset, True)
+            return AofScan(
+                state_base,
+                tuple(batches),
+                valid_offset,
+                True,
+            )
         payload_length = struct.unpack_from(">I", data, offset)[0]
         if payload_length > MAX_PAYLOAD_BYTES:
             raise CodecError("AOF payload exceeds limit")
         end = offset + 4 + payload_length + 4
         if end > len(data):
-            return AofScan(tuple(batches), valid_offset, True)
+            return AofScan(
+                state_base,
+                tuple(batches),
+                valid_offset,
+                True,
+            )
         payload_start = offset + 4
         payload_end = payload_start + payload_length
         payload = data[payload_start:payload_end]
@@ -474,6 +546,19 @@ def scan_aof_bytes(data: bytes) -> AofScan:
         actual_crc = zlib.crc32(payload)
         if actual_crc != expected_crc:
             raise CodecError(f"AOF checksum failure at offset {offset}")
+        decoded_payload = _loads(payload)
+        is_state_base = (
+            isinstance(decoded_payload, dict)
+            and decoded_payload.get("record") == "state_base"
+        )
+        if is_state_base:
+            if state_base is not None or batches:
+                raise CodecError("AOF state base must be first")
+            state_base = decode_aof_state_base_payload(payload)
+            previous_seq = state_base.checkpoint_seq
+            offset = end
+            valid_offset = end
+            continue
         batch = decode_commit_payload(payload)
         if previous_seq is not None and batch.seq != previous_seq + 1:
             raise CodecError(
@@ -483,7 +568,7 @@ def scan_aof_bytes(data: bytes) -> AofScan:
         previous_seq = batch.seq
         offset = end
         valid_offset = end
-    return AofScan(tuple(batches), valid_offset, False)
+    return AofScan(state_base, tuple(batches), valid_offset, False)
 
 
 def encode_snapshot_file(image: SnapshotImage) -> bytes:

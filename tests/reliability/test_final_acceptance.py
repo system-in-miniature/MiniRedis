@@ -147,6 +147,10 @@ async def test_final_acceptance_activates_components_then_leaves_no_owners(
     assert active.tcp_tasks >= 6
     assert active.timer_handles == 0
     assert active.waiters == 0
+    assert active.primary_seq == primary.debug_commit_seq
+    assert active.backlog_batch_count > 0
+    assert active.full_sync_count == 1
+    assert active.replication_id
 
     await sink.wait_until_applied(primary.debug_commit_seq)
     assert await replica.direct_client().execute(

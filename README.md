@@ -110,6 +110,25 @@ gates. The acknowledged-write-loss test deliberately pauses replica apply,
 acknowledges a primary write, simulates primary crash without replica drain,
 and promotes the lagging replica.
 
+## Logical replication resume
+
+Each Primary history has a logical replication ID and a bounded
+`CommitBatch` backlog. `replication_backlog_batches` controls the number of
+whole batches retained; it is separate from the per-link
+`replica_queue_limit`.
+
+`ReplicaSink.disconnect()` preserves only the last fully applied
+`(replication_id, seq)` cursor. Manual reattachment uses partial sync when the
+ID matches and every missing batch is still covered. Catch-up batches apply
+contiguously before batches that arrived live during attachment. An identity
+mismatch, future cursor, or backlog gap falls back to a full snapshot.
+
+Restart and promotion create a new Primary replication ID and an empty
+backlog, fencing the prior history even when visible data and sequence numbers
+match. Replication remains asynchronous: a Primary may acknowledge a write
+before a Replica applies it, so manual promotion of a lagging Replica can
+still lose that acknowledged write.
+
 ## Online AOF rewrite
 
 When AOF is configured, `await redis.rewrite_aof()` compacts the log online.
@@ -161,7 +180,8 @@ and full replica sync.
   than Redis's sampled LRU and probabilistic LFU counter.
 - AOF, AOF state bases, and snapshots are custom versioned formats, not Redis
   AOF or RDB.
-- Replication is one in-process `ReplicaSink`, not a network protocol.
+- Replication is one in-process `ReplicaSink` with logical batch cursors, not
+  a network protocol or Redis PSYNC wire implementation.
 - RESP2/TCP is a bounded correctness adapter with ordered pipelined submission,
   not a throughput target.
 
@@ -170,9 +190,9 @@ See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
 ## Non-goals
 
 MiniRedis does not implement RESP3, inline protocol, Lua or a general script
-VM, Streams, ACL, multiple databases, Modules, network replication, PSYNC,
-backlog, heartbeat, ACK quorum, election, Sentinel, Cluster, authentication,
-TLS, or production performance parity.
+VM, Streams, ACL, multiple databases, Modules, network replication, PSYNC
+wire compatibility, heartbeat, ACK quorum/`WAIT`, election, Sentinel, Cluster,
+authentication, TLS, or production performance parity.
 
 ## Test and SLOC commands
 

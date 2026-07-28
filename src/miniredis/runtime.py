@@ -96,6 +96,13 @@ class RuntimeStats:
     aof_rewrite_active: bool
     aof_rewrite_delta_bytes: int
     aof_rewrite_checkpoint_seq: int | None
+    replication_id: str
+    primary_seq: int
+    backlog_oldest_seq: int | None
+    backlog_newest_seq: int | None
+    backlog_batch_count: int
+    full_sync_count: int
+    partial_sync_count: int
 
 
 @dataclass(slots=True)
@@ -806,6 +813,19 @@ class MiniRedis:
                 if self._aof_writer is None
                 else self._aof_writer.rewrite_checkpoint_seq
             ),
+            replication_id=self.executor.replication_id,
+            primary_seq=self.database.commit_seq,
+            backlog_oldest_seq=(
+                self.executor.replication_backlog.oldest_seq
+            ),
+            backlog_newest_seq=(
+                self.executor.replication_backlog.newest_seq
+            ),
+            backlog_batch_count=(
+                self.executor.replication_backlog.batch_count
+            ),
+            full_sync_count=self.executor.full_sync_count,
+            partial_sync_count=self.executor.partial_sync_count,
         )
 
     def _debug_notify(self) -> None:

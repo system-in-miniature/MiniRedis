@@ -17,6 +17,7 @@ from miniredis.replication.sink import (
     ReplicaSyncMode,
 )
 from tests.helpers.runtime import open_test_runtime
+from tests.unit.persistence.test_framing import batch
 
 
 @dataclass
@@ -255,5 +256,58 @@ async def test_backlog_gap_falls_back_to_full_and_replaces_stale_keys():
     assert status.sync_mode is ReplicaSyncMode.FULL
     assert b"obsolete" not in replica.database.entries
     assert tuple(replica.database.entries) == (b"b", b"c")
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_replication_stats_report_history_without_mutating_it():
+    primary = await open_test_runtime(
+        config=MiniRedisConfig(replication_backlog_batches=4),
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=4)
+    first = await primary.attach_replica(sink)
+    client = primary.direct_client()
+    await client.execute(CommandRequest(b"SET", (b"a", b"1")))
+    await sink.wait_until_applied(1)
+    await sink.disconnect()
+    await client.execute(CommandRequest(b"SET", (b"b", b"2")))
+    resumed = await primary.attach_replica(sink)
+    await sink.wait_until_applied(2)
+
+    before = primary.debug_stats()
+    after = primary.debug_stats()
+
+    assert first.sync_mode is ReplicaSyncMode.FULL
+    assert resumed.sync_mode is ReplicaSyncMode.PARTIAL
+    assert before.replication_id == "primary-A"
+    assert before.primary_seq == 2
+    assert before.backlog_oldest_seq == 1
+    assert before.backlog_newest_seq == 2
+    assert before.backlog_batch_count == 2
+    assert before.full_sync_count == 1
+    assert before.partial_sync_count == 1
+    assert after == before
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_failed_replica_resume_validation_detaches_primary_link():
+    primary = await open_test_runtime(
+        replication_id_factory=lambda: "primary-A"
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=4)
+    await primary.attach_replica(sink)
+    await sink.disconnect()
+    replica.database.apply_batch(batch(1), track_access=False)
+
+    status = await primary.attach_replica(sink)
+
+    assert status.state is ReplicaSinkState.NEEDS_RESYNC
+    assert primary.debug_stats().replica_links == 0
     await primary.close()
     await replica.close()

@@ -132,17 +132,16 @@ class ReplicaSink:
         if self._state is not ReplicaSinkState.BOOTSTRAPPING:
             raise RuntimeError("sink is not bootstrapping")
         self._generation = attachment.generation
-        self._replication_id = attachment.replication_id
         if isinstance(attachment, FullSyncAttachment):
             self._sync_mode = ReplicaSyncMode.FULL
             self._baseline_seq = attachment.image.checkpoint_seq
-            self._applied_seq = attachment.image.checkpoint_seq
             self._primary_seq = attachment.image.checkpoint_seq
             self._catch_up.clear()
         else:
+            if self.cursor != attachment.cursor:
+                raise RuntimeError("partial attachment cursor changed")
             self._sync_mode = ReplicaSyncMode.PARTIAL
             self._baseline_seq = attachment.cursor.applied_seq
-            self._applied_seq = attachment.cursor.applied_seq
             self._primary_seq = attachment.boundary_seq
             self._catch_up = deque(attachment.batches)
         self._attachment_captured.set()
@@ -201,10 +200,23 @@ class ReplicaSink:
                 )
             if not installed:
                 self._state = ReplicaSinkState.NEEDS_RESYNC
+                await primary.executor.detach_replica(
+                    attachment.generation
+                )
+                primary._release_replica_sink(self)
                 self._signal_status_change()
                 return self.status
             if self._state is not ReplicaSinkState.BOOTSTRAPPING:
                 return self.status
+            if isinstance(attachment, FullSyncAttachment):
+                self._replication_id = attachment.replication_id
+                self._applied_seq = attachment.image.checkpoint_seq
+                self._primary_seq = max(
+                    self._primary_seq,
+                    attachment.image.checkpoint_seq,
+                )
+            else:
+                self._replication_id = attachment.replication_id
             self._state = (
                 ReplicaSinkState.CATCHING_UP
                 if self._catch_up

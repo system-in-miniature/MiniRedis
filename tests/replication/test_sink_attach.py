@@ -6,6 +6,7 @@ from miniredis import CommandRequest
 from miniredis.config import MiniRedisConfig
 from miniredis.core.reply import Bytes, Ok
 from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+from miniredis.replication.backlog import ReplicationCursor
 from tests.helpers.runtime import open_test_runtime
 
 
@@ -83,5 +84,32 @@ async def test_full_sync_resets_volatile_lfu_metadata():
 
     assert replica.database.entries[b"k"].frequency == 0
     assert replica.database.entries[b"k"].last_access_tick == 0
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_full_sync_cursor_exists_only_after_snapshot_install():
+    primary = await open_test_runtime(
+        replication_id_factory=lambda: "primary-A"
+    )
+    replica = await open_test_runtime()
+    await primary.direct_client().execute(
+        CommandRequest(b"SET", (b"k", b"v"))
+    )
+    install_gate = asyncio.Event()
+    sink = ReplicaSink(
+        replica,
+        queue_limit=4,
+        install_gate=install_gate,
+    )
+    attaching = asyncio.create_task(primary.attach_replica(sink))
+    await sink.attachment_captured.wait()
+
+    assert sink.status.cursor is None
+
+    install_gate.set()
+    await attaching
+    assert sink.status.cursor == ReplicationCursor("primary-A", 1)
     await primary.close()
     await replica.close()

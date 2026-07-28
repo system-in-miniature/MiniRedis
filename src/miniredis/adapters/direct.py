@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
+from miniredis.commands.model import BlockingPop, Command
 from miniredis.commands.request import CommandRequest
-from miniredis.commands.model import BlockingPop
 from miniredis.core.executor import (
     AbandonRequest,
     SessionClosed,
@@ -25,6 +26,12 @@ if TYPE_CHECKING:
     from miniredis.runtime import MiniRedis
 
 
+@dataclass(frozen=True, slots=True)
+class _DirectSubmission:
+    submitted: SubmittedRequest | Failure
+    command: Command | None
+
+
 class DirectClient:
     def __init__(self, runtime: MiniRedis, endpoint: SessionEndpoint) -> None:
         self._runtime = runtime
@@ -41,23 +48,28 @@ class DirectClient:
         return self._closed
 
     async def execute(self, request: CommandRequest) -> Reply | None:
+        return await self.resolve(self.submit(request))
+
+    def submit(self, request: CommandRequest) -> _DirectSubmission:
         if self._closed:
-            return Failure("CLOSED", "client is closed")
+            return _DirectSubmission(Failure("CLOSED", "client is closed"), None)
         if not self._runtime.accepting_commands:
             if self._runtime.normal_shutdown_started:
-                return Failure("CLOSED", "runtime is not accepting commands")
-            return Failure("CLOSED", "runtime is closed")
-        parsed = self._runtime.parse(request)
-        if isinstance(parsed, Failure):
-            return parsed
-        submitted = self._runtime.executor.submit(
-            session_id=self.session_id, command=parsed
+                failure = Failure("CLOSED", "runtime is not accepting commands")
+            else:
+                failure = Failure("CLOSED", "runtime is closed")
+            return _DirectSubmission(failure, None)
+        submitted = self._runtime.submit_request(
+            session_id=self.session_id,
+            request=request,
         )
+        command = submitted.command if isinstance(submitted, SubmittedRequest) else None
+        return _DirectSubmission(submitted, command)
+
+    async def resolve(self, item: _DirectSubmission) -> Reply | None:
+        submitted = item.submitted
         if isinstance(submitted, Failure):
             return submitted
-        assert isinstance(submitted, SubmittedRequest), (
-            f"unexpected submission: {submitted!r}"
-        )
 
         try:
             outcome = await asyncio.shield(submitted.future)
@@ -71,7 +83,7 @@ class DirectClient:
                 return Failure("CLOSED", "runtime closed")
             case RuntimeClosed():
                 return Failure("CLOSED", "runtime closed before reply")
-            case TransportClosed() if isinstance(parsed, BlockingPop):
+            case TransportClosed() if isinstance(item.command, BlockingPop):
                 return Bytes(None)
             case TransportClosed():
                 return Failure("CLOSED", "session closed")
@@ -101,3 +113,28 @@ class DirectClient:
             self.endpoint.outbox.abort("runtime closed")
             return
         await asyncio.shield(completion)
+
+
+class DirectPipeline:
+    def __init__(self, client: DirectClient) -> None:
+        self._client = client
+        self._requests: list[CommandRequest] = []
+
+    @property
+    def pending_count(self) -> int:
+        return len(self._requests)
+
+    def queue(self, request: CommandRequest) -> DirectPipeline:
+        if self._client.closed:
+            raise RuntimeError("client is closed")
+        self._requests.append(request)
+        return self
+
+    async def execute(self) -> tuple[Reply | None, ...]:
+        requests, self._requests = self._requests, []
+        submitted = [self._client.submit(request) for request in requests]
+        return tuple([await self._client.resolve(item) for item in submitted])
+
+    async def close(self) -> None:
+        self._requests.clear()
+        await self._client.close()

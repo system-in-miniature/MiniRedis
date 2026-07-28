@@ -72,10 +72,19 @@ class ExecuteRequest:
     future: asyncio.Future[RequestOutcome]
 
 
+@dataclass(slots=True)
+class RejectRequest:
+    token: RequestToken
+    session_id: int
+    reply: Failure
+    future: asyncio.Future[RequestOutcome]
+
+
 @dataclass(frozen=True, slots=True)
 class SubmittedRequest:
     token: RequestToken
     future: asyncio.Future[RequestOutcome]
+    command: Command | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -196,7 +205,12 @@ class ActiveExpireTick:
 
 
 type ExecutorMessage = (
-    ExecuteRequest | AbandonRequest | ActiveExpireTick | _StopExecutor | object
+    ExecuteRequest
+    | RejectRequest
+    | AbandonRequest
+    | ActiveExpireTick
+    | _StopExecutor
+    | object
 )
 
 
@@ -245,7 +259,7 @@ class CommandExecutor:
         self._run_gate = asyncio.Event()
         self._run_gate.set()
         self._request_tokens = itertools.count(1)
-        self._requests: dict[RequestToken, ExecuteRequest] = {}
+        self._requests: dict[RequestToken, ExecuteRequest | RejectRequest] = {}
         self._accepted_tokens: list[RequestToken] = []
         self._endpoints: dict[int, SessionEndpoint] = {}
         self._accepted_changed = asyncio.Event()
@@ -309,6 +323,24 @@ class CommandExecutor:
             self._worker_started_or_done.set()
 
     def submit(self, session_id: int, command: Command) -> SubmittedRequest | Failure:
+        return self._admit_request(session_id, command=command)
+
+    def submit_rejection(
+        self,
+        session_id: int,
+        reply: Failure,
+    ) -> SubmittedRequest | Failure:
+        return self._admit_request(session_id, rejection=reply)
+
+    def _admit_request(
+        self,
+        session_id: int,
+        *,
+        command: Command | None = None,
+        rejection: Failure | None = None,
+    ) -> SubmittedRequest | Failure:
+        if (command is None) == (rejection is None):
+            raise ValueError("exactly one request payload is required")
         if (
             not self._started
             or self._stopping
@@ -324,7 +356,12 @@ class CommandExecutor:
         future: asyncio.Future[RequestOutcome] = (
             asyncio.get_running_loop().create_future()
         )
-        request = ExecuteRequest(token, session_id, command, future)
+        request: ExecuteRequest | RejectRequest
+        if command is not None:
+            request = ExecuteRequest(token, session_id, command, future)
+        else:
+            assert rejection is not None
+            request = RejectRequest(token, session_id, rejection, future)
         self._requests[token] = request
         if not self.mailbox.admit_user(request):
             del self._requests[token]
@@ -334,7 +371,7 @@ class CommandExecutor:
         self._accepted_tokens.append(token)
         self._accepted_changed.set()
         self._on_debug_change()
-        return SubmittedRequest(token, future)
+        return SubmittedRequest(token, future, command)
 
     def new_request_token(self) -> RequestToken:
         return RequestToken(next(self._request_tokens))
@@ -411,6 +448,8 @@ class CommandExecutor:
     async def _dispatch(self, message: object) -> None:
         if isinstance(message, ExecuteRequest):
             await self._execute(message)
+        elif isinstance(message, RejectRequest):
+            self._finish_reply(message.token, message.reply)
         elif isinstance(message, AbandonRequest):
             self._abandon(message)
         elif isinstance(message, ActiveExpireTick):

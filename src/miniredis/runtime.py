@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Self
 
-from miniredis.adapters.direct import DirectClient
+from miniredis.adapters.direct import DirectClient, DirectPipeline
 from miniredis.clock import (
     AsyncioTimerScheduler,
     Clock,
@@ -29,6 +29,7 @@ from miniredis.core.executor import (
     CommitBarrier,
     NullCommitBarrier,
     SessionClosed,
+    SubmittedRequest,
 )
 from miniredis.core.expiration import ActiveExpireProducer
 from miniredis.core.outbound import (
@@ -348,6 +349,9 @@ class MiniRedis:
         self.executor.register_endpoint(endpoint)
         return DirectClient(self, endpoint)
 
+    def direct_pipeline(self) -> DirectPipeline:
+        return DirectPipeline(self.direct_client())
+
     def _session_became_slow(self, session_id: int, reason: str) -> None:
         endpoint = self.executor.endpoint(session_id)
         if endpoint is not None:
@@ -385,19 +389,30 @@ class MiniRedis:
         session_id: int,
         request: CommandRequest,
     ) -> None:
-        parsed = self.parse(request)
+        submitted = self.submit_request(session_id, request)
         endpoint = self.executor.endpoint(session_id)
         if endpoint is None:
             return
-        if isinstance(parsed, Failure):
-            token = self.executor.new_request_token()
-            endpoint.offer(ReplyMessage(token, parsed))
-            return
-        submitted = self.executor.submit(session_id, parsed)
         if isinstance(submitted, Failure):
             token = self.executor.new_request_token()
             endpoint.offer(ReplyMessage(token, submitted))
             return
+        await self.wait_for_session_submission(submitted)
+
+    def submit_request(
+        self,
+        session_id: int,
+        request: CommandRequest,
+    ) -> SubmittedRequest | Failure:
+        parsed = self.parse(request)
+        if isinstance(parsed, Failure):
+            return self.executor.submit_rejection(session_id, parsed)
+        return self.executor.submit(session_id, parsed)
+
+    async def wait_for_session_submission(
+        self,
+        submitted: SubmittedRequest,
+    ) -> None:
         try:
             await asyncio.shield(submitted.future)
         except asyncio.CancelledError:

@@ -53,3 +53,26 @@ async def test_corrupt_startup_never_accepts_clients_or_leaks_workers(
     assert stats.owned_tasks == 0
     assert stats.sessions == 0
     await runtime.close()
+
+
+@pytest.mark.asyncio
+async def test_restart_resets_volatile_lfu_metadata(tmp_path):
+    config = MiniRedisConfig(
+        aof_path=tmp_path / "appendonly.mraof",
+        aof_policy=AofPolicy.ALWAYS,
+        eviction_policy="allkeys-lfu",
+    )
+    first = MiniRedis.open(config)
+    await first.start()
+    client = first.direct_client()
+    await client.execute(CommandRequest(b"SET", (b"k", b"v")))
+    for _ in range(4):
+        await client.execute(CommandRequest(b"GET", (b"k",)))
+    assert first.database.entries[b"k"].frequency == 5
+    await first.close()
+
+    second = MiniRedis.open(config)
+    await second.start()
+    assert second.database.entries[b"k"].frequency == 0
+    assert second.database.entries[b"k"].last_access_tick == 0
+    await second.close()

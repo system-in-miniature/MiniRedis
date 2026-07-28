@@ -110,11 +110,21 @@ gates. The acknowledged-write-loss test deliberately pauses replica apply,
 acknowledges a primary write, simulates primary crash without replica drain,
 and promotes the lagging replica.
 
+## Deterministic eviction metadata
+
+`allkeys-lru` orders victims by exact access tick. `allkeys-lfu` projects each
+frequency by halving it once per injected-time decay window, then orders by
+effective frequency, access tick, and binary key. Successful client reads and
+writes materialize one touch; eviction planning only reads projected values.
+LFU/LRU metadata is operational state and resets to neutral values on restart
+and full replica sync.
+
 ## Compatibility simplifications
 
 - Five values use Python containers, not Redis internal encodings.
 - Memory is a deterministic logical budget, not allocator/RSS accounting.
-- LRU is exact with a binary-key tie-break, not sampled Redis LRU.
+- LRU is exact and LFU is deterministic with binary-key tie-breaks, rather
+  than Redis's sampled LRU and probabilistic LFU counter.
 - AOF and snapshots are custom versioned formats, not Redis AOF or RDB.
 - Replication is one in-process `ReplicaSink`, not a network protocol.
 - RESP2/TCP is a bounded correctness adapter with ordered pipelined submission,

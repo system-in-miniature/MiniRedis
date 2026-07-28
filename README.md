@@ -110,6 +110,40 @@ gates. The acknowledged-write-loss test deliberately pauses replica apply,
 acknowledges a primary write, simulates primary crash without replica drain,
 and promotes the lagging replica.
 
+## Online AOF rewrite
+
+When AOF is configured, `await redis.rewrite_aof()` compacts the log online.
+The executor captures a logically live `SnapshotImage` and registers it with
+the writer in one ordered mailbox turn. The old AOF remains authoritative
+while the base is written; later committed records enter a bounded delta.
+Finalization appends that delta, fsyncs the temporary file, atomically replaces
+the path, fsyncs its parent directory, and then switches the writer fd.
+
+```python
+from pathlib import Path
+
+from miniredis import MiniRedis
+from miniredis.config import MiniRedisConfig
+
+
+async with MiniRedis.open(
+    MiniRedisConfig(aof_path=Path("appendonly.mraof"))
+) as redis:
+    outcome = await redis.rewrite_aof()
+    print(outcome)
+```
+
+`aof_rewrite_delta_limit_bytes` bounds concurrent rewrite memory. Overflow or
+another failure before rename aborts only the rewrite and leaves the old AOF
+writable. A failure after rename is terminal because durable path ownership is
+ambiguous. Graceful shutdown completes an active rewrite; simulated crash
+aborts an unfinalized rewrite and removes its temporary file.
+
+Recovery supports both legacy batch-only AOF files and rewritten files with
+one leading state base. When both a snapshot and an AOF base exist, it selects
+the newer complete checkpoint (the AOF base wins a tie) and replays only
+contiguous later batches.
+
 ## Deterministic eviction metadata
 
 `allkeys-lru` orders victims by exact access tick. `allkeys-lfu` projects each
@@ -125,7 +159,8 @@ and full replica sync.
 - Memory is a deterministic logical budget, not allocator/RSS accounting.
 - LRU is exact and LFU is deterministic with binary-key tie-breaks, rather
   than Redis's sampled LRU and probabilistic LFU counter.
-- AOF and snapshots are custom versioned formats, not Redis AOF or RDB.
+- AOF, AOF state bases, and snapshots are custom versioned formats, not Redis
+  AOF or RDB.
 - Replication is one in-process `ReplicaSink`, not a network protocol.
 - RESP2/TCP is a bounded correctness adapter with ordered pipelined submission,
   not a throughput target.
@@ -135,9 +170,9 @@ See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
 ## Non-goals
 
 MiniRedis does not implement RESP3, inline protocol, Lua or a general script
-VM, Streams, ACL, multiple databases, Modules, AOF rewrite, network
-replication, PSYNC, backlog, heartbeat, ACK quorum, election, Sentinel,
-Cluster, authentication, TLS, or production performance parity.
+VM, Streams, ACL, multiple databases, Modules, network replication, PSYNC,
+backlog, heartbeat, ACK quorum, election, Sentinel, Cluster, authentication,
+TLS, or production performance parity.
 
 ## Test and SLOC commands
 

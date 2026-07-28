@@ -263,6 +263,67 @@ def test_apply_batch_unsupported_operation_is_atomic() -> None:
     ) == before_state
 
 
+def test_revision_survives_create_delete_cycle_and_absent_delete():
+    database = Database()
+    database.apply_batch(
+        CommitBatch(
+            1,
+            (PutEntry(b"k", StoredEntry(StoredString(b"v"), None, 1)),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+    )
+    created = database.revision(b"k")
+    database.apply_batch(
+        CommitBatch(2, (DeleteKey(b"k", DeleteReason.CLIENT),), CommitTrigger.CLIENT),
+        track_access=True,
+    )
+    deleted = database.revision(b"k")
+    database.apply_batch(
+        CommitBatch(
+            3,
+            (DeleteKey(b"missing", DeleteReason.CLIENT),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+    )
+
+    assert b"k" not in database.entries
+    assert deleted > created
+    assert database.revision(b"missing") > deleted
+
+
+def test_database_fork_is_deep_and_preserves_runtime_metadata():
+    database = Database()
+    database.apply_batch(
+        CommitBatch(
+            1,
+            (PutEntry(b"k", StoredEntry(StoredString(b"v"), None, 1)),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+    )
+
+    fork = database.fork()
+    fork.touch_if_live(b"k", 0)
+    fork.apply_batch(
+        CommitBatch(
+            2,
+            (DeleteKey(b"k", DeleteReason.CLIENT),),
+            CommitTrigger.CLIENT,
+        ),
+        track_access=True,
+    )
+
+    assert b"k" in database.entries
+    assert b"k" not in fork.entries
+    assert database.access_tick == 1
+    assert fork.access_tick == 2
+    assert database.revision(b"k") != fork.revision(b"k")
+    assert database.logical_usage > 0
+    assert fork.logical_usage == 0
+
+
 def test_apply_batch_tracks_each_put_and_touch_only_live_entries() -> None:
     database = Database()
     database.apply_batch(

@@ -121,6 +121,11 @@ class Database:
         self.commit_seq = 0
         self.access_tick = 0
         self.logical_usage = 0
+        self.key_revisions: dict[bytes, int] = {}
+        self.revision_clock = 0
+
+    def revision(self, key: bytes) -> int:
+        return self.key_revisions.get(key, 0)
 
     def apply_batch(self, batch: CommitBatch, *, track_access: bool) -> None:
         next_seq = self.commit_seq + 1
@@ -129,6 +134,8 @@ class Database:
 
         staged = dict(self.entries)
         staged_access_tick = self.access_tick
+        staged_key_revisions = dict(self.key_revisions)
+        staged_revision_clock = self.revision_clock
 
         for operation in batch.operations:
             match operation:
@@ -149,6 +156,8 @@ class Database:
                     raise TypeError(
                         f"unsupported commit operation: {type(operation)!r}"
                     )
+            staged_revision_clock += 1
+            staged_key_revisions[operation.key] = staged_revision_clock
 
         staged_usage = sum(entry.logical_size for entry in staged.values())
         if staged_usage < 0:
@@ -159,7 +168,28 @@ class Database:
         self.entries = staged
         self.logical_usage = staged_usage
         self.access_tick = staged_access_tick
+        self.key_revisions = staged_key_revisions
+        self.revision_clock = staged_revision_clock
         self.commit_seq = batch.seq
+
+    def fork(self) -> Database:
+        forked = Database()
+        forked.entries = {
+            key: Entry(
+                value=thaw_value(freeze_value(entry.value)),
+                expire_at_ms=entry.expire_at_ms,
+                mutation_version=entry.mutation_version,
+                last_access_tick=entry.last_access_tick,
+                logical_size=entry.logical_size,
+            )
+            for key, entry in self.entries.items()
+        }
+        forked.commit_seq = self.commit_seq
+        forked.access_tick = self.access_tick
+        forked.logical_usage = self.logical_usage
+        forked.key_revisions = dict(self.key_revisions)
+        forked.revision_clock = self.revision_clock
+        return forked
 
     def touch_if_live(self, key: bytes, now_ms: int) -> bool:
         entry = self.entries.get(key)
@@ -221,6 +251,11 @@ class Database:
         self.logical_usage = staged_usage
         self.commit_seq = image.checkpoint_seq
         self.access_tick = 0
+        self.key_revisions = {
+            key: revision
+            for revision, key in enumerate(sorted(staged_entries), start=1)
+        }
+        self.revision_clock = len(self.key_revisions)
 
     def discard_expired_for_recovery(self, now_ms: int) -> None:
         expired = tuple(

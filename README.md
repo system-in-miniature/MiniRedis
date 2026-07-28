@@ -2,8 +2,9 @@
 
 MiniRedis is a compact Redis-inspired reference project for learning typed
 in-memory data structures, serialized command atomicity, expiration, eviction,
-blocking operations, Pub/Sub, persistence, and asynchronous replication loss.
-It is not a production-compatible Redis replacement.
+blocking operations, ordered adapter pipelines, Pub/Sub, persistence, and
+asynchronous replication loss. It is not a production-compatible Redis
+replacement.
 
 ## Why Direct-first
 
@@ -25,15 +26,20 @@ TCP -> RESP2 decoder ───────┘                         |
 | Area | Commands |
 |---|---|
 | General | `PING`, `ECHO`, `DEL`, `EXISTS`, `TYPE` |
-| String | `GET`, `SET [NX\|XX] [EX seconds\|PX ms]`, `INCR`, `INCRBY` |
+| String | `GET`, `MGET`, `SET [NX\|XX] [EX seconds\|PX ms]`, `MSET`, `INCR`, `DECR`, `INCRBY` |
 | Hash | `HSET`, `HGET`, `HDEL`, `HGETALL`, `HINCRBY` |
-| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP` |
+| List | `LPUSH`, `RPUSH`, `LPOP`, `RPOP`, `LRANGE`, `BLPOP`, `BRPOP` |
 | Set | `SADD`, `SREM`, `SISMEMBER`, `SMEMBERS`, `SINTER` |
 | Sorted Set | `ZADD`, `ZREM`, `ZSCORE`, `ZRANK`, `ZRANGE`, `ZRANGEBYSCORE` |
 | Expiry | `EXPIRE`, `TTL`, `PTTL`, `PERSIST` |
 | Pub/Sub | `SUBSCRIBE`, `UNSUBSCRIBE`, `PUBLISH` |
 
 Keys, fields, members, values, and channels are `bytes`.
+
+`DirectPipeline` and coalesced RESP2 frames submit independent commands in
+order without waiting for each preceding result. Pipeline batches adapter
+submission only. It does not provide atomic execution, rollback, or
+cross-client isolation.
 
 ## Quick start: Direct API
 
@@ -48,6 +54,11 @@ async def main():
         client = redis.direct_client()
         print(await client.execute(CommandRequest(b"SET", (b"k", b"1"))))
         print(await client.execute(CommandRequest(b"INCR", (b"k",))))
+
+        pipeline = redis.direct_pipeline()
+        pipeline.queue(CommandRequest(b"MSET", (b"a", b"1", b"b", b"2")))
+        pipeline.queue(CommandRequest(b"MGET", (b"a", b"b")))
+        print(await pipeline.execute())
 
 
 asyncio.run(main())
@@ -99,17 +110,17 @@ and promotes the lagging replica.
 - LRU is exact with a binary-key tie-break, not sampled Redis LRU.
 - AOF and snapshots are custom versioned formats, not Redis AOF or RDB.
 - Replication is one in-process `ReplicaSink`, not a network protocol.
-- RESP2/TCP is a correctness adapter with one pending request per session, not a
-  throughput target.
+- RESP2/TCP is a bounded correctness adapter with ordered pipelined submission,
+  not a throughput target.
 
 See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
 
 ## Non-goals
 
 MiniRedis does not implement RESP3, inline protocol, `MULTI`/`EXEC`/`WATCH`,
-Pipeline semantics, Lua, Streams, ACL, multiple databases, Modules, AOF
-rewrite, network replication, PSYNC, backlog, heartbeat, ACK quorum, election,
-Sentinel, Cluster, authentication, TLS, or production performance parity.
+Lua, Streams, ACL, multiple databases, Modules, AOF rewrite, network
+replication, PSYNC, backlog, heartbeat, ACK quorum, election, Sentinel,
+Cluster, authentication, TLS, or production performance parity.
 
 ## Test and SLOC commands
 

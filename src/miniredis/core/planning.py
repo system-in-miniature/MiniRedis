@@ -122,6 +122,44 @@ def plan_general_and_strings(
             return ExecutionPlan(Bytes(message))
         case cmd.Echo(message):
             return ExecutionPlan(Bytes(message))
+        case cmd.CompareDelete(key, expected):
+            entry, expired = lookup(database, key, now_ms)
+            if entry is None:
+                return ExecutionPlan(Number(0), expired)
+            if not isinstance(entry.value, StringValue):
+                return ExecutionPlan(WRONGTYPE)
+            if entry.value.data != expected:
+                return ExecutionPlan(Number(0), touch_keys=(key,))
+            return ExecutionPlan(
+                Number(1),
+                expired + (DeleteKey(key, DeleteReason.CLIENT),),
+            )
+        case cmd.CheckDecrement(key, amount):
+            previous, expired = lookup(database, key, now_ms)
+            if previous is None:
+                return ExecutionPlan(
+                    Failure("INSUFFICIENT", "insufficient value"),
+                    expired,
+                )
+            if not isinstance(previous.value, StringValue):
+                return ExecutionPlan(WRONGTYPE)
+            try:
+                old_value = parse_int64(previous.value.data)
+            except CommandParseError:
+                return _integer_failure()
+            if old_value < amount:
+                return ExecutionPlan(
+                    Failure("INSUFFICIENT", "insufficient value"),
+                    touch_keys=(key,),
+                )
+            new_value = old_value - amount
+            put = make_put(
+                key,
+                StringValue(str(new_value).encode("ascii")),
+                previous,
+                previous.expire_at_ms,
+            )
+            return ExecutionPlan(Number(new_value), expired + (put,))
         case cmd.Delete(keys):
             operations: list[CommitOperation] = []
             removed = 0

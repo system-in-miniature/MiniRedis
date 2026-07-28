@@ -58,8 +58,8 @@ from miniredis.core.outbound import (
     TransportClosed,
 )
 from miniredis.core.pubsub import PubSubRegistry
-from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
-from miniredis.core.transactions import TransactionState
+from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok, Reply
+from miniredis.core.transactions import TransactionState, TransactionWorkspace
 from miniredis.persistence.aof import (
     AofAppendFailed,
     AofAppendOk,
@@ -651,6 +651,9 @@ class CommandExecutor:
 
     async def _execute(self, request: ExecuteRequest) -> None:
         command = request.command
+        if isinstance(command, Exec):
+            await self._execute_transaction(request)
+            return
         if self._route_transaction_command(request, command):
             return
         if self._replica_read_only and is_dataset_mutating(command):
@@ -772,18 +775,6 @@ class CommandExecutor:
                 self._drop_empty_transaction_state(request.session_id, state)
             self._finish_reply(request.token, Ok())
             return True
-        if isinstance(command, Exec):
-            if state is None or not state.active:
-                self._finish_reply(
-                    request.token,
-                    Failure("ERR", "EXEC without MULTI"),
-                )
-            else:
-                self._finish_reply(
-                    request.token,
-                    Failure("ERR", "EXEC is not implemented"),
-                )
-            return True
         if state is None or not state.active:
             return False
         if isinstance(command, TRANSACTION_DISALLOWED):
@@ -804,6 +795,98 @@ class CommandExecutor:
     ) -> None:
         if not state.active and not state.watched:
             self._transactions.pop(session_id, None)
+
+    async def _execute_transaction(self, request: ExecuteRequest) -> None:
+        state = self._transactions.get(request.session_id)
+        if state is None or not state.active:
+            self._finish_reply(
+                request.token,
+                Failure("ERR", "EXEC without MULTI"),
+            )
+            return
+        try:
+            if state.dirty:
+                self._finish_reply(
+                    request.token,
+                    Failure(
+                        "EXECABORT",
+                        "transaction discarded because of previous errors",
+                    ),
+                )
+                return
+            if any(
+                self.database.revision(key) != revision
+                for key, revision in state.watched.items()
+            ):
+                self._finish_reply(request.token, NullArray())
+                return
+
+            workspace = TransactionWorkspace(self.database.fork())
+            now_ms = self.clock.now_ms()
+            for command in state.queued:
+                if self._replica_read_only and is_dataset_mutating(command):
+                    workspace.replies.append(
+                        Failure("READONLY", "replica is read only")
+                    )
+                    continue
+                plan = self.planner.plan(command, workspace.database, now_ms)
+                plan = self._attach_push_wakeups(
+                    command,
+                    plan,
+                    workspace.reserved_waiters,
+                )
+                if plan.reply is None:
+                    raise AssertionError("queued command produced no transaction reply")
+                workspace.replies.append(plan.reply)
+                if isinstance(plan.reply, Failure):
+                    continue
+                workspace.touch_keys.extend(plan.touch_keys)
+                workspace.wakeups.extend(plan.waiter_wakeups)
+                if plan.operations:
+                    workspace.database.apply_batch(
+                        CommitBatch(
+                            workspace.database.commit_seq + 1,
+                            plan.operations,
+                            plan.trigger,
+                        ),
+                        track_access=plan.trigger is CommitTrigger.CLIENT,
+                    )
+                    workspace.operations.extend(plan.operations)
+                for key in dict.fromkeys(plan.touch_keys):
+                    workspace.database.touch_if_live(key, now_ms)
+
+            if workspace.operations:
+                try:
+                    await self._commit_prepared(
+                        PreparedCommit(
+                            tuple(workspace.operations),
+                            CommitTrigger.CLIENT,
+                        )
+                    )
+                except DurabilityFailure as exc:
+                    self._finish_reply(
+                        request.token,
+                        Failure("ERR", f"durability failure: {exc}"),
+                    )
+                    self._on_fatal(str(exc))
+                    return
+            for key in dict.fromkeys(workspace.touch_keys):
+                self.database.touch_if_live(key, now_ms)
+            for wakeup in workspace.wakeups:
+                waiter = self.waiters.transition(
+                    wakeup.waiter_id,
+                    wakeup.generation,
+                    WaiterState.FULFILLED,
+                )
+                if waiter is not None:
+                    self._finish_reply(
+                        waiter.token,
+                        Items((Bytes(wakeup.key), Bytes(wakeup.item))),
+                    )
+            self._finish_reply(request.token, Items(tuple(workspace.replies)))
+        finally:
+            state.clear_all()
+            self._drop_empty_transaction_state(request.session_id, state)
 
     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
         items: list[SubscriptionAck] = []
@@ -859,6 +942,7 @@ class CommandExecutor:
         self,
         command: Command,
         plan: ExecutionPlan,
+        reserved_waiters: set[WaiterId] | None = None,
     ) -> ExecutionPlan:
         if not isinstance(command, ListPush) or isinstance(plan.reply, Failure):
             return plan
@@ -873,6 +957,7 @@ class CommandExecutor:
                     command.key,
                     operation,
                     self.waiters,
+                    reserved_waiters,
                 )
                 operations[index] = final
                 return replace(

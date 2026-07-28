@@ -174,18 +174,19 @@ def prepare_list_wakeups(
     key: bytes,
     pushed: PutEntry,
     waiters: WaiterRegistry,
+    reserved: set[WaiterId] | None = None,
 ) -> tuple[CommitOperation, tuple[WaiterWakeup, ...]]:
     stored = pushed.entry.value
     if not isinstance(stored, StoredList):
         raise TypeError("push operation must contain StoredList")
     remaining = deque(stored.items)
-    reserved: set[WaiterId] = set()
+    owned = set() if reserved is None else reserved
     wakeups: list[WaiterWakeup] = []
     while remaining:
-        waiter = waiters.peek(key, reserved)
+        waiter = waiters.peek(key, owned)
         if waiter is None:
             break
-        reserved.add(waiter.waiter_id)
+        owned.add(waiter.waiter_id)
         wakeups.append(
             WaiterWakeup(
                 waiter.waiter_id,

@@ -16,6 +16,7 @@ from miniredis.persistence.aof import (
     AofRewriteSaved,
     AofWriter,
     PosixAofFileOps,
+    load_aof,
 )
 from miniredis.persistence.codec import encode_aof_record
 from tests.unit.persistence.test_framing import batch
@@ -389,3 +390,195 @@ def test_rewrite_delta_limit_must_be_positive(limit):
         match="aof_rewrite_delta_limit_bytes must be positive",
     ):
         MiniRedisConfig(aof_rewrite_delta_limit_bytes=limit)
+
+
+class RewriteFailureOps(PosixAofFileOps):
+    def __init__(self) -> None:
+        self.rewrite_fd: int | None = None
+        self.fail_temp_write = False
+        self.fail_temp_fsync = False
+        self.fail_replace = False
+        self.fail_parent_fsync = False
+        self.writes: list[tuple[int, bytes]] = []
+
+    def open_rewrite(self, path: Path) -> int:
+        fd = super().open_rewrite(path)
+        self.rewrite_fd = fd
+        return fd
+
+    def write_all(self, fd: int, data: bytes) -> None:
+        self.writes.append((fd, data))
+        if fd == self.rewrite_fd and self.fail_temp_write:
+            raise OSError("temp write failed")
+        super().write_all(fd, data)
+
+    def fsync(self, fd: int) -> None:
+        if fd == self.rewrite_fd and self.fail_temp_fsync:
+            raise OSError("temp fsync failed")
+        super().fsync(fd)
+
+    def replace(self, source: Path, destination: Path) -> None:
+        if self.fail_replace:
+            raise OSError("replace failed")
+        super().replace(source, destination)
+
+    def fsync_parent(self, path: Path) -> None:
+        if self.fail_parent_fsync:
+            raise OSError("parent fsync failed")
+        super().fsync_parent(path)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("failure", "message"),
+    [
+        ("fail_temp_write", "temp write failed"),
+        ("fail_temp_fsync", "temp fsync failed"),
+        ("fail_replace", "replace failed"),
+    ],
+)
+async def test_pre_rename_rewrite_failure_keeps_old_aof_writable(
+    tmp_path,
+    failure,
+    message,
+):
+    path = tmp_path / "appendonly.mraof"
+    ops = RewriteFailureOps()
+    writer = AofWriter(
+        path,
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+    )
+    await writer.start()
+    assert await writer.append(batch(1)) == AofAppendOk(1)
+    setattr(ops, failure, True)
+
+    outcome = await writer.begin_rewrite(SnapshotImage(1, ()))
+
+    assert outcome == AofRewriteFailed(message)
+    setattr(ops, failure, False)
+    assert await writer.append(batch(2)) == AofAppendOk(2)
+    assert writer.failure is None
+    await writer.close()
+    assert load_aof(path, repair_truncated_tail=False).batches == (
+        batch(1),
+        batch(2),
+    )
+
+
+@pytest.mark.asyncio
+async def test_paused_base_delta_is_ordered_into_rewritten_file(tmp_path):
+    path = tmp_path / "appendonly.mraof"
+    ops = GateRewriteOps(asyncio.get_running_loop())
+    writer = AofWriter(
+        path,
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+    )
+    await writer.start()
+    job = writer.begin_rewrite(SnapshotImage(0, ()))
+    await ops.base_entered.wait()
+
+    assert await writer.append(batch(1)) == AofAppendOk(1)
+    ops.release_base.set()
+    assert isinstance(await job, AofRewriteSaved)
+    await writer.close()
+
+    log = load_aof(path, repair_truncated_tail=False)
+    assert log.state_base == SnapshotImage(0, ())
+    assert log.batches == (batch(1),)
+
+
+@pytest.mark.asyncio
+async def test_parent_fsync_failure_after_rename_is_terminal(tmp_path):
+    failures: list[BaseException] = []
+    ops = RewriteFailureOps()
+    ops.fail_parent_fsync = True
+    writer = AofWriter(
+        tmp_path / "appendonly.mraof",
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+        on_failure=failures.append,
+    )
+    await writer.start()
+
+    outcome = await writer.begin_rewrite(SnapshotImage(0, ()))
+
+    assert outcome == AofRewriteFailed("parent fsync failed")
+    assert len(failures) == 1
+    assert str(writer.failure) == "parent fsync failed"
+    later = await writer.append(batch(1))
+    assert later == AofAppendFailed("parent fsync failed")
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_append_after_successful_rewrite_uses_new_descriptor(tmp_path):
+    ops = RewriteFailureOps()
+    writer = AofWriter(
+        tmp_path / "appendonly.mraof",
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+    )
+    await writer.start()
+    assert isinstance(
+        await writer.begin_rewrite(SnapshotImage(0, ())),
+        AofRewriteSaved,
+    )
+    assert ops.rewrite_fd is not None
+
+    assert await writer.append(batch(1)) == AofAppendOk(1)
+
+    assert ops.writes[-1] == (ops.rewrite_fd, encode_aof_record(batch(1)))
+    await writer.close()
+
+
+@pytest.mark.asyncio
+async def test_graceful_close_waits_for_active_rewrite(tmp_path):
+    ops = GateRewriteOps(asyncio.get_running_loop())
+    writer = AofWriter(
+        tmp_path / "appendonly.mraof",
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+    )
+    await writer.start()
+    job = writer.begin_rewrite(SnapshotImage(0, ()))
+    await ops.base_entered.wait()
+
+    closing = asyncio.create_task(writer.close())
+    await asyncio.sleep(0)
+    assert not closing.done()
+    ops.release_base.set()
+    assert isinstance(await job, AofRewriteSaved)
+    await closing
+
+    assert writer.owned_task_count == 0
+
+
+@pytest.mark.asyncio
+async def test_crash_close_aborts_rewrite_and_cleans_temp(tmp_path):
+    ops = GateRewriteOps(asyncio.get_running_loop())
+    writer = AofWriter(
+        tmp_path / "appendonly.mraof",
+        AofPolicy.ALWAYS,
+        rewrite_delta_limit_bytes=4096,
+        ops=ops,
+    )
+    await writer.start()
+    job = writer.begin_rewrite(SnapshotImage(0, ()))
+    await ops.base_entered.wait()
+
+    crashing = asyncio.create_task(writer.crash_close())
+    await asyncio.sleep(0)
+    assert not crashing.done()
+    ops.release_base.set()
+    await crashing
+
+    assert await job == AofRewriteFailed("AOF writer crashed during rewrite")
+    assert writer.owned_task_count == 0
+    assert not tuple(tmp_path.glob("*.tmp"))

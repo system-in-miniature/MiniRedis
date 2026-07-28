@@ -467,9 +467,9 @@ class AofWriter:
         if state.abort_reason is not None:
             await self._cleanup_rewrite(state)
             return
+        temporary_fd = state.temporary_fd
+        old_fd = self._fd
         try:
-            temporary_fd = state.temporary_fd
-            old_fd = self._fd
             assert temporary_fd is not None
             assert old_fd is not None
             await asyncio.to_thread(
@@ -489,6 +489,28 @@ class AofWriter:
             state.temporary_fd = None
             await asyncio.to_thread(self._ops.close, old_fd)
         except BaseException as exc:
+            if state.renamed:
+                installed_fd = state.temporary_fd
+                if installed_fd is not None:
+                    self._fd = installed_fd
+                    state.temporary_fd = None
+                if old_fd is not None and old_fd != self._fd:
+                    try:
+                        await asyncio.to_thread(
+                            self._ops.close,
+                            old_fd,
+                        )
+                    except OSError:
+                        pass
+                if self._rewrite is state:
+                    self._rewrite = None
+                self._record_failure(exc)
+                self._fail_queued(exc)
+                self._settle_rewrite(
+                    state.completion,
+                    AofRewriteFailed(str(exc)),
+                )
+                return
             self._settle_rewrite(
                 state.completion,
                 AofRewriteFailed(str(exc)),
@@ -642,6 +664,19 @@ class AofWriter:
         if self._fd is None:
             return
         self._accepting = False
+        rewrite = self._rewrite
+        if rewrite is not None and not rewrite.renamed:
+            rewrite.abort_reason = "AOF writer crashed during rewrite"
+            self._settle_rewrite(
+                rewrite.completion,
+                AofRewriteFailed(rewrite.abort_reason),
+            )
+        if (
+            rewrite is not None
+            and rewrite.base_task is not None
+            and not rewrite.base_task.done()
+        ):
+            await asyncio.shield(rewrite.base_task)
         if self._worker is not None and not self._worker.done():
             self._queue.put_nowait(_STOP)
             await asyncio.shield(self._worker)

@@ -6,6 +6,8 @@ from miniredis.core.reply import Bytes, Ok
 from miniredis.persistence.aof import AofPolicy
 from miniredis.persistence.recovery import RecoveryError
 from miniredis.runtime import RuntimeState
+from miniredis.replication.sink import ReplicaSink, ReplicaSyncMode
+from tests.helpers.runtime import open_test_runtime
 
 
 @pytest.mark.asyncio
@@ -76,3 +78,38 @@ async def test_restart_resets_volatile_lfu_metadata(tmp_path):
     assert second.database.entries[b"k"].frequency == 0
     assert second.database.entries[b"k"].last_access_tick == 0
     await second.close()
+
+
+@pytest.mark.asyncio
+async def test_primary_restart_changes_identity_and_forces_full_sync(
+    tmp_path,
+):
+    config = MiniRedisConfig(
+        aof_path=tmp_path / "appendonly.mraof",
+        aof_policy=AofPolicy.ALWAYS,
+    )
+    first = await open_test_runtime(
+        config=config,
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=4)
+    await first.attach_replica(sink)
+    await first.direct_client().execute(
+        CommandRequest(b"SET", (b"k", b"v"))
+    )
+    await sink.wait_until_applied(1)
+    await sink.disconnect()
+    await first.close()
+
+    restarted = await open_test_runtime(
+        config=config,
+        replication_id_factory=lambda: "primary-B",
+    )
+    status = await restarted.attach_replica(sink)
+
+    assert status.sync_mode is ReplicaSyncMode.FULL
+    assert status.replication_id == "primary-B"
+    assert status.applied_seq == 1
+    await restarted.close()
+    await replica.close()

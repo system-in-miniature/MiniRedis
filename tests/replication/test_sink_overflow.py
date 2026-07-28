@@ -4,7 +4,12 @@ import pytest
 
 from miniredis import CommandRequest
 from miniredis.core.reply import Bytes, Ok
-from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+from miniredis.config import MiniRedisConfig
+from miniredis.replication.sink import (
+    ReplicaSink,
+    ReplicaSinkState,
+    ReplicaSyncMode,
+)
 from tests.helpers.runtime import open_test_runtime
 
 
@@ -92,5 +97,59 @@ async def test_bootstrap_overflow_never_installs_the_stale_snapshot():
         CommandRequest(b"GET", (b"local",))
     ) == Bytes(b"keep")
     assert primary.debug_stats().replica_links == 0
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_overflow_can_reattach_from_backlog():
+    primary = await open_test_runtime(
+        config=MiniRedisConfig(replication_backlog_batches=4),
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=1)
+    await primary.attach_replica(sink)
+    sink.pause()
+    client = primary.direct_client()
+    await client.execute(CommandRequest(b"SET", (b"a", b"1")))
+    await client.execute(CommandRequest(b"SET", (b"b", b"2")))
+    assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+
+    sink.resume()
+    status = await primary.attach_replica(sink)
+    await sink.wait_until_applied(2)
+
+    assert status.sync_mode is ReplicaSyncMode.PARTIAL
+    assert tuple(replica.database.entries) == (b"a", b"b")
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_queue_overflow_falls_back_after_backlog_rotates():
+    primary = await open_test_runtime(
+        config=MiniRedisConfig(replication_backlog_batches=2),
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=1)
+    await primary.attach_replica(sink)
+    sink.pause()
+    client = primary.direct_client()
+    for seq in range(1, 5):
+        await client.execute(
+            CommandRequest(
+                b"SET",
+                (f"k{seq}".encode(), str(seq).encode()),
+            )
+        )
+    assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+
+    sink.resume()
+    status = await primary.attach_replica(sink)
+
+    assert status.sync_mode is ReplicaSyncMode.FULL
+    assert sink.status.applied_seq == 4
     await primary.close()
     await replica.close()

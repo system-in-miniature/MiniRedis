@@ -97,6 +97,24 @@ async def test_matching_current_cursor_uses_empty_partial_sync(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_empty_backlog_accepts_current_cursor():
+    primary = await open_test_runtime(
+        replication_id_factory=lambda: "primary-A"
+    )
+    probe = AttachmentProbe()
+
+    attachment = await primary.executor.attach_replica(
+        probe,
+        ReplicationCursor("primary-A", 0),
+    )
+
+    assert isinstance(attachment, PartialSyncAttachment)
+    assert attachment.batches == ()
+    await primary.executor.detach_replica(attachment.generation)
+    await primary.close()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "cursor",
     [
@@ -187,5 +205,55 @@ async def test_partial_catchup_precedes_concurrent_live_batch():
     assert replica.debug_commit_seq == 3
     assert tuple(replica.database.entries) == (b"a", b"b", b"c")
     assert sink.status.state is ReplicaSinkState.STREAMING
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_cursor_exactly_before_oldest_backlog_batch_is_partial():
+    primary = await open_test_runtime(
+        config=MiniRedisConfig(replication_backlog_batches=2),
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=4)
+    await primary.attach_replica(sink)
+    client = primary.direct_client()
+    await client.execute(CommandRequest(b"SET", (b"a", b"1")))
+    await sink.wait_until_applied(1)
+    await sink.disconnect()
+    await client.execute(CommandRequest(b"SET", (b"b", b"2")))
+    await client.execute(CommandRequest(b"SET", (b"c", b"3")))
+
+    status = await primary.attach_replica(sink)
+    await sink.wait_until_applied(3)
+
+    assert status.sync_mode is ReplicaSyncMode.PARTIAL
+    await primary.close()
+    await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_backlog_gap_falls_back_to_full_and_replaces_stale_keys():
+    primary = await open_test_runtime(
+        config=MiniRedisConfig(replication_backlog_batches=2),
+        replication_id_factory=lambda: "primary-A",
+    )
+    replica = await open_test_runtime()
+    sink = ReplicaSink(replica, queue_limit=4)
+    await primary.attach_replica(sink)
+    client = primary.direct_client()
+    await client.execute(CommandRequest(b"SET", (b"obsolete", b"1")))
+    await sink.wait_until_applied(1)
+    await sink.disconnect()
+    await client.execute(CommandRequest(b"DEL", (b"obsolete",)))
+    await client.execute(CommandRequest(b"SET", (b"b", b"3")))
+    await client.execute(CommandRequest(b"SET", (b"c", b"4")))
+
+    status = await primary.attach_replica(sink)
+
+    assert status.sync_mode is ReplicaSyncMode.FULL
+    assert b"obsolete" not in replica.database.entries
+    assert tuple(replica.database.entries) == (b"b", b"c")
     await primary.close()
     await replica.close()

@@ -28,6 +28,16 @@ class GetString:
 
 
 @dataclass(frozen=True, slots=True)
+class MultiGet:
+    keys: tuple[bytes, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MultiSet:
+    pairs: tuple[tuple[bytes, bytes], ...]
+
+
+@dataclass(frozen=True, slots=True)
 class Delete:
     keys: tuple[bytes, ...]
 
@@ -214,6 +224,8 @@ Command: TypeAlias = (
     | Echo
     | SetString
     | GetString
+    | MultiGet
+    | MultiSet
     | Delete
     | Exists
     | TypeOf
@@ -250,6 +262,7 @@ Command: TypeAlias = (
 _DATASET_MUTATING_TYPES = frozenset(
     {
         SetString,
+        MultiSet,
         Delete,
         Increment,
         HashSet,
@@ -272,6 +285,7 @@ _NON_DATASET_MUTATING_TYPES = frozenset(
         Ping,
         Echo,
         GetString,
+        MultiGet,
         Exists,
         TypeOf,
         HashGet,

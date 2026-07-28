@@ -14,6 +14,8 @@ from miniredis.commands.model import (
     HashGetAll,
     ListPop,
     ListPush,
+    MultiGet,
+    MultiSet,
     SetMembers,
     ZRemove,
     ZRangeByScore,
@@ -66,6 +68,12 @@ def test_parse_set_rejects_invalid_entire_option_set(args: tuple[bytes, ...]) ->
     [
         (CommandRequest(b"EXISTS", (b"a", b"a")), Exists((b"a", b"a"))),
         (CommandRequest(b"INCRBY", (b"a", b"2")), Increment(b"a", 2)),
+        (CommandRequest(b"DECR", (b"a",)), Increment(b"a", -1)),
+        (CommandRequest(b"MGET", (b"a", b"b")), MultiGet((b"a", b"b"))),
+        (
+            CommandRequest(b"MSET", (b"a", b"1", b"b", b"2")),
+            MultiSet(((b"a", b"1"), (b"b", b"2"))),
+        ),
         (CommandRequest(b"HGETALL", (b"h",)), HashGetAll(b"h")),
         (
             CommandRequest(b"LPUSH", (b"l", b"a", b"b")),
@@ -90,6 +98,10 @@ def test_parse_representative_commands_return_exact_typed_command(
     "command_request",
     [
         CommandRequest(b"GET"),
+        CommandRequest(b"MGET"),
+        CommandRequest(b"MSET", (b"a",)),
+        CommandRequest(b"MSET", (b"a", b"1", b"b")),
+        CommandRequest(b"DECR"),
         CommandRequest(b"HSET", (b"h", b"f")),
         CommandRequest(b"LRANGE", (b"l", b"0")),
         CommandRequest(b"SADD", (b"s",)),

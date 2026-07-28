@@ -27,6 +27,8 @@ from miniredis.commands.model import (
     ListPop,
     ListPush,
     ListRange,
+    MultiGet,
+    MultiSet,
     Persist,
     Ping,
     Publish,
@@ -181,11 +183,22 @@ def parse_request(request: CommandRequest) -> Command:
         case b"GET":
             _require_arity(name, args, 1)
             return GetString(args[0])
+        case b"MGET":
+            _require_min_arity(name, args, 1)
+            return MultiGet(args)
+        case b"MSET":
+            _require_min_arity(name, args, 2)
+            if len(args) % 2 != 0:
+                raise CommandParseError("wrong number of arguments for MSET")
+            return MultiSet(_byte_pairs(args))
         case b"SET":
             return _parse_set(args)
         case b"INCR":
             _require_arity(name, args, 1)
             return Increment(args[0], 1)
+        case b"DECR":
+            _require_arity(name, args, 1)
+            return Increment(args[0], -1)
         case b"INCRBY":
             _require_arity(name, args, 2)
             return Increment(args[0], parse_int64(args[1]))

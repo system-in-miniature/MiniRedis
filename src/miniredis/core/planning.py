@@ -19,7 +19,7 @@ from miniredis.core.commit import (
 from miniredis.core.database import Database, Entry, freeze_value
 from miniredis.core.executor import ExecutionPlan
 from miniredis.core.expiration import expiry_delete, is_expired
-from miniredis.core.reply import Bytes, Failure, Number, Ok
+from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
 from miniredis.core.values import (
     HashValue,
     ListValue,
@@ -165,6 +165,29 @@ def plan_general_and_strings(
             if not isinstance(entry.value, StringValue):
                 return ExecutionPlan(WRONGTYPE)
             return ExecutionPlan(Bytes(entry.value.data), expired, (key,))
+        case cmd.MultiGet(keys):
+            touches: list[bytes] = []
+            replies: list[Reply] = []
+            for key in keys:
+                entry, _expired = lookup(database, key, now_ms)
+                if entry is None or not isinstance(entry.value, StringValue):
+                    replies.append(Bytes(None))
+                else:
+                    replies.append(Bytes(entry.value.data))
+                    touches.append(key)
+            return ExecutionPlan(Items(tuple(replies)), (), tuple(touches))
+        case cmd.MultiSet(pairs):
+            final_values: dict[bytes, bytes] = {}
+            for key, value in pairs:
+                final_values[key] = value
+            operations: list[CommitOperation] = []
+            for key, value in final_values.items():
+                previous, expired = lookup(database, key, now_ms)
+                operations.extend(expired)
+                operations.append(
+                    make_put(key, StringValue(value), previous, None)
+                )
+            return ExecutionPlan(Ok(), tuple(operations))
         case cmd.SetString(key, value, only_if, expire_ms):
             previous, expired = lookup(database, key, now_ms)
             if only_if == "nx" and previous is not None:

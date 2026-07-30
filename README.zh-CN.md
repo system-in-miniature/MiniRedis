@@ -2,6 +2,8 @@
 
 # MiniRedis
 
+[![CI](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml/badge.svg)](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)
+
 MiniRedis 是一个紧凑的、受 Redis 启发的参考项目，用于学习类型化内存数据结构、串行化命令原子性、过期、淘汰、阻塞操作、有序适配器流水线、发布/订阅（Pub/Sub）、持久化以及异步复制中的数据丢失。它不是可用于生产环境、与 Redis 兼容的替代品。
 
 ## 为什么采用 Direct-first
@@ -173,3 +175,7 @@ SLOC 分别报告生产 Python、测试 Python 和 Markdown 文档。它只负�
 ## 课程分离
 
 本仓库是完成后的参考项目。课程材料与之分离，目前尚未生成；此处没有 `course/` 目录，也没有固定章节数。
+
+## 商标声明
+
+MiniRedis 是独立的教学项目，与 Redis Ltd. 无隶属、背书或赞助关系。"Redis" 商标归其所有者所有。

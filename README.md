@@ -2,6 +2,8 @@
 
 # MiniRedis
 
+[![CI](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml/badge.svg)](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)
+
 MiniRedis is a compact Redis-inspired reference project for learning typed
 in-memory data structures, serialized command atomicity, expiration, eviction,
 blocking operations, ordered adapter pipelines, Pub/Sub, persistence, and
@@ -234,3 +236,7 @@ separately. It is reported, never accepted or rejected by a size range.
 This repository is the finished reference project. Course material is separate
 and has not yet been generated; there is no `course/` directory or fixed
 chapter count here.
+
+## Trademark Notice
+
+MiniRedis is an independent educational project. It is not affiliated with, endorsed by, or sponsored by Redis Ltd.. "Redis" is a trademark of its respective owner.

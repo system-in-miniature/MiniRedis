@@ -2,7 +2,7 @@
 
 Date: 2026-07-27
 
-Status: Approved design
+Status: Historical design record
 
 ## 1. Context
 
@@ -28,7 +28,7 @@ the project.
 
 ## 2. Goals
 
-Add the following capabilities:
+The recorded scope added the following capabilities:
 
 - `MGET`, `MSET`, `DECR`, and `BRPOP`;
 - Direct and RESP2 pipelining semantics;
@@ -755,7 +755,7 @@ No correctness test depends on arbitrary sleeps.
 
 ### 13.1 Phase A: commands and pipeline
 
-Implement:
+Recorded implementation shape:
 
 - `MGET`, `MSET`, `DECR`;
 - `BRPOP`;
@@ -768,7 +768,7 @@ session admission, and full regression.
 
 ### 13.2 Phase B: transactions and atomic functions
 
-Implement:
+Recorded implementation shape:
 
 - session transaction state;
 - revision ledger;
@@ -783,7 +783,7 @@ cleanup.
 
 ### 13.3 Phase C: LFU
 
-Implement deterministic decay, LFU projections, victim selection, and
+The recorded implementation provided deterministic decay, LFU projections, victim selection, and
 configuration.
 
 Acceptance includes FakeClock decay, stable tie-breaking, comparison of
@@ -792,7 +792,7 @@ neutral metadata after recovery/full sync.
 
 ### 13.4 Phase D: online AOF rewrite
 
-Implement the state-base codec, recovery, rewrite registration, background
+The recorded implementation provided the state-base codec, recovery, rewrite registration, background
 base generation, bounded delta, ordered finalization, atomic replacement, and
 failure cleanup.
 
@@ -809,7 +809,7 @@ Acceptance includes:
 
 ### 13.5 Phase E: backlog and partial resync
 
-Implement logical identity, bounded batch backlog, resume decisions, ordered
+The recorded implementation provided logical identity, bounded batch backlog, resume decisions, ordered
 catch-up, full-sync fallback, and promotion fencing.
 
 Acceptance includes:

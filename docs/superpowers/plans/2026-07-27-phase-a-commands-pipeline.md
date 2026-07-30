@@ -1,11 +1,6 @@
-# Phase A Commands and Pipeline Implementation Plan
+# Phase A Commands and Pipeline Design and Implementation History
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> `superpowers:executing-plans` to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking. The user selected inline execution;
-> do not dispatch subagents.
-
-**Goal:** Add MGET, MSET, DECR, BRPOP, DirectPipeline, and true ordered RESP2
+**Historical objective:** Add MGET, MSET, DECR, BRPOP, DirectPipeline, and true ordered RESP2
 pipelining while keeping the executor as the single state owner.
 
 **Architecture:** New commands follow the existing typed-command and planner
@@ -21,35 +16,35 @@ pytest-asyncio, RESP2.
 
 ## File map
 
-- Modify `src/miniredis/commands/model.py`: typed commands and mutability
+- Changed `src/miniredis/commands/model.py`: typed commands and mutability
   classification.
-- Modify `src/miniredis/commands/parser.py`: new command parsing.
-- Modify `src/miniredis/core/planning.py`: MGET/MSET/DECR planning.
-- Modify `src/miniredis/core/planner.py`: direction-aware blocking pop.
-- Modify `src/miniredis/core/blocking.py`: waiter pop direction and wakeups.
-- Modify `src/miniredis/core/executor.py`: ordered rejection messages and
+- Changed `src/miniredis/commands/parser.py`: new command parsing.
+- Changed `src/miniredis/core/planning.py`: MGET/MSET/DECR planning.
+- Changed `src/miniredis/core/planner.py`: direction-aware blocking pop.
+- Changed `src/miniredis/core/blocking.py`: waiter pop direction and wakeups.
+- Changed `src/miniredis/core/executor.py`: ordered rejection messages and
   direction-aware blocking registration.
-- Modify `src/miniredis/runtime.py`: one ordered adapter submission API and
+- Changed `src/miniredis/runtime.py`: one ordered adapter submission API and
   pipeline factory.
-- Modify `src/miniredis/adapters/direct.py`: submission primitive and
+- Changed `src/miniredis/adapters/direct.py`: submission primitive and
   `DirectPipeline`.
-- Modify `src/miniredis/adapters/tcp.py`: submit all decoded frames without a
+- Changed `src/miniredis/adapters/tcp.py`: submit all decoded frames without a
   per-command await gate.
-- Modify `src/miniredis/__init__.py`: export `DirectPipeline`.
-- Test `tests/unit/commands/test_parser.py`.
-- Test `tests/unit/commands/test_command_traits.py`.
-- Test `tests/contract/test_strings.py`.
-- Test `tests/contract/test_lists.py`.
-- Create `tests/adapters/test_direct_pipeline.py`.
-- Modify `tests/adapters/test_tcp_async_semantics.py`.
-- Modify `tests/concurrency/test_blpop_races.py`.
-- Modify `docs/behavior-matrix.md` and `README.md`.
+- Changed `src/miniredis/__init__.py`: export `DirectPipeline`.
+- Evidence covered `tests/unit/commands/test_parser.py`.
+- Evidence covered `tests/unit/commands/test_command_traits.py`.
+- Evidence covered `tests/contract/test_strings.py`.
+- Evidence covered `tests/contract/test_lists.py`.
+- Added `tests/adapters/test_direct_pipeline.py`.
+- Changed `tests/adapters/test_tcp_async_semantics.py`.
+- Changed `tests/concurrency/test_blpop_races.py`.
+- Changed `docs/behavior-matrix.md` and `README.md`.
 
-### Task 1: MGET, MSET, and DECR command contracts
+### Milestone 1: MGET, MSET, and DECR command contracts
 
-- [ ] **Step 1: Add failing parser and command-trait tests**
+**Recorded activity 1 — Design outcome: failing parser and command-trait tests**
 
-Add cases equivalent to:
+Recorded test cases included:
 
 ```python
 def test_parse_bulk_string_commands():
@@ -76,22 +71,16 @@ def test_bulk_string_command_arity_is_rejected(request):
 
 Classify `MultiSet` as mutating and `MultiGet` as non-mutating.
 
-- [ ] **Step 2: Run the focused tests and verify RED**
+**Recorded activity 2 — Verification intent: the focused tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/commands/test_parser.py`, `tests/unit/commands/test_command_traits.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/commands/test_parser.py \
-  tests/unit/commands/test_command_traits.py
-```
-
-Expected: collection or assertion failure because `MultiGet` and `MultiSet`
+Historical expected evidence: collection or assertion failure because `MultiGet` and `MultiSet`
 do not exist.
 
-- [ ] **Step 3: Add typed models and parser branches**
+**Recorded activity 3 — Design outcome: typed models and parser branches**
 
-Implement:
+Recorded implementation shape:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -104,7 +93,7 @@ class MultiSet:
     pairs: tuple[tuple[bytes, bytes], ...]
 ```
 
-Parser behavior:
+Recorded parser behavior:
 
 ```python
 case b"MGET":
@@ -120,9 +109,9 @@ case b"DECR":
     return Increment(args[0], -1)
 ```
 
-Add both types to `Command` and to exactly one trait set.
+The recorded scope added both types to `Command` and to exactly one trait set.
 
-- [ ] **Step 4: Add failing Direct contract tests**
+**Recorded activity 4 — Design outcome: failing Direct contract tests**
 
 Cover ordered nulls/non-Strings, last-duplicate-wins, type replacement, TTL
 clearing, one commit, OOM all-or-nothing, and DECR TTL preservation:
@@ -167,9 +156,9 @@ async def test_mset_is_one_atomic_commit_and_last_duplicate_wins():
         )
 ```
 
-- [ ] **Step 5: Implement planners**
+**Recorded activity 5 — Design outcome: planners**
 
-Add `MultiGet` and `MultiSet` cases in `plan_general_and_strings`.
+The recorded scope added `MultiGet` and `MultiSet` cases in `plan_general_and_strings`.
 
 `MultiGet` must return expired and non-String entries as null without
 materializing expiry deletion. It touches only returned live Strings:
@@ -213,38 +202,20 @@ case cmd.MultiSet(pairs):
     return ExecutionPlan(Ok(), tuple(operations))
 ```
 
-Do not deduplicate Put/Delete across different operation kinds after lookup;
+The design did not deduplicate Put/Delete across different operation kinds after lookup;
 expired-then-put ordering is intentional.
 
-- [ ] **Step 6: Run command contracts and commit**
+**Recorded activity 6 — Verification intent: command contracts and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/commands/test_parser.py`, `tests/unit/commands/test_command_traits.py`, `tests/contract/test_strings.py`, `tests/contract/test_ttl.py`, `tests/contract/test_eviction.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/commands/test_parser.py \
-  tests/unit/commands/test_command_traits.py \
-  tests/contract/test_strings.py \
-  tests/contract/test_ttl.py \
-  tests/contract/test_eviction.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 2: Direction-aware BRPOP
 
-Commit:
+**Recorded activity 1 — Design outcome: failing parser and list contract tests**
 
-```bash
-git add src/miniredis/commands src/miniredis/core/planning.py \
-  tests/unit/commands tests/contract/test_strings.py \
-  tests/contract/test_ttl.py tests/contract/test_eviction.py
-git commit -m "feat: add bulk string commands"
-```
-
-### Task 2: Direction-aware BRPOP
-
-- [ ] **Step 1: Add failing parser and list contract tests**
-
-Use one typed command with direction:
+The design used one typed command with direction:
 
 ```python
 assert parse(CommandRequest(b"BLPOP", (b"a", b"0"))) == BlockingPop(
@@ -258,20 +229,13 @@ assert parse(CommandRequest(b"BRPOP", (b"a", b"b", b"1.5"))) == BlockingPop(
 Contract cases must prove immediate right pop, first-key priority, wrong type,
 timeout, and closed-session cleanup.
 
-- [ ] **Step 2: Run focused tests and verify RED**
+**Recorded activity 2 — Verification intent: focused tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/commands/test_parser.py`, `tests/contract/test_lists.py`, `tests/concurrency/test_blpop_races.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/commands/test_parser.py \
-  tests/contract/test_lists.py \
-  tests/concurrency/test_blpop_races.py
-```
+Historical expected evidence: FAIL because only `BlPop` exists.
 
-Expected: FAIL because only `BlPop` exists.
-
-- [ ] **Step 3: Replace BlPop with BlockingPop**
+**Recorded activity 3 — Replace BlPop with BlockingPop**
 
 Define:
 
@@ -292,9 +256,9 @@ Change `CommandPlanner.plan_blocking_pop_now` to select:
 item = items.popleft() if command.left else items.pop()
 ```
 
-- [ ] **Step 4: Carry direction through waiting and push wakeup**
+**Recorded activity 4 — Carry direction through waiting and push wakeup**
 
-Add `left: bool` to `BlockingWaiter` and `WaiterRegistry.register`. In
+The recorded scope added `left: bool` to `BlockingWaiter` and `WaiterRegistry.register`. In
 `prepare_list_wakeups`, reserve from the requested side:
 
 ```python
@@ -312,35 +276,17 @@ wakeups.append(
 Register `command.left` in the executor. Keep key ordering, timer ownership,
 transition rules, and `[key, value]` replies unchanged.
 
-- [ ] **Step 5: Run blocking suites and commit**
+**Recorded activity 5 — Verification intent: blocking suites and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/contract/test_lists.py`, `tests/mechanisms/test_blpop.py`, `tests/mechanisms/test_blpop_push_batch.py`, `tests/concurrency/test_blpop_races.py`, `tests/concurrency/test_shutdown.py`.
 
-```bash
-uv run pytest -q \
-  tests/contract/test_lists.py \
-  tests/mechanisms/test_blpop.py \
-  tests/mechanisms/test_blpop_push_batch.py \
-  tests/concurrency/test_blpop_races.py \
-  tests/concurrency/test_shutdown.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 3: Ordered adapter submission and DirectPipeline
 
-Commit:
+**Recorded activity 1 — Design outcome: failing DirectPipeline tests**
 
-```bash
-git add src/miniredis/commands src/miniredis/core/blocking.py \
-  src/miniredis/core/planner.py src/miniredis/core/executor.py \
-  src/miniredis/adapters/direct.py tests
-git commit -m "feat: add direction-aware blocking pop"
-```
-
-### Task 3: Ordered adapter submission and DirectPipeline
-
-- [ ] **Step 1: Add failing DirectPipeline tests**
-
-Create `tests/adapters/test_direct_pipeline.py` with:
+The recorded scope added `tests/adapters/test_direct_pipeline.py` with:
 
 ```python
 @pytest.mark.asyncio
@@ -358,21 +304,17 @@ async def test_direct_pipeline_preserves_result_slots_and_is_not_atomic():
         assert pipeline.pending_count == 0
 ```
 
-Add a paused-executor test that submits one pipeline, inserts another
+The recorded scope added a paused-executor test that submits one pipeline, inserts another
 session's command between individual submissions using a test hook, and proves
 that no atomic batch promise exists.
 
-- [ ] **Step 2: Run the new test and verify RED**
+**Recorded activity 2 — Verification intent: the new test and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/adapters/test_direct_pipeline.py`.
 
-```bash
-uv run pytest -q tests/adapters/test_direct_pipeline.py
-```
+Historical expected evidence: FAIL because `direct_pipeline` does not exist.
 
-Expected: FAIL because `direct_pipeline` does not exist.
-
-- [ ] **Step 3: Introduce ordered rejection submission**
+**Recorded activity 3 — Introduce ordered rejection submission**
 
 In `core/executor.py`, add:
 
@@ -407,7 +349,7 @@ def submit_request(
 
 Refactor `DirectClient.execute` and `execute_for_session` to use it.
 
-Add:
+The recorded scope added:
 
 ```python
 async def wait_for_session_submission(
@@ -430,9 +372,9 @@ async def wait_for_session_submission(
 
 `execute_for_session` becomes submit plus this wait helper.
 
-- [ ] **Step 4: Implement DirectPipeline**
+**Recorded activity 4 — Design outcome: DirectPipeline**
 
-Implement a focused adapter:
+The recorded implementation provided a focused adapter:
 
 ```python
 class DirectPipeline:
@@ -469,34 +411,17 @@ Extract `DirectClient.submit` and `DirectClient.resolve` from the existing
 Tests must close a standalone pipeline or let runtime shutdown prove its
 session is reclaimed.
 
-- [ ] **Step 5: Run Direct and ownership tests and commit**
+**Recorded activity 5 — Verification intent: Direct and ownership tests and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/adapters/test_direct_pipeline.py`, `tests/concurrency/test_direct_executor.py`, `tests/concurrency/test_request_ownership.py`, `tests/concurrency/test_shutdown.py`.
 
-```bash
-uv run pytest -q \
-  tests/adapters/test_direct_pipeline.py \
-  tests/concurrency/test_direct_executor.py \
-  tests/concurrency/test_request_ownership.py \
-  tests/concurrency/test_shutdown.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 4: RESP2 pipelined submission
 
-Commit:
+**Recorded activity 1 — Design outcome: failing TCP pipeline tests**
 
-```bash
-git add src/miniredis/core/executor.py src/miniredis/runtime.py \
-  src/miniredis/adapters/direct.py src/miniredis/__init__.py \
-  tests/adapters/test_direct_pipeline.py tests/concurrency
-git commit -m "feat: add ordered direct pipelines"
-```
-
-### Task 4: RESP2 pipelined submission
-
-- [ ] **Step 1: Add failing TCP pipeline tests**
-
-Add tests that write three RESP arrays in one `writer.write`, then read three
+The recorded scope added tests that write three RESP arrays in one `writer.write`, then read three
 ordered replies. Include an invalid middle command and a paused writer to
 prove that decoded commands reach the executor before the first reply drains:
 
@@ -510,20 +435,14 @@ await send(writer, wire)
 await expect(reader, b"+OK\r\n-ERR unknown command\r\n:2\r\n")
 ```
 
-- [ ] **Step 2: Run the TCP test and verify RED**
+**Recorded activity 2 — Verification intent: the TCP test and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/adapters/test_tcp_async_semantics.py`, `tests/adapters/test_tcp_smoke.py`.
 
-```bash
-uv run pytest -q \
-  tests/adapters/test_tcp_async_semantics.py \
-  tests/adapters/test_tcp_smoke.py
-```
-
-Expected: the pipeline concurrency assertion fails because `_pending_command`
+Historical expected evidence: the pipeline concurrency assertion fails because `_pending_command`
 serializes submit-and-wait.
 
-- [ ] **Step 3: Replace the single pending command with submitted ownership**
+**Recorded activity 3 — Replace the single pending command with submitted ownership**
 
 In `TcpSession`, remove `_pending_command` and add:
 
@@ -564,33 +483,19 @@ whenever `_finish_request` removes an accepted request. Cancellation and
 session close cancel this waiter. `CLOSED` is terminal and closes the session
 after already ordered replies drain.
 
-- [ ] **Step 4: Run adapter, backpressure, and shutdown tests**
+**Recorded activity 4 — Verification intent: adapter, backpressure, and shutdown tests**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/adapters`, `tests/concurrency/test_slow_endpoint.py`, `tests/concurrency/test_shutdown.py`, `tests/reliability/test_reliability_shutdown.py`.
 
-```bash
-uv run pytest -q \
-  tests/adapters \
-  tests/concurrency/test_slow_endpoint.py \
-  tests/concurrency/test_shutdown.py \
-  tests/reliability/test_reliability_shutdown.py
-```
+Historical expected evidence: PASS with ordered replies and zero owned tasks after close.
 
-Expected: PASS with ordered replies and zero owned tasks after close.
+**Recorded activity 5 — Commit RESP2 pipeline support**
 
-- [ ] **Step 5: Commit RESP2 pipeline support**
+### Milestone 5: Phase A acceptance and documentation
 
-```bash
-git add src/miniredis/adapters/tcp.py src/miniredis/runtime.py \
-  tests/adapters tests/concurrency tests/reliability
-git commit -m "feat: submit RESP2 pipelines without round trips"
-```
+**Recorded activity 1 — Update behavior claims**
 
-### Task 5: Phase A acceptance and documentation
-
-- [ ] **Step 1: Update behavior claims**
-
-Update `docs/behavior-matrix.md` and `README.md` to list the exact new command
+The recorded change updated `docs/behavior-matrix.md` and `README.md` to list the exact new command
 subset and state:
 
 ```text
@@ -601,21 +506,10 @@ execution, rollback, or cross-client isolation.
 Remove MGET/MSET/DECR/BRPOP/Pipeline from current non-goals. Do not claim
 transactions yet.
 
-- [ ] **Step 2: Run formatting and complete regression**
+**Recorded activity 2 — Verification intent: formatting and complete regression**
 
-Run:
+Historical verification covered targeted or full test coverage, static analysis, diff hygiene.
 
-```bash
-uv run ruff check .
-uv run pytest -q
-git diff --check
-```
+Historical expected evidence: Ruff clean, all tests pass, diff check clean.
 
-Expected: Ruff clean, all tests pass, diff check clean.
-
-- [ ] **Step 3: Commit Phase A acceptance**
-
-```bash
-git add README.md docs/behavior-matrix.md
-git commit -m "docs: accept command and pipeline phase"
-```
+**Recorded activity 3 — Recorded Phase A acceptance**

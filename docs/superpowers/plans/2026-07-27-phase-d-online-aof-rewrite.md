@@ -1,11 +1,6 @@
-# Phase D Online AOF Rewrite Implementation Plan
+# Phase D Online AOF Rewrite Design and Implementation History
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> `superpowers:executing-plans` to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking. The user selected inline execution;
-> do not dispatch subagents.
-
-**Goal:** Compact AOF online into one stable state base plus concurrent commit
+**Historical objective:** Compact AOF online into one stable state base plus concurrent commit
 deltas, with bounded memory, atomic replacement, deterministic failures, and
 recoverable shutdown/crash behavior.
 
@@ -22,32 +17,32 @@ CRC-framed JSON codec, pytest failure-injection file ops.
 
 ## File map
 
-- Modify `src/miniredis/config.py`: rewrite delta bound.
-- Modify `src/miniredis/persistence/codec.py`: state-base record and richer
+- Changed `src/miniredis/config.py`: rewrite delta bound.
+- Changed `src/miniredis/persistence/codec.py`: state-base record and richer
   AOF scan result.
-- Modify `src/miniredis/persistence/aof.py`: rewrite outcomes, file operations,
+- Changed `src/miniredis/persistence/aof.py`: rewrite outcomes, file operations,
   rewrite state, background base, delta capture, finalize barrier, cleanup.
-- Modify `src/miniredis/persistence/recovery.py`: choose newest complete
+- Changed `src/miniredis/persistence/recovery.py`: choose newest complete
   snapshot/AOF baseline.
-- Modify `src/miniredis/core/executor.py`: `BeginAofRewrite` capture and
+- Changed `src/miniredis/core/executor.py`: `BeginAofRewrite` capture and
   registration control.
-- Modify `src/miniredis/runtime.py`: `rewrite_aof`, writer wiring, test hooks,
+- Changed `src/miniredis/runtime.py`: `rewrite_aof`, writer wiring, test hooks,
   shutdown, and stats.
-- Modify `tests/helpers/runtime.py`: gated/failing AOF rewrite operations.
-- Modify `tests/unit/persistence/test_codec.py`.
-- Modify `tests/unit/persistence/test_framing.py`.
-- Modify `tests/unit/persistence/test_recovery.py`.
-- Modify `tests/unit/persistence/test_aof_writer.py`.
-- Create `tests/reliability/test_aof_rewrite.py`.
-- Modify `tests/reliability/test_restart.py`.
-- Modify `tests/reliability/test_reliability_shutdown.py`.
-- Modify `docs/behavior-matrix.md` and `README.md`.
+- Changed `tests/helpers/runtime.py`: gated/failing AOF rewrite operations.
+- Changed `tests/unit/persistence/test_codec.py`.
+- Changed `tests/unit/persistence/test_framing.py`.
+- Changed `tests/unit/persistence/test_recovery.py`.
+- Changed `tests/unit/persistence/test_aof_writer.py`.
+- Added `tests/reliability/test_aof_rewrite.py`.
+- Changed `tests/reliability/test_restart.py`.
+- Changed `tests/reliability/test_reliability_shutdown.py`.
+- Changed `docs/behavior-matrix.md` and `README.md`.
 
-### Task 1: AOF state-base codec and backward-compatible scan
+### Milestone 1: AOF state-base codec and backward-compatible scan
 
-- [ ] **Step 1: Add failing codec tests**
+**Recorded activity 1 — Design outcome: failing codec tests**
 
-Add:
+The recorded scope added:
 
 ```python
 def test_aof_state_base_round_trips_before_contiguous_batches():
@@ -80,21 +75,15 @@ Also test base-only files, batch at/below checkpoint, non-contiguous batch
 after base, duplicate base, truncated base tail repair boundary, and legacy
 batch-only files.
 
-- [ ] **Step 2: Run codec tests and verify RED**
+**Recorded activity 2 — Verification intent: codec tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_codec.py`, `tests/unit/persistence/test_framing.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/persistence/test_codec.py \
-  tests/unit/persistence/test_framing.py
-```
+Historical expected evidence: no state-base encoder or scan field.
 
-Expected: no state-base encoder or scan field.
+**Recorded activity 3 — Design outcome: framed state-base payload**
 
-- [ ] **Step 3: Add framed state-base payload**
-
-Keep existing commit payloads unchanged for backward compatibility. Encode a
+The design retained existing commit payloads unchanged for backward compatibility. Encode a
 base payload with a disjoint strict shape:
 
 ```python
@@ -116,7 +105,7 @@ Frame it with the existing length plus CRC envelope. Detect a state base by
 strictly loading the payload and checking `record == "state_base"`; otherwise
 decode it as the existing commit payload.
 
-Extend:
+The recorded change extended:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -130,29 +119,15 @@ class AofScan:
 Enforce exactly one leading base and contiguous sequence starting at
 `checkpoint_seq + 1`.
 
-- [ ] **Step 4: Run codec tests and commit**
+**Recorded activity 4 — Verification intent: codec tests and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_codec.py`, `tests/unit/persistence/test_framing.py`, `tests/unit/persistence/test_corruption.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/persistence/test_codec.py \
-  tests/unit/persistence/test_framing.py \
-  tests/unit/persistence/test_corruption.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 2: Recovery baseline selection
 
-Commit:
-
-```bash
-git add src/miniredis/persistence/codec.py tests/unit/persistence
-git commit -m "feat: encode AOF state base records"
-```
-
-### Task 2: Recovery baseline selection
-
-- [ ] **Step 1: Add failing recovery matrix tests**
+**Recorded activity 1 — Design outcome: failing recovery matrix tests**
 
 Cover a newer AOF base explicitly:
 
@@ -200,23 +175,19 @@ def test_recovery_prefers_newer_aof_state_base(tmp_path):
     )
 ```
 
-Add the inverse newer-snapshot case, equal checkpoints, base-without-snapshot,
+The recorded scope added the inverse newer-snapshot case, equal checkpoints, base-without-snapshot,
 legacy AOF plus snapshot, missing post-baseline sequence, and
 truncated-final-delta repair.
 
-- [ ] **Step 2: Run recovery tests and verify RED**
+**Recorded activity 2 — Verification intent: recovery tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_recovery.py`.
 
-```bash
-uv run pytest -q tests/unit/persistence/test_recovery.py
-```
+Historical expected evidence: `load_aof` returns only batches and cannot select the base.
 
-Expected: `load_aof` returns only batches and cannot select the base.
+**Recorded activity 3 — Return an AOF log object and select baseline**
 
-- [ ] **Step 3: Return an AOF log object and select baseline**
-
-Add:
+The recorded scope added:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -251,33 +222,17 @@ Retain explicit gap and "AOF ends before selected checkpoint" validation.
 Install the selected image, replay contiguous later batches, then discard
 expired entries.
 
-- [ ] **Step 4: Run recovery/restart tests and commit**
+**Recorded activity 4 — Verification intent: recovery/restart tests and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_recovery.py`, `tests/unit/persistence/test_aof_repair.py`, `tests/reliability/test_restart.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/persistence/test_recovery.py \
-  tests/unit/persistence/test_aof_repair.py \
-  tests/reliability/test_restart.py
-```
+Historical expected evidence: PASS for legacy and state-base histories.
 
-Expected: PASS for legacy and state-base histories.
+### Milestone 3: Rewrite file operations and bounded writer state
 
-Commit:
+**Recorded activity 1 — Design outcome: failing writer state/outcome tests**
 
-```bash
-git add src/miniredis/persistence/aof.py \
-  src/miniredis/persistence/recovery.py tests/unit/persistence \
-  tests/reliability/test_restart.py
-git commit -m "feat: recover from AOF state baselines"
-```
-
-### Task 3: Rewrite file operations and bounded writer state
-
-- [ ] **Step 1: Add failing writer state/outcome tests**
-
-Add tests for Disabled/Busy registration, temp-file path uniqueness, base
+The recorded scope added tests for Disabled/Busy registration, temp-file path uniqueness, base
 write gating, and delta overflow:
 
 ```python
@@ -319,19 +274,15 @@ async def test_begin_rewrite_registers_before_next_append(tmp_path):
     assert await job == AofRewriteSaved(tmp_path / "appendonly.mraof", 0)
 ```
 
-- [ ] **Step 2: Run writer tests and verify RED**
+**Recorded activity 2 — Verification intent: writer tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_aof_writer.py`.
 
-```bash
-uv run pytest -q tests/unit/persistence/test_aof_writer.py
-```
+Historical expected evidence: missing rewrite API and file operations.
 
-Expected: missing rewrite API and file operations.
+**Recorded activity 3 — Extend file operations**
 
-- [ ] **Step 3: Extend file operations**
-
-Add protocol and POSIX methods:
+The recorded scope added protocol and POSIX methods:
 
 ```python
 def open_rewrite(self, path: Path) -> int:
@@ -358,9 +309,9 @@ def unlink(self, path: Path) -> None:
 Tests implement the same protocol and inject gates/errors without monkeypatching
 writer internals.
 
-- [ ] **Step 4: Define rewrite outcomes and state**
+**Recorded activity 4 — Define rewrite outcomes and state**
 
-Add:
+The recorded scope added:
 
 ```python
 aof_rewrite_delta_limit_bytes: int = 8 * 1024 * 1024
@@ -398,7 +349,7 @@ self._path.with_name(
 before returning the shieldable completion future. A second call returns an
 already-set `AofRewriteBusy`.
 
-- [ ] **Step 5: Write base in the background**
+**Recorded activity 5 — Test intent: base in the background**
 
 The owned task:
 
@@ -411,7 +362,7 @@ It does not fsync or rename; finalization owns those ordered steps. On pre-fd
 failure it settles `AofRewriteFailed`. On cancellation/abort it closes any fd
 and unlinks the temp after the thread call returns.
 
-- [ ] **Step 6: Capture bounded delta after authoritative append**
+**Recorded activity 6 — Capture bounded delta after authoritative append**
 
 After each `_AppendWork` completes its required old-AOF write/fsync and before
 settling `AofAppendOk`, append its already encoded record to active rewrite
@@ -422,29 +373,17 @@ delta. If the new total exceeds `aof_rewrite_delta_limit_bytes`:
 - keep the ordinary append successful;
 - let base completion perform fd/temp cleanup instead of finalization.
 
-- [ ] **Step 7: Run writer tests and commit**
+**Recorded activity 7 — Verification intent: writer tests and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_aof_writer.py`.
 
-```bash
-uv run pytest -q tests/unit/persistence/test_aof_writer.py
-```
+Historical expected evidence: registration, delta, Busy, overflow, and base failure cases pass.
 
-Expected: registration, delta, Busy, overflow, and base failure cases pass.
+### Milestone 4: Ordered finalization and failure boundary
 
-Commit:
+**Recorded activity 1 — Design outcome: failing finalization failure-injection tests**
 
-```bash
-git add src/miniredis/config.py src/miniredis/persistence/aof.py \
-  tests/unit/persistence/test_aof_writer.py
-git commit -m "feat: capture bounded online AOF rewrite deltas"
-```
-
-### Task 4: Ordered finalization and failure boundary
-
-- [ ] **Step 1: Add failing finalization failure-injection tests**
-
-Test:
+Historical test coverage included:
 
 - temp write failure leaves old AOF writable;
 - temp fsync failure leaves old path;
@@ -453,7 +392,7 @@ Test:
 - parent-directory fsync failure after rename is terminal;
 - later append work uses the new fd after success.
 
-Use operation classes with one explicit failure flag per syscall:
+The design used operation classes with one explicit failure flag per syscall:
 
 ```python
 class RewriteFailureOps(PosixAofFileOps):
@@ -462,17 +401,13 @@ class RewriteFailureOps(PosixAofFileOps):
     fail_parent_fsync = False
 ```
 
-- [ ] **Step 2: Run finalization tests and verify RED**
+**Recorded activity 2 — Verification intent: finalization tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_aof_writer.py`.
 
-```bash
-uv run pytest -q tests/unit/persistence/test_aof_writer.py -k rewrite
-```
+Historical expected evidence: rewrite never atomically switches files.
 
-Expected: rewrite never atomically switches files.
-
-- [ ] **Step 3: Implement `_FinalizeRewrite` in writer queue order**
+**Recorded activity 3 — Design outcome: `_FinalizeRewrite` in writer queue order**
 
 For the matching active generation:
 
@@ -496,7 +431,7 @@ rewrite as Failed, and continue writer service. After successful rename, any
 failure is passed to `_record_failure`, fails queued appends, and makes the
 runtime terminal; never resume writes through `old_fd`.
 
-- [ ] **Step 4: Account for owned tasks and close modes**
+**Recorded activity 4 — Account for owned tasks and close modes**
 
 `owned_task_count` includes the rewrite base task.
 
@@ -506,33 +441,17 @@ unfinalized rewrite aborted, waits only for thread ownership cleanup, deletes
 the temp, and closes the current authoritative fd without an extra configured
 fsync. If rename already succeeded, it closes the installed fd.
 
-- [ ] **Step 5: Run writer and shutdown tests and commit**
+**Recorded activity 5 — Verification intent: writer and shutdown tests and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_aof_writer.py`, `tests/reliability/test_reliability_shutdown.py`, `tests/reliability/test_worker_failure.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/persistence/test_aof_writer.py \
-  tests/reliability/test_reliability_shutdown.py \
-  tests/reliability/test_worker_failure.py
-```
+Historical expected evidence: PASS and zero writer-owned tasks after every close path.
 
-Expected: PASS and zero writer-owned tasks after every close path.
+### Milestone 5: Race-free runtime API and end-to-end rewrite
 
-Commit:
+**Recorded activity 1 — Design outcome: failing end-to-end reliability tests**
 
-```bash
-git add src/miniredis/persistence/aof.py tests/unit/persistence \
-  tests/reliability/test_reliability_shutdown.py \
-  tests/reliability/test_worker_failure.py
-git commit -m "feat: atomically finalize AOF rewrites"
-```
-
-### Task 5: Race-free runtime API and end-to-end rewrite
-
-- [ ] **Step 1: Add failing end-to-end reliability tests**
-
-Create `tests/reliability/test_aof_rewrite.py` covering:
+The recorded scope added `tests/reliability/test_aof_rewrite.py` covering:
 
 ```python
 @pytest.mark.asyncio
@@ -560,21 +479,17 @@ async def test_write_during_paused_base_survives_rewrite_and_restart(tmp_path):
     await recovered.close()
 ```
 
-Add Busy, no-AOF Failed, delta overflow, combined snapshot precedence,
+The recorded scope added Busy, no-AOF Failed, delta overflow, combined snapshot precedence,
 graceful close, simulated crash before rename, successful compacted record
 count, and no capture gap.
 
-- [ ] **Step 2: Run reliability tests and verify RED**
+**Recorded activity 2 — Verification intent: reliability tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/reliability/test_aof_rewrite.py`.
 
-```bash
-uv run pytest -q tests/reliability/test_aof_rewrite.py
-```
+Historical expected evidence: runtime has no rewrite method or executor control.
 
-Expected: runtime has no rewrite method or executor control.
-
-- [ ] **Step 3: Add `BeginAofRewrite` executor control**
+**Recorded activity 3 — Design outcome: `BeginAofRewrite` executor control**
 
 Define:
 
@@ -596,9 +511,9 @@ Bridge the job result to the message future with an executor-owned callback or
 small supervised task. Crucially, registration occurs before the handler
 returns to the mailbox.
 
-- [ ] **Step 4: Expose runtime API, hooks, and stats**
+**Recorded activity 4 — Expose runtime API, hooks, and stats**
 
-Add:
+The recorded scope added:
 
 ```python
 async def rewrite_aof(self) -> AofRewriteOutcome:
@@ -609,10 +524,10 @@ async def rewrite_aof(self) -> AofRewriteOutcome:
     return await self.executor.begin_aof_rewrite()
 ```
 
-Wire writer callback after AOF startup and before executor start. Add test
+The recorded integration wired writer callback after AOF startup and before executor start. Add test
 hooks for rewrite file ops/gates.
 
-Extend stats with:
+The recorded change extended stats with:
 
 ```python
 aof_rewrite_active: bool
@@ -620,52 +535,27 @@ aof_rewrite_delta_bytes: int
 aof_rewrite_checkpoint_seq: int | None
 ```
 
-- [ ] **Step 5: Run AOF/restart/lifecycle matrix**
+**Recorded activity 5 — Verification intent: AOF/restart/lifecycle matrix**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/reliability/test_aof_rewrite.py`, `tests/reliability/test_restart.py`, `tests/reliability/test_reliability_shutdown.py`, `tests/unit/persistence`.
 
-```bash
-uv run pytest -q \
-  tests/reliability/test_aof_rewrite.py \
-  tests/reliability/test_restart.py \
-  tests/reliability/test_reliability_shutdown.py \
-  tests/unit/persistence
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+**Recorded activity 6 — Commit runtime rewrite API**
 
-- [ ] **Step 6: Commit runtime rewrite API**
+### Milestone 6: Phase D documentation and acceptance
 
-```bash
-git add src/miniredis/core/executor.py src/miniredis/runtime.py \
-  tests/helpers/runtime.py tests/reliability tests/unit/persistence
-git commit -m "feat: expose race-free online AOF rewrite"
-```
+**Recorded activity 1 — Update README and behavior matrix**
 
-### Task 6: Phase D documentation and acceptance
-
-- [ ] **Step 1: Update README and behavior matrix**
-
-Document state-base format, legacy compatibility, rewrite delta bound,
+Historical documentation covered state-base format, legacy compatibility, rewrite delta bound,
 non-terminal pre-rename failure, terminal post-rename ambiguity, snapshot
 baseline selection, and manual `rewrite_aof()` API. Remove AOF rewrite from
 non-goals; retain real Redis AOF/RDB compatibility as non-goals.
 
-- [ ] **Step 2: Run complete verification**
+**Recorded activity 2 — Verification intent: complete verification**
 
-Run:
+Historical verification covered targeted or full test coverage, static analysis, diff hygiene.
 
-```bash
-uv run ruff check .
-uv run pytest -q
-git diff --check
-```
+Historical expected evidence: all checks pass.
 
-Expected: all checks pass.
-
-- [ ] **Step 3: Commit Phase D acceptance**
-
-```bash
-git add README.md docs/behavior-matrix.md
-git commit -m "docs: accept online AOF rewrite phase"
-```
+**Recorded activity 3 — Recorded Phase D acceptance**

@@ -1,11 +1,6 @@
-# Phase C Deterministic LFU Implementation Plan
+# Phase C Deterministic LFU Design and Implementation History
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> `superpowers:executing-plans` to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking. The user selected inline execution;
-> do not dispatch subagents.
-
-**Goal:** Add deterministic, decaying allkeys-LFU eviction without persisting
+**Historical objective:** Add deterministic, decaying allkeys-LFU eviction without persisting
 or replicating operational access metadata.
 
 **Architecture:** Database entries own volatile frequency and decay-anchor
@@ -21,29 +16,29 @@ pytest-asyncio.
 
 ## File map
 
-- Modify `src/miniredis/config.py`: LFU policy and decay interval validation.
-- Create `src/miniredis/core/frequency.py`: pure decay projection.
-- Modify `src/miniredis/core/database.py`: LFU metadata, client-write
+- Changed `src/miniredis/config.py`: LFU policy and decay interval validation.
+- Added `src/miniredis/core/frequency.py`: pure decay projection.
+- Changed `src/miniredis/core/database.py`: LFU metadata, client-write
   preservation, read touches, recovery neutrality, and transaction fork
   support.
-- Modify `src/miniredis/core/executor.py`: pass clock/interval and count
+- Changed `src/miniredis/core/executor.py`: pass clock/interval and count
   expiry/eviction operations.
-- Modify `src/miniredis/core/eviction.py`: deterministic LFU candidate order.
-- Modify `src/miniredis/runtime.py`: LFU and eviction statistics.
-- Modify `tests/unit/core/test_domain_types.py`.
-- Create `tests/unit/core/test_frequency.py`.
-- Modify `tests/contract/test_eviction.py`.
-- Modify `tests/unit/persistence/test_codec.py`.
-- Modify `tests/reliability/test_restart.py`.
-- Modify `tests/replication/test_sink_attach.py`.
-- Modify `tests/mechanisms/test_transactions.py`.
-- Modify `docs/behavior-matrix.md` and `README.md`.
+- Changed `src/miniredis/core/eviction.py`: deterministic LFU candidate order.
+- Changed `src/miniredis/runtime.py`: LFU and eviction statistics.
+- Changed `tests/unit/core/test_domain_types.py`.
+- Added `tests/unit/core/test_frequency.py`.
+- Changed `tests/contract/test_eviction.py`.
+- Changed `tests/unit/persistence/test_codec.py`.
+- Changed `tests/reliability/test_restart.py`.
+- Changed `tests/replication/test_sink_attach.py`.
+- Changed `tests/mechanisms/test_transactions.py`.
+- Changed `docs/behavior-matrix.md` and `README.md`.
 
-### Task 1: Configuration and pure decay projection
+### Milestone 1: Configuration and pure decay projection
 
-- [ ] **Step 1: Add failing configuration and projection tests**
+**Recorded activity 1 — Design outcome: failing configuration and projection tests**
 
-Create `tests/unit/core/test_frequency.py`:
+The recorded scope added `tests/unit/core/test_frequency.py`:
 
 ```python
 @pytest.mark.parametrize(
@@ -63,7 +58,7 @@ def test_project_frequency_decay(
     ) == expected
 ```
 
-Extend config tests:
+The recorded change extended config tests:
 
 ```python
 assert MiniRedisConfig(eviction_policy="allkeys-lfu").eviction_policy == "allkeys-lfu"
@@ -71,21 +66,15 @@ with pytest.raises(ValueError, match="lfu_decay_interval_ms"):
     MiniRedisConfig(lfu_decay_interval_ms=0)
 ```
 
-- [ ] **Step 2: Run focused tests and verify RED**
+**Recorded activity 2 — Verification intent: focused tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/core/test_frequency.py`, `tests/test_project_contract.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/core/test_frequency.py \
-  tests/test_project_contract.py
-```
+Historical expected evidence: missing module and rejected LFU policy.
 
-Expected: missing module and rejected LFU policy.
+**Recorded activity 3 — Design outcome: the pure helper and config**
 
-- [ ] **Step 3: Implement the pure helper and config**
-
-Create:
+The recorded scope added:
 
 ```python
 def project_frequency(
@@ -106,10 +95,10 @@ def project_frequency(
     return frequency // (2**windows), last_decay_ms + windows * interval_ms
 ```
 
-Use a shift or early-zero branch if necessary to avoid constructing an
+The design used a shift or early-zero branch if necessary to avoid constructing an
 unbounded `2**windows`; behavior must remain identical.
 
-Update:
+The recorded change updated:
 
 ```python
 EvictionPolicy = Literal["noeviction", "allkeys-lru", "allkeys-lfu"]
@@ -118,29 +107,17 @@ lfu_decay_interval_ms: int = 60_000
 
 and validate it as positive.
 
-- [ ] **Step 4: Run and commit**
+**Recorded activity 4 — Verification intent: and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/core/test_frequency.py`, `tests/test_project_contract.py`.
 
-```bash
-uv run pytest -q tests/unit/core/test_frequency.py tests/test_project_contract.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 2: Volatile LFU metadata and touch semantics
 
-Commit:
+**Recorded activity 1 — Design outcome: failing Database metadata tests**
 
-```bash
-git add src/miniredis/config.py src/miniredis/core/frequency.py \
-  tests/unit/core/test_frequency.py tests/test_project_contract.py
-git commit -m "feat: define deterministic LFU decay"
-```
-
-### Task 2: Volatile LFU metadata and touch semantics
-
-- [ ] **Step 1: Add failing Database metadata tests**
-
-Add:
+The recorded scope added:
 
 ```python
 def test_client_updates_preserve_decay_and_increment_frequency():
@@ -176,26 +153,22 @@ def test_recovery_and_replica_puts_start_neutral():
 
 Also verify `Database.fork()` from Phase B copies LFU metadata independently.
 
-- [ ] **Step 2: Run Database tests and verify RED**
+**Recorded activity 2 — Verification intent: Database tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/core/test_domain_types.py`.
 
-```bash
-uv run pytest -q tests/unit/core/test_domain_types.py
-```
+Historical expected evidence: `Entry` has no LFU fields and `apply_batch` rejects new keywords.
 
-Expected: `Entry` has no LFU fields and `apply_batch` rejects new keywords.
+**Recorded activity 3 — Design outcome: metadata and materialized touches**
 
-- [ ] **Step 3: Add metadata and materialized touches**
-
-Extend `Entry`:
+The recorded change extended `Entry`:
 
 ```python
 frequency: int
 last_frequency_decay_ms: int
 ```
 
-Extend `Database.apply_batch`:
+The recorded change extended `Database.apply_batch`:
 
 ```python
 def apply_batch(
@@ -217,7 +190,7 @@ For each `PutEntry`, inspect the previous staged entry. If `track_access`:
 If not `track_access`, assign neutral frequency/access metadata. Snapshot
 installation also assigns neutral metadata anchored at `now_ms`.
 
-Update:
+The recorded change updated:
 
 ```python
 def touch_if_live(
@@ -231,11 +204,11 @@ def touch_if_live(
 It projects decay, increments frequency, advances access tick, and mutates
 only a live entry.
 
-Update `fork()` to copy both fields.
+The recorded change updated `fork()` to copy both fields.
 
-- [ ] **Step 4: Pass access context from executor**
+**Recorded activity 4 — Pass access context from executor**
 
-Add `lfu_decay_interval_ms` to `CommandExecutor.__init__`. Pass config from
+The recorded scope added `lfu_decay_interval_ms` to `CommandExecutor.__init__`. Pass config from
 runtime. In `_commit_prepared`:
 
 ```python
@@ -250,34 +223,19 @@ self.database.apply_batch(
 Pass the same interval to all `touch_if_live` calls. Replica application
 continues with `track_access=False`.
 
-- [ ] **Step 5: Run core, transaction, recovery, and replica tests**
+**Recorded activity 5 — Verification intent: core, transaction, recovery, and replica tests**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/core`, `tests/mechanisms/test_transactions.py`, `tests/reliability/test_restart.py`, `tests/replication/test_sink_attach.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/core \
-  tests/mechanisms/test_transactions.py \
-  tests/reliability/test_restart.py \
-  tests/replication/test_sink_attach.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+**Recorded activity 6 — Commit metadata support**
 
-- [ ] **Step 6: Commit metadata support**
+### Milestone 3: Read-only LFU eviction planning
 
-```bash
-git add src/miniredis/core/database.py src/miniredis/core/executor.py \
-  src/miniredis/runtime.py tests/unit/core tests/mechanisms \
-  tests/reliability tests/replication
-git commit -m "feat: track volatile LFU access metadata"
-```
+**Recorded activity 1 — Design outcome: failing LFU contract tests**
 
-### Task 3: Read-only LFU eviction planning
-
-- [ ] **Step 1: Add failing LFU contract tests**
-
-Add tests using `FakeClock`:
+The recorded scope added tests using `FakeClock`:
 
 ```python
 @pytest.mark.asyncio
@@ -301,23 +259,19 @@ async def test_lfu_evicts_lowest_effective_frequency():
         assert await c.execute(CommandRequest(b"GET", (b"hot",))) == Bytes(b"x")
 ```
 
-Add tests for multi-window decay, access-tick tie-break, binary-key tie-break,
+The recorded scope added tests for multi-window decay, access-tick tie-break, binary-key tie-break,
 expired-first behavior, target exclusion, and no mutation during
 `enforce_memory`.
 
-- [ ] **Step 2: Run LFU contracts and verify RED**
+**Recorded activity 2 — Verification intent: LFU contracts and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/contract/test_eviction.py`.
 
-```bash
-uv run pytest -q tests/contract/test_eviction.py
-```
+Historical expected evidence: LFU currently falls through LRU ordering.
 
-Expected: LFU currently falls through LRU ordering.
+**Recorded activity 3 — Design outcome: pure candidate ordering**
 
-- [ ] **Step 3: Implement pure candidate ordering**
-
-Add:
+The recorded scope added:
 
 ```python
 def _lfu_candidates(
@@ -348,7 +302,7 @@ keys from the selected ordering and preserve the existing same-commit eviction
 operations. Never call `touch_if_live` or update a decay anchor while
 planning.
 
-- [ ] **Step 4: Add eviction/expiry counters**
+**Recorded activity 4 — Design outcome: eviction/expiry counters**
 
 In `_commit_prepared`, count `DeleteKey` reasons after a successful database
 apply:
@@ -364,7 +318,7 @@ self.evicted_key_count += sum(
 )
 ```
 
-Expose them through `RuntimeStats` without changing state.
+The interface exposed them through `RuntimeStats` without changing state.
 
 Also expose:
 
@@ -378,34 +332,19 @@ evicted_key_count: int
 `key_count` is physical live-table size at inspection time; diagnostics do not
 run lazy expiry or touch access metadata.
 
-- [ ] **Step 5: Run eviction and memory regressions**
+**Recorded activity 5 — Verification intent: eviction and memory regressions**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/contract/test_eviction.py`, `tests/contract/test_ttl.py`, `tests/reliability/test_phase3_invariants.py`, `tests/mechanisms/test_transactions.py`.
 
-```bash
-uv run pytest -q \
-  tests/contract/test_eviction.py \
-  tests/contract/test_ttl.py \
-  tests/reliability/test_phase3_invariants.py \
-  tests/mechanisms/test_transactions.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+**Recorded activity 6 — Commit LFU policy**
 
-- [ ] **Step 6: Commit LFU policy**
+### Milestone 4: Persistence neutrality and Phase C acceptance
 
-```bash
-git add src/miniredis/core/eviction.py src/miniredis/core/executor.py \
-  src/miniredis/runtime.py tests/contract/test_eviction.py \
-  tests/reliability tests/mechanisms
-git commit -m "feat: evict with deterministic decaying LFU"
-```
+**Recorded activity 1 — Design outcome: failing restart and full-sync neutrality tests**
 
-### Task 4: Persistence neutrality and Phase C acceptance
-
-- [ ] **Step 1: Add failing restart and full-sync neutrality tests**
-
-Write frequency up through repeated GETs, save/restart or full-sync, and assert
+Historical test and implementation coverage included frequency up through repeated GETs, save/restart or full-sync, and assert
 the recovered entry has:
 
 ```python
@@ -416,23 +355,16 @@ assert recovered.database.entries[b"k"].last_access_tick == 0
 Also assert encoded `StoredEntry` and AOF/snapshot payloads do not gain LFU
 fields.
 
-- [ ] **Step 2: Run reliability tests**
+**Recorded activity 2 — Verification intent: reliability tests**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/persistence/test_codec.py`, `tests/reliability/test_restart.py`, `tests/replication/test_sink_attach.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/persistence/test_codec.py \
-  tests/reliability/test_restart.py \
-  tests/replication/test_sink_attach.py
-```
-
-Expected: PASS after Task 2; failures indicate accidental metadata
+Historical expected evidence: PASS after Milestone 2; failures indicate accidental metadata
 persistence.
 
-- [ ] **Step 3: Update documentation**
+**Recorded activity 3 — Update documentation**
 
-Document:
+Historical documentation covered:
 
 - deterministic halving by injected time;
 - successful read/client-write touch rules;
@@ -440,21 +372,10 @@ Document:
 - metadata reset on restart/full sync;
 - intentional difference from production Redis's probabilistic counter.
 
-- [ ] **Step 4: Run complete verification**
+**Recorded activity 4 — Verification intent: complete verification**
 
-Run:
+Historical verification covered targeted or full test coverage, static analysis, diff hygiene.
 
-```bash
-uv run ruff check .
-uv run pytest -q
-git diff --check
-```
+Historical expected evidence: all checks pass.
 
-Expected: all checks pass.
-
-- [ ] **Step 5: Commit Phase C acceptance**
-
-```bash
-git add tests README.md docs/behavior-matrix.md
-git commit -m "docs: accept deterministic LFU phase"
-```
+**Recorded activity 5 — Recorded Phase C acceptance**

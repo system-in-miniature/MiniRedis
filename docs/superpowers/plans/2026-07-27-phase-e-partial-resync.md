@@ -1,11 +1,6 @@
-# Phase E Replication Backlog and Partial Resync Implementation Plan
+# Phase E Replication Backlog and Partial Resync Design and Implementation History
 
-> **For agentic workers:** REQUIRED SUB-SKILL: Use
-> `superpowers:executing-plans` to implement this plan task-by-task. Steps use
-> checkbox (`- [ ]`) syntax for tracking. The user selected inline execution;
-> do not dispatch subagents.
-
-**Goal:** Add logical replication identity, a bounded CommitBatch backlog,
+**Historical objective:** Add logical replication identity, a bounded CommitBatch backlog,
 manual partial resync, full-sync fallback, and promotion fencing without
 adding network replication or automatic distributed-system machinery.
 
@@ -22,32 +17,32 @@ pytest deterministic gates.
 
 ## File map
 
-- Modify `src/miniredis/config.py`: positive backlog capacity.
-- Create `src/miniredis/replication/backlog.py`: replication identity, cursor,
+- Changed `src/miniredis/config.py`: positive backlog capacity.
+- Added `src/miniredis/replication/backlog.py`: replication identity, cursor,
   backlog, coverage, and attachment types.
-- Modify `src/miniredis/replication/sink.py`: retained cursor, full/partial
+- Changed `src/miniredis/replication/sink.py`: retained cursor, full/partial
   attachment, ordered catch-up, reattachment, status, and promotion identity.
-- Modify `src/miniredis/core/executor.py`: history ownership, backlog insert,
+- Changed `src/miniredis/core/executor.py`: history ownership, backlog insert,
   attach decision, replica source preparation, promotion fencing, and stats.
-- Modify `src/miniredis/runtime.py`: identity generation/injection, reattach
+- Changed `src/miniredis/runtime.py`: identity generation/injection, reattach
   API ownership, and runtime stats.
-- Modify `tests/helpers/runtime.py`: deterministic replication ID hook.
-- Create `tests/unit/replication/test_backlog.py`.
-- Modify `tests/replication/test_sink_attach.py`.
-- Modify `tests/replication/test_sink_overflow.py`.
-- Modify `tests/replication/test_sink_lag.py`.
-- Modify `tests/replication/test_promotion.py`.
-- Create `tests/replication/test_partial_resync.py`.
-- Modify `tests/reliability/test_lost_acked_write.py`.
-- Modify `tests/reliability/test_restart.py`.
-- Modify `tests/reliability/test_reliability_shutdown.py`.
-- Modify `docs/behavior-matrix.md` and `README.md`.
+- Changed `tests/helpers/runtime.py`: deterministic replication ID hook.
+- Added `tests/unit/replication/test_backlog.py`.
+- Changed `tests/replication/test_sink_attach.py`.
+- Changed `tests/replication/test_sink_overflow.py`.
+- Changed `tests/replication/test_sink_lag.py`.
+- Changed `tests/replication/test_promotion.py`.
+- Added `tests/replication/test_partial_resync.py`.
+- Changed `tests/reliability/test_lost_acked_write.py`.
+- Changed `tests/reliability/test_restart.py`.
+- Changed `tests/reliability/test_reliability_shutdown.py`.
+- Changed `docs/behavior-matrix.md` and `README.md`.
 
-### Task 1: Replication identity and bounded backlog
+### Milestone 1: Replication identity and bounded backlog
 
-- [ ] **Step 1: Add failing pure backlog tests**
+**Recorded activity 1 — Design outcome: failing pure backlog tests**
 
-Create `tests/unit/replication/test_backlog.py`:
+The recorded scope added `tests/unit/replication/test_backlog.py`:
 
 ```python
 from tests.unit.persistence.test_framing import batch
@@ -73,21 +68,17 @@ def test_backlog_distinguishes_current_empty_range_from_gap():
     assert backlog.missing_after(6, current_seq=5) is None
 ```
 
-Test non-contiguous append rejection and clear.
+Historical test coverage included non-contiguous append rejection and clear.
 
-- [ ] **Step 2: Run unit tests and verify RED**
+**Recorded activity 2 — Verification intent: unit tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/replication/test_backlog.py`.
 
-```bash
-uv run pytest -q tests/unit/replication/test_backlog.py
-```
+Historical expected evidence: replication backlog module is missing.
 
-Expected: replication backlog module is missing.
+**Recorded activity 3 — Design outcome: pure replication types**
 
-- [ ] **Step 3: Implement pure replication types**
-
-Create:
+The recorded scope added:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -126,11 +117,11 @@ class ReplicationBacklog:
         return selected
 ```
 
-Expose read-only oldest/newest/count and `clear`.
+The interface exposed read-only oldest/newest/count and `clear`.
 
-- [ ] **Step 4: Add config and run tests**
+**Recorded activity 4 — Design outcome: config and run tests**
 
-Add:
+The recorded scope added:
 
 ```python
 replication_backlog_batches: int = 1024
@@ -138,27 +129,13 @@ replication_backlog_batches: int = 1024
 
 and positive validation. Retain existing `replica_queue_limit` unchanged.
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/replication/test_backlog.py`, `tests/test_project_contract.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/replication/test_backlog.py \
-  tests/test_project_contract.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 2: Executor history ownership and attachment decision
 
-- [ ] **Step 5: Commit**
-
-```bash
-git add src/miniredis/config.py src/miniredis/replication/backlog.py \
-  tests/unit/replication/test_backlog.py tests/test_project_contract.py
-git commit -m "feat: add bounded logical replication backlog"
-```
-
-### Task 2: Executor history ownership and attachment decision
-
-- [ ] **Step 1: Add failing attachment-decision tests**
+**Recorded activity 1 — Design outcome: failing attachment-decision tests**
 
 Define attachment assertions:
 
@@ -173,24 +150,18 @@ assert tuple(batch.seq for batch in resumed.batches) == (2, 3)
 assert resumed.boundary_seq == 3
 ```
 
-Test matching current cursor gives an empty partial attachment; identity
+Historical test coverage included matching current cursor gives an empty partial attachment; identity
 mismatch, future cursor, and backlog gap give full attachment.
 
-- [ ] **Step 2: Run attachment tests and verify RED**
+**Recorded activity 2 — Verification intent: attachment tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_sink_attach.py`, `tests/replication/test_partial_resync.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication/test_sink_attach.py \
-  tests/replication/test_partial_resync.py
-```
+Historical expected evidence: only full `ReplicaAttachment` exists.
 
-Expected: only full `ReplicaAttachment` exists.
+**Recorded activity 3 — Define full and partial attachment types**
 
-- [ ] **Step 3: Define full and partial attachment types**
-
-Add:
+The recorded scope added:
 
 ```python
 @dataclass(frozen=True, slots=True)
@@ -212,9 +183,9 @@ class PartialSyncAttachment:
 ReplicaAttachment = FullSyncAttachment | PartialSyncAttachment
 ```
 
-- [ ] **Step 4: Own identity and backlog in executor**
+**Recorded activity 4 — Own identity and backlog in executor**
 
-Add constructor arguments:
+The recorded scope added constructor arguments:
 
 ```python
 replication_id: str
@@ -233,8 +204,8 @@ self._offer_replica_batch(batch)
 Recovered history starts with an empty backlog and a new ID even if
 `database.commit_seq > 0`.
 
-Wire identity construction through runtime now, before sink resume tests.
-Extend `_RuntimeTestHooks` and `open_test_runtime` with:
+The recorded integration wired identity construction through runtime now, before sink resume tests.
+The recorded change extended `_RuntimeTestHooks` and `open_test_runtime` with:
 
 ```python
 replication_id_factory: Callable[[], str] | None = None
@@ -250,9 +221,9 @@ def new_replication_id() -> str:
 The executor calls it once for initial history and retains the callable for
 promotion.
 
-- [ ] **Step 5: Decide attachment in one executor turn**
+**Recorded activity 5 — Decide attachment in one executor turn**
 
-Extend `AttachReplica` with `cursor: ReplicationCursor | None`. In its handler:
+The recorded change extended `AttachReplica` with `cursor: ReplicationCursor | None`. In its handler:
 
 ```python
 generation = self._allocate_replica_generation()
@@ -288,33 +259,17 @@ self._replica_sinks[generation] = message.sink
 Registration precedes returning to the mailbox, so later batches enter the
 same sink's live queue.
 
-- [ ] **Step 6: Run executor/full-sync regressions and commit**
+**Recorded activity 6 — Verification intent: executor/full-sync regressions and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/unit/replication/test_backlog.py`, `tests/replication/test_sink_attach.py`, `tests/replication/test_sink_lag.py`.
 
-```bash
-uv run pytest -q \
-  tests/unit/replication/test_backlog.py \
-  tests/replication/test_sink_attach.py \
-  tests/replication/test_sink_lag.py
-```
+Historical expected evidence: existing full sync remains green and decision tests pass.
 
-Expected: existing full sync remains green and decision tests pass.
+### Milestone 3: Replica cursor and ordered partial catch-up
 
-Commit:
+**Recorded activity 1 — Design outcome: failing short-disconnect and concurrent-write tests**
 
-```bash
-git add src/miniredis/core/executor.py src/miniredis/runtime.py \
-  src/miniredis/replication/backlog.py \
-  src/miniredis/replication/sink.py tests/helpers/runtime.py tests/replication
-git commit -m "feat: choose full or partial replica attachment"
-```
-
-### Task 3: Replica cursor and ordered partial catch-up
-
-- [ ] **Step 1: Add failing short-disconnect and concurrent-write tests**
-
-Create cases:
+The recorded scope added cases:
 
 ```python
 @pytest.mark.asyncio
@@ -339,17 +294,13 @@ async def test_short_disconnect_resumes_only_missing_batches():
 Pause partial installation, write again on Primary, then prove captured backlog
 is applied before the live queue with contiguous sequence.
 
-- [ ] **Step 2: Run partial tests and verify RED**
+**Recorded activity 2 — Verification intent: partial tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_partial_resync.py`.
 
-```bash
-uv run pytest -q tests/replication/test_partial_resync.py
-```
+Historical expected evidence: sink cannot reconnect and always installs a snapshot.
 
-Expected: sink cannot reconnect and always installs a snapshot.
-
-- [ ] **Step 3: Retain cursor and add source preparation control**
+**Recorded activity 3 — Retain cursor and add source preparation control**
 
 `ReplicaSink` retains:
 
@@ -364,12 +315,12 @@ self._applied_seq: int
 self._sync_mode: ReplicaSyncMode | None
 ```
 
-Add `CATCHING_UP = "catching_up"` to the existing `ReplicaSinkState` enum.
+The recorded scope added `CATCHING_UP = "catching_up"` to the existing `ReplicaSinkState` enum.
 
 Its cursor property returns `None` until a full image is installed, then
 returns the last completely applied pair.
 
-Add a Replica executor control:
+The recorded scope added a Replica executor control:
 
 ```python
 @dataclass(slots=True)
@@ -387,7 +338,7 @@ clearing data.
 
 Full snapshot installation records both generation and source ID.
 
-- [ ] **Step 4: Implement one connect path for full and partial**
+**Recorded activity 4 — Design outcome: one connect path for full and partial**
 
 Allow `attach` from `DETACHED`, `NEEDS_RESYNC`, or `SOURCE_LOST`. Pass the
 retained cursor to Primary.
@@ -409,9 +360,9 @@ For partial attachment:
 Every apply requires exactly `applied_seq + 1`. A duplicate or gap moves the
 sink to `NEEDS_RESYNC` and detaches it.
 
-- [ ] **Step 5: Preserve cursor on disconnect/overflow/source loss**
+**Recorded activity 5 — Preserve cursor on disconnect/overflow/source loss**
 
-Add manual:
+The recorded scope added manual:
 
 ```python
 async def disconnect(self) -> ReplicaStatus:
@@ -424,34 +375,19 @@ and preserves the last completed cursor.
 Overflow and source loss also preserve the cursor. They never advance
 `applied_seq` for a queued-but-unapplied batch.
 
-- [ ] **Step 6: Run partial, overflow, lag, and shutdown tests**
+**Recorded activity 6 — Verification intent: partial, overflow, lag, and shutdown tests**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_partial_resync.py`, `tests/replication/test_sink_overflow.py`, `tests/replication/test_sink_lag.py`, `tests/reliability/test_reliability_shutdown.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication/test_partial_resync.py \
-  tests/replication/test_sink_overflow.py \
-  tests/replication/test_sink_lag.py \
-  tests/reliability/test_reliability_shutdown.py
-```
+Historical expected evidence: PASS with no sink task leak.
 
-Expected: PASS with no sink task leak.
+**Recorded activity 7 — Commit partial catch-up**
 
-- [ ] **Step 7: Commit partial catch-up**
+### Milestone 4: Full-sync fallback, restart, and queue-overflow recovery
 
-```bash
-git add src/miniredis/core/executor.py \
-  src/miniredis/replication/backlog.py \
-  src/miniredis/replication/sink.py tests/replication tests/reliability
-git commit -m "feat: resume replicas from logical backlog"
-```
+**Recorded activity 1 — Design outcome: failing fallback matrix**
 
-### Task 4: Full-sync fallback, restart, and queue-overflow recovery
-
-- [ ] **Step 1: Add failing fallback matrix**
-
-Test:
+Historical test coverage included:
 
 - cursor exactly one before backlog oldest: partial succeeds;
 - cursor two before backlog oldest: full sync;
@@ -465,22 +401,15 @@ Test:
 Assert full sync replaces stale extra Replica keys while partial sync does not
 clear unrelated current state.
 
-- [ ] **Step 2: Run fallback tests and verify RED**
+**Recorded activity 2 — Verification intent: fallback tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_partial_resync.py`, `tests/replication/test_sink_overflow.py`, `tests/reliability/test_restart.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication/test_partial_resync.py \
-  tests/replication/test_sink_overflow.py \
-  tests/reliability/test_restart.py
-```
+Historical expected evidence: boundary or restart cases fail until all cursor paths are wired.
 
-Expected: boundary or restart cases fail until all cursor paths are wired.
+**Recorded activity 3 — Inject deterministic Primary IDs in tests**
 
-- [ ] **Step 3: Inject deterministic Primary IDs in tests**
-
-Extend `_RuntimeTestHooks`:
+The recorded change extended `_RuntimeTestHooks`:
 
 ```python
 replication_id_factory: Callable[[], str] | None = None
@@ -492,7 +421,7 @@ Runtime production construction uses:
 lambda: uuid.uuid4().hex
 ```
 
-Use the factory hook introduced in Task 2. Test construction passes a
+The design used the factory hook introduced in Milestone 2. Test construction passes a
 deterministic iterator-backed callable:
 
 ```python
@@ -505,9 +434,9 @@ def factory() -> str:
 Pass that same factory into executor so initial startup and later promotion
 consume distinct deterministic IDs without hardcoding global state.
 
-- [ ] **Step 4: Complete coverage and fallback behavior**
+**Recorded activity 4 — Complete coverage and fallback behavior**
 
-Make `ReplicationBacklog.missing_after` the only coverage decision. Do not
+The design made `ReplicationBacklog.missing_after` the only coverage decision. Do not
 infer coverage from Replica lag or queue size. A full attachment always
 captures the current `SnapshotImage`; later writes remain queued behind its
 boundary.
@@ -515,33 +444,17 @@ boundary.
 On full install, reset Replica operational LFU/LRU metadata as already defined
 by `Database.install_snapshot`.
 
-- [ ] **Step 5: Run fallback matrix and commit**
+**Recorded activity 5 — Verification intent: fallback matrix and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication`, `tests/reliability/test_restart.py`, `tests/reliability/test_reliability_shutdown.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication \
-  tests/reliability/test_restart.py \
-  tests/reliability/test_reliability_shutdown.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 5: Promotion fencing and preserved asynchronous loss
 
-Commit:
+**Recorded activity 1 — Design outcome: failing promotion-history tests**
 
-```bash
-git add src/miniredis/runtime.py src/miniredis/core/executor.py \
-  src/miniredis/replication tests/helpers/runtime.py \
-  tests/replication tests/reliability
-git commit -m "feat: fall back to full sync when history diverges"
-```
-
-### Task 5: Promotion fencing and preserved asynchronous loss
-
-- [ ] **Step 1: Add failing promotion-history tests**
-
-Extend promotion tests:
+The recorded change extended promotion tests:
 
 ```python
 old_id = sink.status.replication_id
@@ -551,22 +464,16 @@ assert promoted.debug_replication_backlog_count == 0
 ```
 
 Reconnect a Replica with the old ID and same visible state; assert full sync.
-Write after promotion and assert the new backlog begins at the next global
+Historical test and implementation coverage included after promotion and assert the new backlog begins at the next global
 sequence.
 
-- [ ] **Step 2: Run promotion tests and verify RED**
+**Recorded activity 2 — Verification intent: promotion tests and verify RED**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_promotion.py`, `tests/reliability/test_lost_acked_write.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication/test_promotion.py \
-  tests/reliability/test_lost_acked_write.py
-```
+Historical expected evidence: promotion has no history ID or backlog fencing.
 
-Expected: promotion has no history ID or backlog fencing.
-
-- [ ] **Step 3: Fence history on promotion**
+**Recorded activity 3 — Fence history on promotion**
 
 In the executor promotion control:
 
@@ -578,7 +485,7 @@ self.replication_id = self._replication_id_factory()
 self.replication_backlog.clear()
 ```
 
-Return:
+The interface returned:
 
 ```python
 PromotionResult(
@@ -588,9 +495,9 @@ PromotionResult(
 )
 ```
 
-Update sink state/status with the new ID.
+The recorded change updated sink state/status with the new ID.
 
-- [ ] **Step 4: Keep acknowledged-write loss test explicit**
+**Recorded activity 4 — Keep acknowledged-write loss test explicit**
 
 The test must still perform:
 
@@ -602,37 +509,19 @@ Replica manual promotion
 GET for the seq=N write returns null
 ```
 
-Do not auto-recover from a dead source or consult a quorum.
+The design did not auto-recover from a dead source or consult a quorum.
 
-- [ ] **Step 5: Run promotion/reliability suites and commit**
+**Recorded activity 5 — Verification intent: promotion/reliability suites and commit**
 
-Run:
+Historical verification covered targeted or full test coverage, including `tests/replication/test_promotion.py`, `tests/reliability/test_lost_acked_write.py`, `tests/reliability/test_final_acceptance.py`.
 
-```bash
-uv run pytest -q \
-  tests/replication/test_promotion.py \
-  tests/reliability/test_lost_acked_write.py \
-  tests/reliability/test_final_acceptance.py
-```
+Historical expected evidence: PASS.
 
-Expected: PASS.
+### Milestone 6: Observability, docs, and final acceptance
 
-Commit:
+**Recorded activity 1 — Extend status and runtime statistics**
 
-```bash
-git add src/miniredis/core/executor.py \
-  src/miniredis/replication/sink.py \
-  tests/replication/test_promotion.py \
-  tests/reliability/test_lost_acked_write.py \
-  tests/reliability/test_final_acceptance.py
-git commit -m "feat: fence replication history on promotion"
-```
-
-### Task 6: Observability, docs, and final acceptance
-
-- [ ] **Step 1: Extend status and runtime statistics**
-
-Expose read-only:
+The interface exposed read-only:
 
 ```python
 replication_id: str
@@ -644,12 +533,12 @@ full_sync_count: int
 partial_sync_count: int
 ```
 
-Extend `ReplicaStatus` with `replication_id`, `sync_mode`, and retained cursor.
+The recorded change extended `ReplicaStatus` with `replication_id`, `sync_mode`, and retained cursor.
 Stats inspection must not mutate backlog or Replica state.
 
-- [ ] **Step 2: Add final acceptance assertions**
+**Recorded activity 2 — Design outcome: final acceptance assertions**
 
-Extend final acceptance to prove:
+The recorded change extended final acceptance to prove:
 
 - adapter-free core contracts still pass;
 - short gap uses partial sync;
@@ -658,29 +547,17 @@ Extend final acceptance to prove:
 - asynchronous acknowledged loss still occurs;
 - shutdown leaves zero Replica/runtime owned tasks.
 
-- [ ] **Step 3: Update README and behavior matrix**
+**Recorded activity 3 — Update README and behavior matrix**
 
-Document logical batch offsets, manual reconnect, backlog capacity, full-sync
+Historical documentation covered logical batch offsets, manual reconnect, backlog capacity, full-sync
 fallback, new Primary ID on restart/promotion, and acknowledged-write loss.
 Remove partial resync from non-goals. Keep PSYNC wire compatibility,
 heartbeats, elections, Sentinel, Cluster, and WAIT explicitly excluded.
 
-- [ ] **Step 4: Run complete repository verification**
+**Recorded activity 4 — Verification intent: complete repository verification**
 
-Run:
+Historical verification covered targeted or full test coverage, static analysis, diff hygiene.
 
-```bash
-uv run ruff check .
-uv run pytest -q
-git diff --check
-```
+Historical expected evidence: all checks pass.
 
-Expected: all checks pass.
-
-- [ ] **Step 5: Commit final project acceptance**
-
-```bash
-git add src/miniredis/runtime.py src/miniredis/core/executor.py \
-  src/miniredis/replication tests README.md docs/behavior-matrix.md
-git commit -m "docs: accept advanced MiniRedis mechanisms"
-```
+**Recorded activity 5 — Commit final project acceptance**

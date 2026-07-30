@@ -1,3 +1,9 @@
+"""Represent request outcomes and bounded per-session outbound delivery.
+
+Replies and Pub/Sub pushes share an ordered outbox, mirroring Redis's need to
+preserve per-client output order while bounding slow-consumer memory.
+"""
+
 from __future__ import annotations
 
 import asyncio

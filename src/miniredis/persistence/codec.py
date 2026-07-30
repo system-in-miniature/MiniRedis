@@ -1,3 +1,5 @@
+"""Encode and validate custom snapshot, AOF-base, and commit-batch records."""
+
 from __future__ import annotations
 
 import base64

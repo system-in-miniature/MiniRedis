@@ -1,3 +1,5 @@
+"""Define the closed typed-command vocabulary accepted by core planning."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

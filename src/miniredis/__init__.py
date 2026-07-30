@@ -1,3 +1,5 @@
+"""Public Direct-first API for the MiniRedis teaching runtime."""
+
 from miniredis.adapters.direct import DirectPipeline
 from miniredis.commands.request import CommandRequest
 from miniredis.config import MiniRedisConfig

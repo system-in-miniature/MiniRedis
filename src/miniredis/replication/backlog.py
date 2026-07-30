@@ -1,3 +1,9 @@
+"""Retain bounded contiguous commit history for logical partial resynchronization.
+
+This models Redis's replication backlog at whole-batch granularity rather than
+as a byte ring carrying the PSYNC wire stream.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -74,6 +80,9 @@ class ReplicationBacklog:
         if applied_seq == current_seq:
             return ()
         expected = applied_seq + 1
+        # This is the logical-batch form of Redis PSYNC backlog coverage: a
+        # matching endpoint is insufficient unless every intervening unit is
+        # retained contiguously through the captured primary boundary.
         selected = tuple(
             batch for batch in self._batches if batch.seq >= expected
         )

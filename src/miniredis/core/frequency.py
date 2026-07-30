@@ -1,3 +1,9 @@
+"""Project deterministic LFU counters through elapsed decay windows.
+
+Redis uses an approximate logarithmic counter; MiniRedis uses exact halving so
+tests and lessons can predict the same victim every time.
+"""
+
 def project_frequency(
     frequency: int,
     last_decay_ms: int,

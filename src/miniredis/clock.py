@@ -1,3 +1,5 @@
+"""Abstract time and timer scheduling for deterministic expiry and blocking."""
+
 from __future__ import annotations
 
 import asyncio

@@ -1,3 +1,9 @@
+"""Append framed commit batches and compact them with online base-plus-delta rewrite.
+
+The design corresponds to Redis ``aof.c`` but uses a custom logical record
+format and treats post-rename durability ambiguity as terminal.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -365,6 +371,9 @@ class AofWriter:
             completion=completion,
             delta=bytearray(),
         )
+        # Redis BGREWRITEAOF likewise needs a stable base plus writes that race
+        # with rewriting. Registration precedes the base task so no accepted
+        # commit can fall between the checkpoint and delta capture.
         self._rewrite = state
         state.base_task = asyncio.create_task(
             self._write_rewrite_base(state),
@@ -452,6 +461,9 @@ class AofWriter:
             len(state.delta) + len(record)
             > self._rewrite_delta_limit_bytes
         ):
+            # A bounded delta prevents an online rewrite from becoming a second
+            # unbounded AOF in memory. Before rename, aborting safely leaves the
+            # original append-only file authoritative.
             state.abort_reason = "AOF rewrite delta limit exceeded"
             self._settle_rewrite(
                 state.completion,
@@ -484,6 +496,10 @@ class AofWriter:
                 self._path,
             )
             state.renamed = True
+            # Matching durable-file replacement practice in Redis aof.c: fsync
+            # the new file before rename, then fsync the directory entry before
+            # switching the writer fd. A failure after rename is terminal because
+            # the durable path owner can no longer be proved safely.
             await asyncio.to_thread(self._ops.fsync_parent, self._path)
             self._fd = temporary_fd
             state.temporary_fd = None

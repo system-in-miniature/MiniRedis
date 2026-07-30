@@ -1,3 +1,5 @@
+"""Choose a complete checkpoint and replay only contiguous later AOF batches."""
+
 from __future__ import annotations
 
 from pathlib import Path

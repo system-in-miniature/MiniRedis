@@ -1,3 +1,5 @@
+"""Plan non-blocking list commands; waiter registration stays in the executor."""
+
 from collections import deque
 
 from miniredis.commands import model as cmd

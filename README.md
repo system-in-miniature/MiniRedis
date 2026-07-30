@@ -1,3 +1,5 @@
+> **Language**: English | [简体中文](README.zh-CN.md)
+
 # MiniRedis
 
 MiniRedis is a compact Redis-inspired reference project for learning typed
@@ -186,6 +188,27 @@ and full replica sync.
   not a throughput target.
 
 See [docs/behavior-matrix.md](docs/behavior-matrix.md) for exact evidence.
+For a guided source tour and Redis concept mapping, see
+[docs/architecture.md](docs/architecture.md).
+
+## Runnable examples
+
+The scripts in `examples/` use the documented runtime and command APIs; they do
+not depend on test-only clocks, gates, or executor hooks:
+
+```bash
+uv run python examples/aof_crash_recovery.py
+uv run python examples/replication_resync.py
+uv run python examples/lfu_eviction.py
+```
+
+- `aof_crash_recovery.py` writes with `AofPolicy.ALWAYS`, simulates a crash,
+  restarts from the same AOF, and verifies the acknowledged value.
+- `replication_resync.py` contrasts a short disconnect that can use partial
+  resynchronization with a cursor that has fallen behind the bounded backlog
+  and therefore needs a full snapshot.
+- `lfu_eviction.py` makes one key hot, exceeds the logical maxmemory budget,
+  and observes the deterministic LFU victim using only `GET` replies.
 
 ## Non-goals
 

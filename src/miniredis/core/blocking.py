@@ -1,3 +1,9 @@
+"""Track blocking list-pop waiters without making planners asynchronous.
+
+This is the teaching analogue of Redis's blocked-client and ready-key machinery:
+the executor owns wakeup order while the registry owns timeout/cancellation state.
+"""
+
 from __future__ import annotations
 
 from collections import defaultdict, deque

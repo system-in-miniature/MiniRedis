@@ -1,3 +1,5 @@
+"""Incrementally decode bounded RESP2 requests and encode domain replies."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

@@ -1,3 +1,9 @@
+"""Hold per-session MULTI/WATCH state and transaction evaluation workspaces.
+
+MiniRedis evaluates EXEC on a deep database fork to make rollback-by-discard
+simple; real Redis runs queued commands against the live keyspace.
+"""
+
 from dataclasses import dataclass, field
 
 from miniredis.commands.model import Command

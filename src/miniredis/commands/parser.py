@@ -1,3 +1,5 @@
+"""Validate binary command requests and freeze options into typed commands."""
+
 from __future__ import annotations
 
 import math

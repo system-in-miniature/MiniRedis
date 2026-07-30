@@ -1,3 +1,9 @@
+"""Route typed commands to pure per-type planners and maxmemory enforcement.
+
+The planner layer corresponds to Redis command implementations, but returns an
+``ExecutionPlan`` rather than mutating the keyspace in place.
+"""
+
 from collections import deque
 
 from miniredis.commands.model import BlockingPop

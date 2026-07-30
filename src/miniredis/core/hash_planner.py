@@ -1,3 +1,5 @@
+"""Plan hash commands as replies plus immutable commit operations."""
+
 from miniredis.commands import model as cmd
 from miniredis.commands.parser import (
     INT64_MAX,

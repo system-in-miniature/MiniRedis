@@ -1,3 +1,5 @@
+"""Capture and atomically install custom stable keyspace checkpoints."""
+
 from __future__ import annotations
 
 import asyncio

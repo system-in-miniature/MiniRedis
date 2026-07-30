@@ -1,3 +1,5 @@
+"""Represent one transport-neutral command name and binary argument tuple."""
+
 from dataclasses import dataclass
 
 

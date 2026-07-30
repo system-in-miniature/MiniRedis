@@ -1,3 +1,5 @@
+"""Plan EXPIRE, TTL/PTTL, and PERSIST against absolute millisecond deadlines."""
+
 from miniredis.commands import model as cmd
 from miniredis.core.commit import DeleteKey, DeleteReason
 from miniredis.core.database import Database

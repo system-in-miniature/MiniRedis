@@ -1,3 +1,5 @@
+"""Plan set commands with deterministic reply materialization where required."""
+
 from miniredis.commands import model as cmd
 from miniredis.core.commit import (
     CommitOperation,

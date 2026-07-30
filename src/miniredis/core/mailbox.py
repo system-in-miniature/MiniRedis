@@ -1,3 +1,5 @@
+"""Provide the bounded event-loop mailbox that serializes all state ownership."""
+
 from __future__ import annotations
 
 import asyncio

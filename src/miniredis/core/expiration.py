@@ -1,3 +1,9 @@
+"""Model lazy expiry tests and the bounded active-expiry tick producer.
+
+``ActiveExpireProducer`` is the scheduling half of Redis ``activeExpireCycle``;
+the executor remains the only component allowed to turn a tick into deletion.
+"""
+
 from collections.abc import Callable
 
 from miniredis.clock import Clock, ScheduledHandle, TimerScheduler

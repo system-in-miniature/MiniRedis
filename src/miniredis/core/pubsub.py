@@ -1,3 +1,5 @@
+"""Index exact-channel subscriptions for bounded at-most-once fan-out."""
+
 from collections import defaultdict
 from collections.abc import Callable
 

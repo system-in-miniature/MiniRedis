@@ -1,3 +1,5 @@
+"""Define transport-neutral command replies before RESP2 encoding."""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

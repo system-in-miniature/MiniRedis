@@ -1,3 +1,9 @@
+"""Plan general and string commands and share lookup/building primitives.
+
+Lazy expiry is represented as a proposed delete operation, allowing the
+executor to suppress replica-local expiry commits while keeping reads logical.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable

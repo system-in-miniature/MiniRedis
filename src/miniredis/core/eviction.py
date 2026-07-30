@@ -1,3 +1,9 @@
+"""Plan maxmemory eviction in the same commit as the triggering write.
+
+This corresponds to Redis ``evict.c`` while using logical bytes and exact,
+deterministic victim ordering instead of allocator memory and sampled candidates.
+"""
+
 from __future__ import annotations
 
 from collections.abc import Iterable
@@ -94,6 +100,9 @@ def enforce_memory(
     if not writes_data:
         return plan
 
+    # Redis evict.c also reclaims logically expired data before sacrificing a
+    # live victim. Keeping those deletes in this plan makes the triggering write
+    # and all space reclamation one atomic propagation unit.
     expired = _expired_operations(database, now_ms)
     operations = dedupe_operations(expired + plan.operations)
 
@@ -128,6 +137,9 @@ def enforce_memory(
     }
     excluded = target_keys | already_deleted
     if config.eviction_policy == "allkeys-lfu":
+        # Redis samples candidates and uses an approximate counter. Exact
+        # projection plus stable tie-breaks is deliberate here: readers can
+        # derive the victim without depending on randomness.
         candidate_keys = [
             key
             for _frequency, _tick, key in _lfu_candidates(
@@ -138,6 +150,8 @@ def enforce_memory(
             )
         ]
     else:
+        # This is the allkeys-LRU lesson from evict.c with a global exact order
+        # instead of Redis's bounded candidate sampling.
         candidate_keys = [
             key
             for _tick, key in sorted(

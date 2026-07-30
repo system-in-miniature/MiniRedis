@@ -1,3 +1,9 @@
+"""Define immutable state and the ordered unit used for durability and propagation.
+
+``CommitBatch`` corresponds to one atomic Redis propagation unit: it crosses
+AOF, local apply, replication, and recovery without exposing partial operations.
+"""
+
 from __future__ import annotations
 
 from dataclasses import dataclass

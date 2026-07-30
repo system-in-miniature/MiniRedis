@@ -1,3 +1,5 @@
+"""Expose binary-safe in-process clients and ordered, non-atomic pipelines."""
+
 from __future__ import annotations
 
 import asyncio

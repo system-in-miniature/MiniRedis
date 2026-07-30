@@ -1,3 +1,5 @@
+"""Define mutable in-memory representations for the five supported value types."""
+
 from __future__ import annotations
 
 from collections import deque

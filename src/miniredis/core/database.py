@@ -1,3 +1,9 @@
+"""Own the live keyspace and apply immutable commit batches.
+
+The database favors staged copies and explicit invariant checks over Redis's
+in-place dictionary updates, making atomicity visible at the cost of O(N) writes.
+"""
+
 from __future__ import annotations
 
 from collections import deque
@@ -142,6 +148,9 @@ class Database:
         if batch.seq != next_seq:
             raise ValueError(f"expected commit seq {next_seq}, got {batch.seq}")
 
+        # Unlike Redis's in-place dictionary updates, staging the tables makes
+        # a failed invariant check non-mutating. The explicit teaching trade-off
+        # is O(N) copying and usage recomputation for every committed batch.
         staged = dict(self.entries)
         staged_access_tick = self.access_tick
         staged_key_revisions = dict(self.key_revisions)
@@ -200,6 +209,9 @@ class Database:
         self.commit_seq = batch.seq
 
     def fork(self) -> Database:
+        # EXEC evaluates against this deep copy so runtime errors can retain
+        # reply slots without leaking partial planning. Real Redis executes its
+        # queued commands directly and does not pay this whole-database copy.
         forked = Database()
         forked.entries = {
             key: Entry(

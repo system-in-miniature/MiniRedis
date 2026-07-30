@@ -1,3 +1,5 @@
+"""Adapt asyncio TCP sessions to the shared parser, executor, and outbox."""
+
 from __future__ import annotations
 
 import asyncio

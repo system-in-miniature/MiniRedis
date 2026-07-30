@@ -1,3 +1,5 @@
+"""Plan sorted-set commands over a simple member-to-float dictionary."""
+
 import math
 
 from miniredis.commands import model as cmd

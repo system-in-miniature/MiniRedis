@@ -12,7 +12,7 @@ replication boundaries in a small executable model rather than replacing Redis.
 ## 安装
 
 ```bash
-git clone https://github.com/system-in-miniature/MiniRedis.git
+git clone https://github.com/system-in-miniature/mini-redis.git
 cd MiniRedis
 uv sync
 ```
@@ -32,4 +32,4 @@ uv run python examples/lfu_eviction.py
 
 接着阅读[架构指南](architecture.md)及其 [Redis 机制映射](redis-mapping.md)。
 完整命令集、适配器、兼容性边界与验证命令见
-[仓库中文 README](https://github.com/system-in-miniature/MiniRedis/blob/main/README.zh-CN.md)。
+[仓库中文 README](https://github.com/system-in-miniature/mini-redis/blob/main/README.zh-CN.md)。

@@ -14,7 +14,7 @@ batch.
 ## Install
 
 ```bash
-git clone https://github.com/system-in-miniature/MiniRedis.git
+git clone https://github.com/system-in-miniature/mini-redis.git
 cd MiniRedis
 uv sync
 ```
@@ -38,4 +38,4 @@ Continue with the [architecture guide](architecture.md) and its
 
 For the full command set, adapters, compatibility boundary, and verification
 commands, read the
-[repository README](https://github.com/system-in-miniature/MiniRedis/blob/main/README.md).
+[repository README](https://github.com/system-in-miniature/mini-redis/blob/main/README.md).

@@ -1,0 +1,41 @@
+site_name: MiniRedis Tutorial
+site_description: A chapter-based guide to MiniRedis and the Redis mechanisms it models
+site_url: https://system-in-miniature.github.io/MiniRedis/
+repo_url: https://github.com/system-in-miniature/MiniRedis
+repo_name: system-in-miniature/MiniRedis
+docs_dir: docs
+
+theme:
+  name: material
+  language: en
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+
+nav:
+  - English:
+      - "Chapter 1 · Quick Start": index.md
+      - "Chapter 2 · Architecture Tour": architecture.md
+      - "Chapter 3 · Mechanisms and Redis Mapping": redis-mapping.md
+      - "Chapter 4 · Hands-on Examples": labs-guide.md
+      - "Chapter 5 · Differences and Evidence": behavior-matrix.md
+      - Appendix:
+          - "Design History Archive": superpowers/README.md
+  - 中文版:
+      - "第 1 章 · 快速开始": zh/index.md
+      - "第 2 章 · 架构总览": zh/architecture.md
+      - "第 3 章 · 机制与 Redis 映射": zh/redis-mapping.md
+      - "第 4 章 · 动手实验": zh/labs-guide.md
+      - "第 5 章 · 差异与证据": zh/behavior-matrix.md
+      - 附录:
+          - "Superpowers 设计存档": superpowers/README.md
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - pymdownx.details
+  - pymdownx.superfences
+
+strict: true

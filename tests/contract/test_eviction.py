@@ -20,7 +20,11 @@ async def test_oversized_target_does_not_evict_unrelated_key():
 
 @pytest.mark.asyncio
 async def test_exact_lru_evicts_cold_key_in_same_commit_as_write():
-    async with MiniRedis.open(maxmemory=260, eviction_policy="allkeys-lru") as r:
+    async with MiniRedis.open(
+        maxmemory=260,
+        eviction_policy="allkeys-lru",
+        debug_record_applied_batches=True,
+    ) as r:
         c = r.direct_client()
         await c.execute(CommandRequest(b"SET", (b"cold", b"x")))
         await c.execute(CommandRequest(b"SET", (b"hot", b"x")))
@@ -65,6 +69,7 @@ async def test_expired_budget_is_purged_in_same_batch_before_noeviction_check():
         clock=clock,
         maxmemory=100,
         eviction_policy="noeviction",
+        debug_record_applied_batches=True,
     ) as r:
         c = r.direct_client()
         assert await c.execute(CommandRequest(b"SET", (b"old", b"x"))) == Ok()

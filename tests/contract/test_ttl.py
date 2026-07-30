@@ -31,6 +31,7 @@ async def test_expire_ttl_persist_and_bounded_active_cleanup():
     async with MiniRedis.open(
         clock=clock,
         active_expire_sample_size=1,
+        debug_record_applied_batches=True,
     ) as runtime:
         c = runtime.direct_client()
         await c.execute(CommandRequest(b"SET", (b"a", b"1")))

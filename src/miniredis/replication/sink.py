@@ -1,3 +1,9 @@
+"""Model one asynchronous primary-to-replica link and its resync state machine.
+
+``ReplicaSink`` corresponds to a Redis replica connection, but delivery stays
+in process and records only the last fully applied logical cursor.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -183,7 +189,7 @@ class ReplicaSink:
                 return self.status
             if isinstance(attachment, FullSyncAttachment):
                 installed = (
-                    await self._replica.executor.install_replica_snapshot(
+                    await self._replica.install_replica_snapshot(
                         self,
                         attachment.generation,
                         attachment.replication_id,
@@ -192,7 +198,7 @@ class ReplicaSink:
                 )
             else:
                 installed = (
-                    await self._replica.executor.prepare_replica_resume(
+                    await self._replica.prepare_replica_resume(
                         attachment.generation,
                         attachment.replication_id,
                         attachment.cursor.applied_seq,
@@ -217,6 +223,9 @@ class ReplicaSink:
                 )
             else:
                 self._replication_id = attachment.replication_id
+            # As in Redis partial resynchronization, backlog catch-up must drain
+            # before writes observed live during attachment; otherwise sequence
+            # order could invert at the replica.
             self._state = (
                 ReplicaSinkState.CATCHING_UP
                 if self._catch_up
@@ -390,7 +399,7 @@ class ReplicaSink:
                 pass
         self._queue.clear()
         self._catch_up.clear()
-        result = await self._replica.executor.promote_replica(self._generation)
+        result = await self._replica.promote_replica(self._generation)
         if not result.writable:
             self._state = ReplicaSinkState.FAILED
             self._signal_status_change()

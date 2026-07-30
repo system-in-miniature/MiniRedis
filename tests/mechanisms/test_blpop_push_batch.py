@@ -9,7 +9,9 @@ from miniredis.core.reply import Bytes, Items, Number
 
 @pytest.mark.asyncio
 async def test_full_push_then_fifo_pops_are_one_commit_batch():
-    async with MiniRedis.open() as runtime:
+    async with MiniRedis.open(
+        debug_record_applied_batches=True
+    ) as runtime:
         first_client = runtime.direct_client()
         second_client = runtime.direct_client()
         producer = runtime.direct_client()

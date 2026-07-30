@@ -1,3 +1,10 @@
+"""Serialize commands and control events through MiniRedis's single state owner.
+
+This module combines the roles of Redis's command execution loop, transaction
+coordinator, propagation boundary, replica control plane, and shutdown barrier.
+The section markers below are the intended reading map for this large module.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -290,6 +297,7 @@ class CommandExecutor:
         ) = None,
         replication_backlog_batches: int = 1024,
         replication_id_factory: Callable[[], str] | None = None,
+        record_applied_batches: bool = False,
     ) -> None:
         self.database = database
         self.planner = planner
@@ -324,7 +332,9 @@ class CommandExecutor:
         self._accepted_tokens: list[RequestToken] = []
         self._endpoints: dict[int, SessionEndpoint] = {}
         self._accepted_changed = asyncio.Event()
-        self._applied_batches: list[CommitBatch] = []
+        self._applied_batches: list[CommitBatch] | None = (
+            [] if record_applied_batches else None
+        )
         self._replica_sinks: dict[int, ReplicaSink] = {}
         self._next_replica_generation = 1
         self._active_source_generation: int | None = None
@@ -549,6 +559,10 @@ class CommandExecutor:
                     self._finish_request(token, RuntimeClosed())
             self._on_debug_change()
 
+    # --- Command execution -------------------------------------------------
+    # Requests enter through this dispatch loop so planning, durability, apply,
+    # and reply publication share one total order, like Redis's main command loop.
+
     async def _dispatch(self, message: object) -> None:
         if isinstance(message, ExecuteRequest):
             await self._execute(message)
@@ -604,6 +618,9 @@ class CommandExecutor:
                     )
                 )
         elif isinstance(message, AttachReplica):
+            # Redis PSYNC makes the same choice: resume only when the history
+            # identity matches and the backlog covers every byte/batch after
+            # the replica cursor; any uncertainty requires a full snapshot.
             generation = self._next_replica_generation
             self._next_replica_generation += 1
             boundary = self.database.commit_seq
@@ -873,6 +890,10 @@ class CommandExecutor:
             plan = self.planner.plan(command, self.database, now_ms)
         await self._apply_plan(request, plan, now_ms)
 
+    # --- Transactions ------------------------------------------------------
+    # MULTI/WATCH state is per session. EXEC plans on an isolated database fork
+    # and collapses successful mutations into one propagation CommitBatch.
+
     def _route_transaction_command(
         self,
         request: ExecuteRequest,
@@ -1052,6 +1073,10 @@ class CommandExecutor:
             state.clear_all()
             self._drop_empty_transaction_state(request.session_id, state)
 
+    # --- Pub/Sub -----------------------------------------------------------
+    # Pub/Sub bypasses database commits: it routes ephemeral pushes through the
+    # same ordered per-session outboxes used for command replies.
+
     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
         items: list[SubscriptionAck] = []
         for channel in command.channels:
@@ -1139,7 +1164,13 @@ class CommandExecutor:
     ) -> None:
         plan = self._attach_push_wakeups(request.command, plan)
         try:
-            if plan.prepared_commit is not None:
+            # Redis replicas logically hide expired data but wait for the
+            # primary's DEL propagation. Dropping a lazy-expiry commit here
+            # keeps the replica sequence aligned with that primary history.
+            if (
+                plan.prepared_commit is not None
+                and not self._replica_read_only
+            ):
                 await self._commit_prepared(plan.prepared_commit)
         except DurabilityFailure as exc:
             self._finish_reply(
@@ -1196,7 +1227,8 @@ class CommandExecutor:
             and operation.reason is DeleteReason.EVICTED
             for operation in batch.operations
         )
-        self._applied_batches.append(batch)
+        if self._applied_batches is not None:
+            self._applied_batches.append(batch)
         self.replication_backlog.append(batch)
         self._offer_replica_batch(batch)
         return batch
@@ -1248,6 +1280,10 @@ class CommandExecutor:
         if not self.post_control(BeginAofRewrite(future)):
             return AofRewriteFailed("executor control admission is closed")
         return await asyncio.shield(future)
+
+    # --- Replication control plane ----------------------------------------
+    # Attach, snapshot install, cursor resume, ordered apply, and promotion all
+    # re-enter the mailbox so no user command can split a control-plane decision.
 
     async def attach_replica(
         self,
@@ -1326,6 +1362,10 @@ class CommandExecutor:
         return await asyncio.shield(future)
 
     async def _active_expire_once(self, now_ms: int) -> int:
+        # Redis replicas do not run active expiry deletion; the primary owns
+        # expiry propagation. Returning zero also prevents a local seq advance.
+        if self._replica_read_only:
+            return 0
         keys = sorted(
             key
             for key, entry in self.database.entries.items()
@@ -1359,6 +1399,10 @@ class CommandExecutor:
             self._on_fatal(str(exc))
             return 0
         return len(operations)
+
+    # --- Shutdown state machine -------------------------------------------
+    # Admission closes first, then the executor resolves every accepted owner
+    # before the runtime releases the held barrier and joins this worker.
 
     async def close(self) -> None:
         if self._close_task is None:
@@ -1528,4 +1572,8 @@ class CommandExecutor:
         return self._failure
 
     def debug_applied_batches(self) -> tuple[CommitBatch, ...]:
-        return tuple(self._applied_batches)
+        return (
+            ()
+            if self._applied_batches is None
+            else tuple(self._applied_batches)
+        )

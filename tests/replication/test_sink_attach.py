@@ -8,6 +8,7 @@ from miniredis.core.reply import Bytes, Ok
 from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
 from miniredis.replication.backlog import ReplicationCursor
 from tests.helpers.runtime import open_test_runtime
+from tests.helpers.time import FakeClock, ManualScheduler
 
 
 @pytest.mark.asyncio
@@ -66,6 +67,56 @@ async def test_attached_replica_rejects_user_writes():
     assert replica.debug_commit_seq == sink.status.applied_seq
     await primary.close()
     await replica.close()
+
+
+@pytest.mark.asyncio
+async def test_replica_logically_hides_expired_key_until_primary_delete_arrives():
+    clock = FakeClock()
+    replica_scheduler = ManualScheduler(clock)
+    primary = await open_test_runtime(clock=clock)
+    replica = await open_test_runtime(
+        clock=clock,
+        scheduler=replica_scheduler,
+    )
+    try:
+        primary_client = primary.direct_client()
+        replica_client = replica.direct_client()
+        assert await primary_client.execute(
+            CommandRequest(b"SET", (b"k", b"v", b"PX", b"10"))
+        ) == Ok()
+
+        sink = ReplicaSink(replica, queue_limit=4)
+        await primary.attach_replica(sink)
+        assert replica_scheduler.pending_count == 0
+        baseline = replica.debug_commit_seq
+
+        clock.advance(10)
+        assert await replica.debug_active_expire_once() == 0
+        assert replica.debug_commit_seq == baseline
+        assert await replica_client.execute(
+            CommandRequest(b"GET", (b"k",))
+        ) == Bytes(None)
+        assert replica.debug_commit_seq == baseline
+        assert replica.debug_physical_key_count == 1
+
+        assert await primary_client.execute(
+            CommandRequest(b"GET", (b"k",))
+        ) == Bytes(None)
+        await sink.wait_until_applied(primary.debug_commit_seq)
+        assert await primary_client.execute(
+            CommandRequest(b"SET", (b"after", b"write"))
+        ) == Ok()
+        await sink.wait_until_applied(primary.debug_commit_seq)
+
+        assert sink.status.state is ReplicaSinkState.STREAMING
+        assert replica.debug_commit_seq == primary.debug_commit_seq
+        assert replica.debug_physical_key_count == 1
+        assert await replica_client.execute(
+            CommandRequest(b"GET", (b"after",))
+        ) == Bytes(b"write")
+    finally:
+        await primary.close()
+        await replica.close()
 
 
 @pytest.mark.asyncio

@@ -32,7 +32,7 @@ async def test_wrongtype_never_allocates_commit(command_request):
 
 @pytest.mark.asyncio
 async def test_commits_rebuild_the_same_logical_database():
-    runtime = MiniRedis.open()
+    runtime = MiniRedis.open(debug_record_applied_batches=True)
     await runtime.start()
     client = runtime.direct_client()
     await client.execute(CommandRequest(b"SET", (b"s", b"1")))
@@ -48,3 +48,16 @@ async def test_commits_rebuild_the_same_logical_database():
     for batch in batches:
         replay.apply_batch(batch, track_access=False)
     assert replay.logical_items() == expected
+
+
+@pytest.mark.asyncio
+async def test_applied_batches_are_not_recorded_by_default():
+    runtime = MiniRedis.open()
+    await runtime.start()
+    await runtime.direct_client().execute(
+        CommandRequest(b"SET", (b"k", b"v"))
+    )
+    batches = runtime.debug_applied_batches()
+    await runtime.close()
+
+    assert batches == ()

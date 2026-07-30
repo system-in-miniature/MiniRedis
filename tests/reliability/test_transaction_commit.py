@@ -11,7 +11,10 @@ async def test_transaction_is_one_aof_batch_and_recovers_as_one_commit(tmp_path)
         aof_path=tmp_path / "appendonly.mraof",
         aof_policy=AofPolicy.ALWAYS,
     )
-    first = MiniRedis.open(config)
+    first = MiniRedis.open(
+        config,
+        debug_record_applied_batches=True,
+    )
     await first.start()
     client = first.direct_client()
     before = first.debug_commit_seq

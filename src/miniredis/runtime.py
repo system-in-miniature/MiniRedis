@@ -1,3 +1,9 @@
+"""Assemble MiniRedis subsystems and own their startup-to-shutdown lifecycle.
+
+The runtime is the public facade; semantic execution remains in the serialized
+executor, while this layer owns tasks, persistence workers, servers, and sinks.
+"""
+
 from __future__ import annotations
 
 import asyncio
@@ -19,7 +25,7 @@ from miniredis.commands.model import Command
 from miniredis.commands.parser import CommandParseError, parse_command_request
 from miniredis.commands.request import CommandRequest
 from miniredis.core.blocking import WaiterId
-from miniredis.core.commit import CommitBatch, StoredEntry
+from miniredis.core.commit import CommitBatch, SnapshotImage, StoredEntry
 from miniredis.core.database import Database
 from miniredis.core.executor import (
     ActiveExpireTick,
@@ -28,6 +34,7 @@ from miniredis.core.executor import (
     CommandExecutor,
     CommitBarrier,
     NullCommitBarrier,
+    PromotionResult,
     SessionClosed,
     SubmittedRequest,
 )
@@ -131,6 +138,7 @@ class MiniRedis:
         commit_barrier: CommitBarrier,
         scheduler: TimerScheduler | None,
         test_hooks: _RuntimeTestHooks | None = None,
+        debug_record_applied_batches: bool = False,
     ) -> None:
         self.config = config
         self.clock = clock
@@ -182,6 +190,7 @@ class MiniRedis:
                 if self._test_hooks is None
                 else self._test_hooks.replication_id_factory
             ),
+            record_applied_batches=debug_record_applied_batches,
         )
         self.executor.mailbox.close_user_admission()
         self._snapshot_manager = (
@@ -201,6 +210,7 @@ class MiniRedis:
         self._lifecycle_lock = asyncio.Lock()
         self._shutdown_task: asyncio.Task[None] | None = None
         self._control_producers: set[object] = set()
+        self._active_expire_producer: ActiveExpireProducer | None = None
         self._owned_tasks: set[asyncio.Task[object]] = set()
         self._failure_reason: str | None = None
         self._shutdown_complete = False
@@ -215,6 +225,7 @@ class MiniRedis:
         clock: Clock | None = None,
         scheduler: TimerScheduler | None = None,
         commit_barrier: CommitBarrier | None = None,
+        debug_record_applied_batches: bool = False,
         **options: Any,
     ) -> MiniRedis:
         if config is not None and options:
@@ -228,6 +239,7 @@ class MiniRedis:
                 commit_barrier if commit_barrier is not None else NullCommitBarrier()
             ),
             test_hooks=None,
+            debug_record_applied_batches=debug_record_applied_batches,
         )
 
     @classmethod
@@ -239,6 +251,7 @@ class MiniRedis:
         scheduler: TimerScheduler | None = None,
         commit_barrier: CommitBarrier | None = None,
         test_hooks: _RuntimeTestHooks | None = None,
+        debug_record_applied_batches: bool = False,
         **options: Any,
     ) -> MiniRedis:
         if config is not None and options:
@@ -252,6 +265,7 @@ class MiniRedis:
                 commit_barrier if commit_barrier is not None else NullCommitBarrier()
             ),
             test_hooks=test_hooks,
+            debug_record_applied_batches=debug_record_applied_batches,
         )
 
     async def start(self) -> None:
@@ -321,6 +335,7 @@ class MiniRedis:
                     self.executor.post_control,
                     lambda now_ms: ActiveExpireTick(now_ms, None),
                 )
+                self._active_expire_producer = producer
                 self._control_producers.add(producer)
                 producer.start()
                 self.executor.mailbox.open_user_admission()
@@ -571,6 +586,7 @@ class MiniRedis:
         self._trace_lifecycle("executor-stopped")
 
         self._control_producers.clear()
+        self._active_expire_producer = None
         current = asyncio.current_task()
         for owned in tuple(self._owned_tasks):
             if owned.done() or owned is current:
@@ -658,6 +674,44 @@ class MiniRedis:
             if task.done() and (task.cancelled() or task.exception() is not None):
                 self._owned_replica_sinks.discard(sink)
             raise
+
+    async def install_replica_snapshot(
+        self,
+        sink: ReplicaSink,
+        generation: int,
+        replication_id: str,
+        image: SnapshotImage,
+    ) -> bool:
+        installed = await self.executor.install_replica_snapshot(
+            sink,
+            generation,
+            replication_id,
+            image,
+        )
+        if installed and self._active_expire_producer is not None:
+            await self._active_expire_producer.quiesce()
+        return installed
+
+    async def prepare_replica_resume(
+        self,
+        generation: int,
+        replication_id: str,
+        expected_applied_seq: int,
+    ) -> bool:
+        prepared = await self.executor.prepare_replica_resume(
+            generation,
+            replication_id,
+            expected_applied_seq,
+        )
+        if prepared and self._active_expire_producer is not None:
+            await self._active_expire_producer.quiesce()
+        return prepared
+
+    async def promote_replica(self, generation: int) -> PromotionResult:
+        result = await self.executor.promote_replica(generation)
+        if result.writable and self._active_expire_producer is not None:
+            self._active_expire_producer.start()
+        return result
 
     def _replica_attach_done(
         self,

@@ -143,8 +143,9 @@ process the `RPUSH` needed to wake the pop.
 
 MiniRedis first plans a blocking pop against current state. If any requested
 key has a list item, it pops immediately, respecting key order and left/right
-direction. If all keys are empty, `CommandExecutor._apply_plan` registers a
-`BlockingWaiter` instead of finishing the request.
+direction. If all keys are empty, the blocking-pop branch in
+`CommandExecutor._execute` registers a `BlockingWaiter` instead of passing a
+plan to `_apply_plan` or finishing the request.
 
 `src/miniredis/core/blocking.py`, `WaiterRegistry.register`, stores:
 
@@ -153,13 +154,15 @@ direction. If all keys are empty, `CommandExecutor._apply_plan` registers a
 - the ordered tuple of keys;
 - whether to pop left or right;
 - an optional timer handle; and
-- explicit `WAITING`, `WOKEN`, `TIMED_OUT`, or `CANCELLED` state.
+- explicit `ACTIVE`, `FULFILLED`, `TIMED_OUT`, `CANCELLED`, or `CLOSED` state.
 
 One waiter is indexed under every requested key but remains one logical
 request. `WaiterRegistry.transition` is the single state transition point. It
 removes all indexes and cancels the timer before returning the waiter. Timeout,
 push wakeup, cancellation, and session close therefore compete to transition
-the same ID; only the first transition succeeds.
+the same ID from `ACTIVE` to their corresponding terminal state; only the
+first transition succeeds. A successful push uses `FULFILLED`, while session
+or runtime shutdown uses `CLOSED`.
 
 `src/miniredis/core/blocking.py`, `prepare_list_wakeups`, runs while planning a
 commit that pushes list values. It examines waiters in deterministic order,
@@ -177,13 +180,13 @@ commit path.
 The command parser freezes a decimal timeout into milliseconds.
 `BLPOP key 0` means no timeout. A positive timeout schedules a control event;
 when `TimeoutWaiter` reaches the executor, `_timeout_waiter` transitions the
-waiter and completes the request with a null result.
+waiter and completes the request with `Bytes(None)`.
 
-For the Direct adapter, `src/miniredis/adapters/direct.py`,
-`DirectClient.resolve`, maps transport closure of a `BlockingPop` to
-`Bytes(None)`. RESP mapping expresses a blocking-pop timeout as a null array
-where appropriate. The domain and wire representations are adapter concerns;
-the waiter state machine remains in core.
+The RESP2 adapter maps `Bytes(None)` to a **null bulk string**, encoded as
+`$-1\r\n`. This is deliberately distinct from `NullArray()`, encoded as
+`*-1\r\n`, which MiniRedis uses for an optimistic `EXEC` abort. The domain and
+wire representations are adapter concerns; the waiter state machine remains
+in core.
 
 Direction is frozen in the waiter. `BRPOP` awakened by a later push still pops
 from the right; it does not degrade into `BLPOP`. Key priority is also stable:

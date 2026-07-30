@@ -83,7 +83,7 @@ MiniRedis 在深拷贝的 database fork 上求值事务。`CommandExecutor._exec
 
 若 executor 内直接 `await` 等待 list 改变，就会死锁：它无法处理负责唤醒该 pop 的 `RPUSH`。
 
-MiniRedis 先针对当前状态 planning。若任一请求 key 有 list item，就按 key 优先级和左右方向立即 pop；若都空，`CommandExecutor._apply_plan` 注册 `BlockingWaiter`，而不是完成请求。
+MiniRedis 先针对当前状态 planning。若任一请求 key 有 list item，就按 key 优先级和左右方向立即 pop；若都空，`CommandExecutor._execute` 的 blocking-pop 分支直接注册 `BlockingWaiter`，不会把 plan 交给 `_apply_plan`，也不会完成请求。
 
 `src/miniredis/core/blocking.py` 的 `WaiterRegistry.register` 保存：
 
@@ -92,9 +92,9 @@ MiniRedis 先针对当前状态 planning。若任一请求 key 有 list item，�
 - 有序 key tuple；
 - 左/右方向；
 - 可选 timer handle；
-- 明确的 `WAITING`、`WOKEN`、`TIMED_OUT` 或 `CANCELLED` 状态。
+- 明确的 `ACTIVE`、`FULFILLED`、`TIMED_OUT`、`CANCELLED` 或 `CLOSED` 状态。
 
-同一个 waiter 会索引到每个请求 key 下，但仍是一个逻辑请求。`WaiterRegistry.transition` 是唯一状态转换点：返回 waiter 前移除所有索引并取消 timer。因此 timeout、push wakeup、cancel、session close 争夺同一 ID，只有第一次转换成功。
+同一个 waiter 会索引到每个请求 key 下，但仍是一个逻辑请求。`WaiterRegistry.transition` 是唯一状态转换点：返回 waiter 前移除所有索引并取消 timer。因此 timeout、push wakeup、cancel、session close 争夺同一 ID，只有第一次能把它从 `ACTIVE` 转为相应终态。push 成功使用 `FULFILLED`，session 或 runtime shutdown 使用 `CLOSED`。
 
 `src/miniredis/core/blocking.py` 的 `prepare_list_wakeups` 在规划 push commit 时运行。它按确定顺序检查 waiter，为每个 waiter 最多预留一个元素，返回附着在同一 execution plan 的 wakeup。`CommandExecutor._attach_push_wakeups` 把 pop operation 和 waiter reply 绑定到触发 commit。
 
@@ -102,9 +102,11 @@ MiniRedis 先针对当前状态 planning。若任一请求 key 有 list item，�
 
 ## Timeout、取消与方向
 
-parser 把十进制 timeout 固化为毫秒；`BLPOP key 0` 表示永不超时。正数 timeout 安排控制事件，`TimeoutWaiter` 到达 executor 后，`_timeout_waiter` 转换 waiter 并以 null 结果完成请求。
+parser 把十进制 timeout 固化为毫秒；`BLPOP key 0` 表示永不超时。正数 timeout 安排控制事件，`TimeoutWaiter` 到达 executor 后，`_timeout_waiter` 转换 waiter 并以 `Bytes(None)` 完成请求。
 
-Direct 适配器中，`src/miniredis/adapters/direct.py` 的 `DirectClient.resolve` 把 `BlockingPop` 的 transport close 映射为 `Bytes(None)`；RESP 在适用处映射为 null array。domain 与 wire 表示属于 adapter，waiter 状态机仍在 core。
+RESP2 适配器把 `Bytes(None)` 映射为 **null bulk string**，编码为
+`$-1\r\n`。它与 `NullArray()` 明确不同：后者编码为 `*-1\r\n`，MiniRedis
+用它表示乐观 `EXEC` abort。domain 与 wire 表示属于 adapter，waiter 状态机仍在 core。
 
 方向也被冻结：`BRPOP` 被后续 push 唤醒时仍从右侧 pop，不会退化为 `BLPOP`；第一个 ready key 仍按命令顺序获胜。`tests/mechanisms/test_blpop.py` 验证这些契约。
 

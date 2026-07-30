@@ -2,7 +2,7 @@
 
 # MiniRedis
 
-[![CI](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml/badge.svg)](https://github.com/system-in-miniature/MiniRedis/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)
+[![CI](https://github.com/system-in-miniature/mini-redis/actions/workflows/ci.yml/badge.svg)](https://github.com/system-in-miniature/mini-redis/actions/workflows/ci.yml) [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE) ![Python 3.12+](https://img.shields.io/badge/Python-3.12%2B-blue.svg)
 
 MiniRedis is a compact Redis-inspired reference project for learning typed
 in-memory data structures, serialized command atomicity, expiration, eviction,

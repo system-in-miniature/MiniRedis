@@ -11,48 +11,51 @@ theme:
   favicon: assets/brand/avatar.svg
   language: en
   features:
+    - navigation.tabs
     - navigation.sections
     - navigation.top
     - content.code.copy
 
 nav:
-  - Tutorial:
-      - "Tutorial Home": tutorial/index.md
-      - "01 · Meet MiniRedis": tutorial/01-getting-started.md
-      - "02 · The Life of a Command": tutorial/02-life-of-a-command.md
-      - "03 · Data Types and the Command Surface": tutorial/03-data-types.md
-      - "04 · Expiration": tutorial/04-expiration.md
-      - "05 · Memory and Eviction": tutorial/05-eviction.md
-      - "06 · Persistence I: AOF": tutorial/06-persistence-aof.md
-      - "07 · Persistence II: Rewrite and Snapshots": tutorial/07-rewrite-snapshot.md
-      - "08 · Replication": tutorial/08-replication.md
-      - "09 · Transactions and Blocking": tutorial/09-transactions-blocking.md
-      - "10 · Protocol Layer": tutorial/10-protocol.md
-  - 中文教程:
-      - "教程首页": zh/tutorial/index.md
-      - "01 · 认识 MiniRedis": zh/tutorial/01-getting-started.md
-      - "02 · 一条命令的一生": zh/tutorial/02-life-of-a-command.md
-      - "03 · 数据类型与命令面": zh/tutorial/03-data-types.md
-      - "04 · 过期": zh/tutorial/04-expiration.md
-      - "05 · 内存与淘汰": zh/tutorial/05-eviction.md
-      - "06 · 持久化 I：AOF": zh/tutorial/06-persistence-aof.md
-      - "07 · 持久化 II：重写与快照": zh/tutorial/07-rewrite-snapshot.md
-      - "08 · 复制": zh/tutorial/08-replication.md
-      - "09 · 事务与阻塞": zh/tutorial/09-transactions-blocking.md
-      - "10 · 协议层": zh/tutorial/10-protocol.md
-  - Reference:
-      - "Quick Start": index.md
-      - "Architecture": architecture.md
-      - "Redis Mapping": redis-mapping.md
-      - "Hands-on Examples": labs-guide.md
-      - "Behavior Matrix": behavior-matrix.md
-      - "Design History Archive": superpowers/README.md
-  - 参考资料:
-      - "快速开始": zh/index.md
-      - "架构总览": zh/architecture.md
-      - "Redis 映射": zh/redis-mapping.md
-      - "动手实验": zh/labs-guide.md
-      - "行为矩阵": zh/behavior-matrix.md
+  - Home: index.md
+  - English:
+      - Tutorial:
+          - Tutorial Home: tutorial/index.md
+          - "01 · Meet MiniRedis": tutorial/01-getting-started.md
+          - "02 · The Life of a Command": tutorial/02-life-of-a-command.md
+          - "03 · Data Types and the Command Surface": tutorial/03-data-types.md
+          - "04 · Expiration": tutorial/04-expiration.md
+          - "05 · Memory and Eviction": tutorial/05-eviction.md
+          - "06 · Persistence I: AOF": tutorial/06-persistence-aof.md
+          - "07 · Persistence II: Rewrite and Snapshots": tutorial/07-rewrite-snapshot.md
+          - "08 · Replication": tutorial/08-replication.md
+          - "09 · Transactions and Blocking": tutorial/09-transactions-blocking.md
+          - "10 · Protocol Layer": tutorial/10-protocol.md
+      - Reference:
+          - Architecture: architecture.md
+          - Redis Mapping: redis-mapping.md
+          - Hands-on Examples: labs-guide.md
+          - Behavior Matrix: behavior-matrix.md
+          - Design History Archive: superpowers/README.md
+  - 简体中文:
+      - 教程:
+          - 教程首页: zh/tutorial/index.md
+          - "01 · 认识 MiniRedis": zh/tutorial/01-getting-started.md
+          - "02 · 一条命令的一生": zh/tutorial/02-life-of-a-command.md
+          - "03 · 数据类型与命令面": zh/tutorial/03-data-types.md
+          - "04 · 过期": zh/tutorial/04-expiration.md
+          - "05 · 内存与淘汰": zh/tutorial/05-eviction.md
+          - "06 · 持久化 I：AOF": zh/tutorial/06-persistence-aof.md
+          - "07 · 持久化 II：重写与快照": zh/tutorial/07-rewrite-snapshot.md
+          - "08 · 复制": zh/tutorial/08-replication.md
+          - "09 · 事务与阻塞": zh/tutorial/09-transactions-blocking.md
+          - "10 · 协议层": zh/tutorial/10-protocol.md
+      - 参考资料:
+          - 快速开始: zh/index.md
+          - 架构总览: zh/architecture.md
+          - Redis 映射: zh/redis-mapping.md
+          - 动手实验: zh/labs-guide.md
+          - 行为矩阵: zh/behavior-matrix.md
 
 markdown_extensions:
   - admonition

@@ -6,8 +6,6 @@ from pathlib import Path
 import subprocess
 import sys
 
-import pytest
-
 from journey.tools import build_journey
 
 

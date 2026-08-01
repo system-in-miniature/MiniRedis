@@ -1,0 +1,21 @@
+failure_files = [
+  "tests/unit/persistence/test_aof_repair.py",
+  "tests/unit/persistence/test_codec.py",
+  "tests/unit/persistence/test_framing.py",
+]
+
+[[blocks]]
+id = "canonical-codec"
+title_en = "Canonical payloads and checksummed frames"
+title_zh = "Canonical Payload 与校验帧"
+summary_en = "Encode stable values as strict canonical JSON and wrap AOF/snapshot payloads with versioned headers, lengths, and CRC32."
+summary_zh = "把稳定值编码为严格 Canonical JSON，再用版本 Header、Length 与 CRC32 包装 AOF/Snapshot Payload。"
+files = ["src/miniredis/persistence/codec.py"]
+
+[[blocks]]
+id = "aof-tail-repair"
+title_en = "Bounded AOF tail repair"
+title_zh = "有界 AOF Tail 修复"
+summary_en = "Treat only one incomplete final frame as repairable; reject checksum, schema, header, and sequence corruption without rewriting evidence."
+summary_zh = "只把一个不完整末帧视为可修复；Checksum、Schema、Header 与 Sequence 损坏都拒绝且不改写证据。"
+files = ["src/miniredis/persistence/aof.py"]

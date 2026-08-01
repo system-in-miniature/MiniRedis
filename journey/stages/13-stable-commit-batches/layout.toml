@@ -1,0 +1,25 @@
+failure_files = ["tests/unit/core/test_commit.py"]
+
+[[blocks]]
+id = "stable-commit-model"
+title_en = "Stable commit and snapshot values"
+title_zh = "稳定 Commit 与 Snapshot 值"
+summary_en = "Freeze every Redis value into deterministic transport-independent operations, batches, and sorted snapshot images."
+summary_zh = "把每个 Redis Value 冻结成确定、Transport-independent 的 Operation、Batch 与有序 Snapshot Image。"
+files = ["src/miniredis/core/commit.py"]
+
+[[blocks]]
+id = "database-replay"
+title_en = "Atomic batch replay"
+title_zh = "原子 Batch 重放"
+summary_en = "Apply one contiguous batch through a staged map and export deep-frozen logical or snapshot state."
+summary_zh = "通过 Staged Map 应用一个连续 Batch，并导出深度冻结的逻辑或 Snapshot 状态。"
+files = ["src/miniredis/core/database.py"]
+
+[[blocks]]
+id = "commit-allocation"
+title_en = "Late commit-sequence allocation"
+title_zh = "延后 Commit Sequence 分配"
+summary_en = "Keep operations sequence-free during planning and allocate the next sequence only at the serialized append boundary."
+summary_zh = "规划时让 Operation 不带 Sequence，只在串行 Append 边界分配下一个 Sequence。"
+files = ["src/miniredis/core/executor.py"]

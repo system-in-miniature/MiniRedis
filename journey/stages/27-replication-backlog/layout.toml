@@ -1,0 +1,29 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/replication/test_partial_resync.py",
+  "tests/unit/replication/test_backlog.py",
+]
+
+[[blocks]]
+id = "backlog-domain"
+title_en = "Bounded replication history"
+title_zh = "有界 Replication History"
+summary_en = "Represent source identity, replica cursor, full/partial attachments, and a contiguous ring of recent commit batches with explicit coverage queries."
+summary_zh = "表示 Source Identity、Replica Cursor、Full/Partial Attachment，以及带显式 Coverage Query 的连续 Recent Commit Batch Ring。"
+files = ["src/miniredis/replication/backlog.py"]
+
+[[blocks]]
+id = "attachment-selection"
+title_en = "Atomic attachment selection"
+title_zh = "原子 Attachment Selection"
+summary_en = "At one executor boundary, compare cursor identity and backlog coverage, freeze either a snapshot or missing batch suffix, register the sink, and count the sync mode."
+summary_zh = "在一个 Executor Boundary 中比较 Cursor Identity 与 Backlog Coverage，冻结 Snapshot 或 Missing Batch Suffix，注册 Sink 并统计 Sync Mode。"
+files = ["src/miniredis/core/executor.py", "src/miniredis/replication/sink.py"]
+
+[[blocks]]
+id = "backlog-runtime"
+title_en = "Backlog configuration and identity"
+title_zh = "Backlog 配置与 Identity"
+summary_en = "Validate retention capacity, generate one source identity per runtime generation, wire deterministic test identities, and expose backlog/sync counters."
+summary_zh = "校验 Retention Capacity，为每个 Runtime Generation 生成一个 Source Identity，接线确定性 Test Identity，并暴露 Backlog/Sync Counter。"
+files = ["src/miniredis/config.py", "src/miniredis/runtime.py"]

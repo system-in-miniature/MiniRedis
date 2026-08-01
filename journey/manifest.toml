@@ -183,7 +183,7 @@ number = 24
 slug = "decaying-lfu"
 endpoint = "b25b473"
 chapter = 5
-tests = ["tests/unit/core/test_frequency.py", "tests/contract/test_eviction.py"]
+tests = ["tests/contract/test_eviction.py", "tests/mechanisms/test_transactions.py", "tests/mechanisms/test_watch.py", "tests/reliability/test_final_acceptance.py", "tests/unit/core/test_domain_types.py", "tests/unit/core/test_frequency.py"]
 
 [[stages]]
 number = 25

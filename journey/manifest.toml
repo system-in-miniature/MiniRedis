@@ -190,7 +190,7 @@ number = 25
 slug = "aof-state-base"
 endpoint = "b9b363e"
 chapter = 7
-tests = ["tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py", "tests/unit/persistence/test_recovery.py"]
+tests = ["tests/reliability/test_final_acceptance.py", "tests/reliability/test_phase3_invariants.py", "tests/reliability/test_restart.py", "tests/replication/test_sink_attach.py", "tests/unit/persistence/test_aof_repair.py", "tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py", "tests/unit/persistence/test_recovery.py"]
 
 [[stages]]
 number = 26

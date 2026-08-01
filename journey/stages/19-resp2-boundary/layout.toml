@@ -1,0 +1,13 @@
+failure_files = [
+  "tests/adapters/test_resp2_decode.py",
+  "tests/adapters/test_resp2_encode.py",
+  "tests/adapters/test_resp2_mapping.py",
+]
+
+[[blocks]]
+id = "resp2-boundary"
+title_en = "Binary-safe RESP2 boundary"
+title_zh = "二进制安全的 RESP2 边界"
+summary_en = "Incrementally decode bounded wire frames, keep bulk values as bytes, map command arrays into domain requests, and encode every outbound value explicitly."
+summary_zh = "增量解码有界 Wire Frame，保持 Bulk Value 为 Bytes，把命令 Array 映射成领域 Request，并显式编码每种 Outbound Value。"
+files = ["src/miniredis/adapters/resp2.py"]

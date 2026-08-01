@@ -1,0 +1,30 @@
+failure_files = [
+  "tests/adapters/test_direct_resp_parity.py",
+  "tests/adapters/test_tcp_async_semantics.py",
+  "tests/adapters/test_tcp_smoke.py",
+  "tests/interop/test_redis_py_resp2.py",
+]
+
+[[blocks]]
+id = "tcp-session"
+title_en = "Owned TCP session pumps"
+title_zh = "Owned TCP Session Pump"
+summary_en = "Give each connection one incremental reader, one ordered outbox writer, bounded decoded-frame buffering, and one idempotent close path."
+summary_zh = "为每条连接提供一个增量 Reader、一个有序 Outbox Writer、有界已解码 Frame Buffer，以及一条幂等 Close 路径。"
+files = ["src/miniredis/adapters/tcp.py"]
+
+[[blocks]]
+id = "runtime-session-boundary"
+title_en = "Runtime-owned network sessions"
+title_zh = "Runtime 持有的网络 Session"
+summary_en = "Register TCP endpoints with the same executor, preserve request cancellation and outbox semantics, and close servers before releasing endpoints."
+summary_zh = "把 TCP Endpoint 注册到同一个 Executor，保持请求取消与 Outbox 语义，并在释放 Endpoint 前关闭 Server。"
+files = ["src/miniredis/config.py", "src/miniredis/core/executor.py", "src/miniredis/runtime.py"]
+
+[[blocks]]
+id = "client-scaffold"
+title_en = "Real-client test dependency"
+title_zh = "真实 Client 测试依赖"
+summary_en = "Add the redis-py interop dependency and lock it reproducibly without treating packaging metadata as a storage mechanism."
+summary_zh = "加入 redis-py 互操作依赖并可复现地锁定它，但不把 Packaging Metadata 当成存储机制。"
+files = ["pyproject.toml", "uv.lock"]

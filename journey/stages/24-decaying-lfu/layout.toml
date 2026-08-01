@@ -1,0 +1,40 @@
+failure_files = [
+  "tests/contract/test_eviction.py",
+  "tests/mechanisms/test_transactions.py",
+  "tests/mechanisms/test_watch.py",
+  "tests/reliability/test_final_acceptance.py",
+  "tests/unit/core/test_domain_types.py",
+  "tests/unit/core/test_frequency.py",
+]
+
+[[blocks]]
+id = "frequency-projection"
+title_en = "Pure decaying-frequency projection"
+title_zh = "纯函数衰减 Frequency Projection"
+summary_en = "Project an access counter through elapsed decay windows without mutating database entries during candidate comparison."
+summary_zh = "让访问 Counter 穿过已过去的 Decay Window 做 Projection，Candidate 比较期间不修改 Database Entry。"
+files = ["src/miniredis/core/frequency.py"]
+
+[[blocks]]
+id = "lfu-metadata"
+title_en = "LFU metadata ownership"
+title_zh = "LFU Metadata 所有权"
+summary_en = "Track frequency and decay anchor on each live entry, update them only on real access/commit, and keep recovery neutral and forks independent."
+summary_zh = "在每个 Live Entry 上记录 Frequency 与 Decay Anchor，只在真实 Access/Commit 时更新，并让 Recovery 保持中性、Fork 相互独立。"
+files = ["src/miniredis/core/database.py"]
+
+[[blocks]]
+id = "lfu-eviction"
+title_en = "Deterministic LFU victim planning"
+title_zh = "确定性 LFU Victim Planning"
+summary_en = "Rank candidates by projected frequency, access tick, then key while leaving surviving metadata untouched."
+summary_zh = "按 Projected Frequency、Access Tick、Key 排序 Candidate，同时不改动 Survivor Metadata。"
+files = ["src/miniredis/core/eviction.py"]
+
+[[blocks]]
+id = "lfu-runtime"
+title_en = "LFU execution and observability"
+title_zh = "LFU 执行与可观测性"
+summary_en = "Validate policy/decay configuration, pass one clock through live, transaction, replica, and recovery paths, and count terminal eviction/abort outcomes."
+summary_zh = "校验 Policy/Decay 配置，让同一个 Clock 贯穿 Live、Transaction、Replica 与 Recovery 路径，并统计终态 Eviction/Abort Outcome。"
+files = ["src/miniredis/config.py", "src/miniredis/core/executor.py", "src/miniredis/runtime.py"]

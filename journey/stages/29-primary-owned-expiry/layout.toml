@@ -1,0 +1,26 @@
+failure_files = [
+  "tests/contract/test_domain_invariants.py",
+  "tests/contract/test_eviction.py",
+  "tests/contract/test_ttl.py",
+  "tests/mechanisms/test_blpop_push_batch.py",
+  "tests/reliability/test_final_acceptance.py",
+  "tests/reliability/test_transaction_commit.py",
+  "tests/replication/test_partial_resync.py",
+  "tests/replication/test_sink_attach.py",
+]
+
+[[blocks]]
+id = "primary-expiry-owner"
+title_en = "Primary-owned physical expiry"
+title_zh = "Primary 持有的物理 Expiry"
+summary_en = "Let replicas hide expired values logically but suppress lazy and active expiry commits so only primary-propagated deletes advance replicated history."
+summary_zh = "让 Replica 逻辑隐藏过期 Value，但抑制 Lazy/Active Expiry Commit，使只有 Primary-propagated Delete 推进复制 History。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "role-aware-producers"
+title_en = "Role-aware expiry producer lifecycle"
+title_zh = "Role-aware Expiry Producer Lifecycle"
+summary_en = "Quiesce the active-expire producer after full install or partial resume and restart it only after successful promotion."
+summary_zh = "Full Install 或 Partial Resume 后 Quiesce Active-expire Producer，只在成功 Promotion 后重新启动。"
+files = ["src/miniredis/runtime.py", "src/miniredis/replication/sink.py"]

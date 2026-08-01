@@ -218,7 +218,7 @@ number = 29
 slug = "primary-owned-expiry"
 endpoint = "94109b0"
 chapter = 8
-tests = ["tests/contract/test_ttl.py", "tests/replication/test_sink_attach.py", "tests/reliability/test_final_acceptance.py"]
+tests = ["tests/contract/test_domain_invariants.py", "tests/contract/test_eviction.py", "tests/contract/test_ttl.py", "tests/mechanisms/test_blpop_push_batch.py", "tests/reliability/test_final_acceptance.py", "tests/reliability/test_transaction_commit.py", "tests/replication/test_partial_resync.py", "tests/replication/test_sink_attach.py"]
 
 [[stages]]
 number = 30

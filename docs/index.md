@@ -12,6 +12,17 @@ MiniRedis 是一个直接 API 优先、二进制安全的 Redis 机制模型，�
 过期、淘汰、事务、持久化、Pub/Sub 与可续传复制。类型化命令先无副作用地生成
 执行计划，跨过持久化边界后，再以不可变提交批次应用并传播。
 
+## Three learning modes / 三种学习模式
+
+1. **[Mechanism Tutorial / 机制教程](tutorial/index.md)**：按主题理解命令执行、
+   过期、淘汰、持久化、复制与协议边界。
+2. **[Self-Guided Rebuild / 自主重建](journey/index.md)**：按 30 个 Stage 浏览
+   测试契约、概念、机制板块、逐文件差异与关键语句。
+3. **[Agent-Guided Rebuild / Agent 带教](agent-guided.md)**：在终端直接要求
+   Codex 开始某个 Stage，通过快速理解筛查、实现、代码走读与累计验收完成学习。
+
+测试用于把错误表现和完成证据说清楚，但课程不要求所有实现都采用测试优先叙事。
+
 ## Install / 安装
 
 ```bash

@@ -1,0 +1,55 @@
+name: Polished Journey
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "journey/**"
+      - "docs/**"
+      - "src/**"
+      - "tests/**"
+      - "AGENTS.md"
+      - "README*.md"
+      - "mkdocs.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/journey.yml"
+  pull_request:
+    paths:
+      - "journey/**"
+      - "docs/**"
+      - "src/**"
+      - "tests/**"
+      - "AGENTS.md"
+      - "README*.md"
+      - "mkdocs.yml"
+      - "pyproject.toml"
+      - "uv.lock"
+      - ".github/workflows/journey.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  journey:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+          python-version: "3.12"
+      - name: Install locked development environment
+        run: uv sync --dev --locked
+      - name: Verify browser pages are generated
+        run: |
+          uv run python -m journey.tools.render_pages
+          git diff --exit-code -- docs/journey docs/zh/journey
+      - name: Verify Journey contracts
+        run: uv run pytest -q journey/tools/tests tests/test_docs_homepage.py
+      - name: Rebuild and verify all thirty Stages
+        run: uv run python -m journey.tools.build_journey --check
+      - name: Build documentation strictly
+        run: uv run --with mkdocs-material==9.7.7 mkdocs build --strict

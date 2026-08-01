@@ -7,10 +7,14 @@ import argparse
 from dataclasses import dataclass
 from pathlib import Path
 import re
+import shlex
 import shutil
 import subprocess
 import sys
 import tempfile
+
+if __package__ in {None, ""}:
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from journey.tools.extract_history import HistoryManifest, load_manifest
 
@@ -18,6 +22,9 @@ from journey.tools.extract_history import HistoryManifest, load_manifest
 ROOT = Path(__file__).resolve().parents[2]
 STAGES_ROOT = ROOT / "journey" / "stages"
 MANIFEST_PATH = ROOT / "journey" / "manifest.toml"
+DEFAULT_AGENT_WORKSPACES_ROOT = ROOT / ".journey-workspaces"
+LEARNING_WORKSPACE_CONFIG_KEY = "journey.learningWorkspace"
+AGENT_STAGE_CONFIG_KEY = "journey.agentStage"
 PATCH_HEADER = re.compile(r"^diff --git a/(.+?) b/(.+?)$", re.MULTILINE)
 DELIVERABLE = re.compile(r"^- `([^`]+)`$", re.MULTILINE)
 
@@ -225,6 +232,23 @@ def check_chain(
     return tuple(results)
 
 
+def assert_stage_parity(
+    workspace: Path,
+    stages: tuple[Stage, ...],
+    stage_number: int,
+    *,
+    roots: tuple[str, ...],
+) -> None:
+    """Compare a learner result with the exact cumulative Stage boundary."""
+
+    with tempfile.TemporaryDirectory(prefix=f"miniredis-stage-{stage_number:02d}-") as raw:
+        expected = Path(raw)
+        _run(["git", "init", "-q"], cwd=expected)
+        for stage in stages[:stage_number]:
+            _apply_stage(stage, expected)
+        assert_tree_parity(workspace, expected, roots=roots)
+
+
 def parity_roots(manifest: HistoryManifest) -> tuple[str, ...]:
     return (*manifest.owned_roots, *manifest.owned_files)
 
@@ -265,6 +289,81 @@ def prepare_workspace(
         _apply_stage(stages[count], destination)
 
 
+def default_agent_workspace(stage: Stage) -> Path:
+    return DEFAULT_AGENT_WORKSPACES_ROOT / stage.label
+
+
+def _local_git_config(workspace: Path, key: str) -> str | None:
+    result = subprocess.run(
+        ["git", "config", "--local", "--get", key],
+        cwd=workspace,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        check=False,
+    )
+    return result.stdout.strip() if result.returncode == 0 else None
+
+
+def _print_agent_handoff(stage: Stage, workspace: Path, *, status: str) -> None:
+    check_command = shlex.join(
+        [
+            sys.executable,
+            str(Path(__file__).resolve()),
+            "check",
+            str(stage.number),
+            "--workspace",
+            str(workspace.resolve()),
+        ]
+    )
+    print(f"[agent {stage.label}] {status}")
+    print(f"WORKSPACE: {workspace.resolve()}")
+    print(f"CHECK: {check_command}")
+
+
+def agent(
+    stage: Stage,
+    stages: tuple[Stage, ...],
+    workspace: Path,
+    *,
+    yes: bool,
+) -> None:
+    """Prepare once, then resume a Stage-specific learner repository."""
+
+    workspace = workspace.resolve()
+    if workspace.exists() and (workspace / ".git").exists():
+        marked = _local_git_config(workspace, LEARNING_WORKSPACE_CONFIG_KEY)
+        if marked != "true":
+            raise JourneyError(f"refusing to use an unmarked Git repository: {workspace}")
+        configured = _local_git_config(workspace, AGENT_STAGE_CONFIG_KEY)
+        if not yes and configured == f"{stage.number:02d}":
+            _print_agent_handoff(stage, workspace, status="RESUME")
+            return
+        if not yes and configured is not None:
+            raise JourneyError(
+                f"{workspace} is prepared for Stage {configured}; "
+                "use its Stage-specific workspace or pass --yes to reset it"
+            )
+    elif workspace.exists() and any(workspace.iterdir()):
+        raise JourneyError(f"refusing to use a non-empty unmarked directory: {workspace}")
+
+    prepare_workspace(
+        stages,
+        stage.number - 1,
+        workspace,
+        apply_current=False,
+    )
+    _run(
+        ["git", "config", "--local", LEARNING_WORKSPACE_CONFIG_KEY, "true"],
+        cwd=workspace,
+    )
+    _run(
+        ["git", "config", "--local", AGENT_STAGE_CONFIG_KEY, f"{stage.number:02d}"],
+        cwd=workspace,
+    )
+    _print_agent_handoff(stage, workspace, status="READY")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true", dest="check_chain")
@@ -301,10 +400,22 @@ def main() -> int:
         raise JourneyError(f"Stage must be between 1 and {len(stages)}")
     selected = stages[arguments.stage - 1]
     default = ROOT.parent / "MiniRedis-journey-workspace"
-    destination = arguments.workspace or default
+    destination = arguments.workspace or (
+        default_agent_workspace(selected) if arguments.command == "agent" else default
+    )
     if arguments.command == "check":
         output = _run_stage_tests(selected, destination)
         print(output.rstrip())
+        assert_stage_parity(
+            destination,
+            stages,
+            selected.number,
+            roots=parity_roots(manifest),
+        )
+        print(f"[check {selected.label}] PASS — tests and canonical parity")
+        return 0
+    if arguments.command == "agent":
+        agent(selected, stages, destination, yes=arguments.yes)
         return 0
     if destination.exists() and not arguments.yes:
         raise JourneyError(f"workspace already exists: {destination}; pass --yes to reset")

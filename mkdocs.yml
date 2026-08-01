@@ -19,7 +19,7 @@ theme:
 nav:
   - Home: index.md
   - English:
-      - Tutorial:
+      - Mechanism Tutorial:
           - Tutorial Home: tutorial/index.md
           - "01 · Meet MiniRedis": tutorial/01-getting-started.md
           - "02 · The Life of a Command": tutorial/02-life-of-a-command.md
@@ -31,6 +31,40 @@ nav:
           - "08 · Replication": tutorial/08-replication.md
           - "09 · Transactions and Blocking": tutorial/09-transactions-blocking.md
           - "10 · Protocol Layer": tutorial/10-protocol.md
+      - Self-Guided Rebuild:
+          - Build MiniRedis yourself: journey/index.md
+          - "01 · Domain state and commit vocabulary": journey/stage-01.md
+          - "02 · Typed commands and strict parsing": journey/stage-02.md
+          - "03 · Serialized Direct executor": journey/stage-03.md
+          - "04 · Atomic String planning": journey/stage-04.md
+          - "05 · Hash and List planning": journey/stage-05.md
+          - "06 · Set and Sorted Set projections": journey/stage-06.md
+          - "07 · Absolute TTL and bounded expiry": journey/stage-07.md
+          - "08 · Deterministic eviction": journey/stage-08.md
+          - "09 · Request ownership and terminal outcomes": journey/stage-09.md
+          - "10 · Ordered outbox and slow sessions": journey/stage-10.md
+          - "11 · Blocking pop race ownership": journey/stage-11.md
+          - "12 · Pub/Sub and supervised shutdown": journey/stage-12.md
+          - "13 · Stable commit batches": journey/stage-13.md
+          - "14 · Canonical persistence frames": journey/stage-14.md
+          - "15 · AOF commit barrier": journey/stage-15.md
+          - "16 · Snapshot capture and recovery": journey/stage-16.md
+          - "17 · Asynchronous replication": journey/stage-17.md
+          - "18 · Promotion and supervised lifecycle": journey/stage-18.md
+          - "19 · RESP2 protocol boundary": journey/stage-19.md
+          - "20 · TCP runtime parity": journey/stage-20.md
+          - "21 · Bulk strings and directional blocking pop": journey/stage-21.md
+          - "22 · Ordered pipelines": journey/stage-22.md
+          - "23 · Transactions and atomic functions": journey/stage-23.md
+          - "24 · Decaying LFU eviction": journey/stage-24.md
+          - "25 · AOF state base": journey/stage-25.md
+          - "26 · Online AOF rewrite": journey/stage-26.md
+          - "27 · Replication backlog": journey/stage-27.md
+          - "28 · Partial resynchronization": journey/stage-28.md
+          - "29 · Primary-owned expiry": journey/stage-29.md
+          - "30 · Public parity and reading map": journey/stage-30.md
+      - Agent-Guided Rebuild:
+          - CLI usage: agent-guided.md
       - Reference:
           - Architecture: architecture.md
           - Redis Mapping: redis-mapping.md
@@ -38,7 +72,7 @@ nav:
           - Behavior Matrix: behavior-matrix.md
           - Design History Archive: superpowers/README.md
   - 简体中文:
-      - 教程:
+      - 机制教程:
           - 教程首页: zh/tutorial/index.md
           - "01 · 认识 MiniRedis": zh/tutorial/01-getting-started.md
           - "02 · 一条命令的一生": zh/tutorial/02-life-of-a-command.md
@@ -50,6 +84,40 @@ nav:
           - "08 · 复制": zh/tutorial/08-replication.md
           - "09 · 事务与阻塞": zh/tutorial/09-transactions-blocking.md
           - "10 · 协议层": zh/tutorial/10-protocol.md
+      - 自主重建:
+          - 从零构建 MiniRedis: zh/journey/index.md
+          - "01 · 领域状态与提交词汇": zh/journey/stage-01.md
+          - "02 · 类型化命令与严格解析": zh/journey/stage-02.md
+          - "03 · 串行 Direct 执行器": zh/journey/stage-03.md
+          - "04 · 原子 String 规划": zh/journey/stage-04.md
+          - "05 · Hash 与 List 规划": zh/journey/stage-05.md
+          - "06 · Set 与 Sorted Set 投影": zh/journey/stage-06.md
+          - "07 · 绝对 TTL 与有界过期": zh/journey/stage-07.md
+          - "08 · 确定性淘汰": zh/journey/stage-08.md
+          - "09 · 请求所有权与终态结果": zh/journey/stage-09.md
+          - "10 · 有序 Outbox 与慢 Session": zh/journey/stage-10.md
+          - "11 · 阻塞 Pop 竞态所有权": zh/journey/stage-11.md
+          - "12 · Pub/Sub 与受监督关闭": zh/journey/stage-12.md
+          - "13 · 稳定 Commit Batch": zh/journey/stage-13.md
+          - "14 · Canonical 持久化帧": zh/journey/stage-14.md
+          - "15 · AOF 提交屏障": zh/journey/stage-15.md
+          - "16 · Snapshot Capture 与恢复": zh/journey/stage-16.md
+          - "17 · 异步复制": zh/journey/stage-17.md
+          - "18 · 晋升与受监督生命周期": zh/journey/stage-18.md
+          - "19 · RESP2 协议边界": zh/journey/stage-19.md
+          - "20 · TCP Runtime 一致性": zh/journey/stage-20.md
+          - "21 · 批量 String 与方向性阻塞 Pop": zh/journey/stage-21.md
+          - "22 · 有序 Pipeline": zh/journey/stage-22.md
+          - "23 · 事务与原子函数": zh/journey/stage-23.md
+          - "24 · 衰减式 LFU 淘汰": zh/journey/stage-24.md
+          - "25 · AOF 状态基线": zh/journey/stage-25.md
+          - "26 · 在线 AOF 重写": zh/journey/stage-26.md
+          - "27 · 复制积压日志": zh/journey/stage-27.md
+          - "28 · 部分重新同步": zh/journey/stage-28.md
+          - "29 · Primary 持有过期删除": zh/journey/stage-29.md
+          - "30 · 公共一致性与阅读地图": zh/journey/stage-30.md
+      - Agent 带教:
+          - CLI 使用教程: zh/agent-guided.md
       - 参考资料:
           - 快速开始: zh/index.md
           - 架构总览: zh/architecture.md
@@ -63,5 +131,8 @@ markdown_extensions:
   - tables
   - pymdownx.details
   - pymdownx.superfences
+
+extra_javascript:
+  - assets/javascripts/language-switch.js
 
 strict: true

@@ -172,9 +172,16 @@ uv run python tools/count_sloc.py
 
 SLOC 分别报告生产 Python、测试 Python 和 Markdown 文档。它只负责报告，绝不会根据规模范围判定接受或拒绝。
 
-## 课程分离
+## 学习模式
 
-本仓库是完成后的参考项目。课程材料与之分离，目前尚未生成；此处没有 `course/` 目录，也没有固定章节数。
+1. **[机制教程](docs/zh/tutorial/index.md)**：按 Redis 机制与所有权边界理解完成后的系统。
+2. **[自主重建](docs/zh/journey/index.md)**：通过 30 个浏览器原生 Stage 重建项目，
+   每个 Stage 都包含明确的测试契约、分组机制差异、关键语句与累计证据。
+3. **[Agent 带教](docs/zh/agent-guided.md)**：在当前仓库打开 Codex，直接说
+   `开始 Agent 带教 Stage NN`；Codex 会自动准备或续接正确的 Stage 基线并互动带完实现。
+
+测试把错误动机与完成证据变成可执行契约，但不强制整套课程采用测试优先叙事。
+Agent 带教网页只提供使用教程；真正的互动教学契约由根目录 `AGENTS.md` 持有。
 
 ## 商标声明
 

@@ -231,11 +231,21 @@ uv run python tools/count_sloc.py
 SLOC reports production Python, test Python, and Markdown documentation
 separately. It is reported, never accepted or rejected by a size range.
 
-## Course separation
+## Learning modes
 
-This repository is the finished reference project. Course material is separate
-and has not yet been generated; there is no `course/` directory or fixed
-chapter count here.
+1. **[Mechanism Tutorial](docs/tutorial/index.md)** — study the completed system
+   by Redis mechanism and ownership boundary.
+2. **[Self-Guided Rebuild](docs/journey/index.md)** — rebuild the project across
+   30 browser-native Stages with explicit test contracts, grouped mechanism
+   diffs, critical statements, and cumulative evidence.
+3. **[Agent-Guided Rebuild](docs/agent-guided.md)** — open Codex in this
+   repository and say `开始 Agent 带教 Stage NN`; Codex prepares or resumes the
+   correct Stage baseline and guides the implementation interactively.
+
+Tests make failure motivation and completion evidence executable. They do not
+force every lesson into a test-first teaching sequence. The Agent-Guided web
+page is intentionally only a usage guide; the root `AGENTS.md` owns the actual
+interactive teaching contract.
 
 ## Trademark Notice
 

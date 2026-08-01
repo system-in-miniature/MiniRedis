@@ -1,0 +1,69 @@
+failure_files = []
+
+[[blocks]]
+id = "executable-examples"
+title_en = "Executable public scenarios"
+title_zh = "可执行公共场景"
+summary_en = "Demonstrate crash recovery, deterministic LFU, and partial-versus-full replica resynchronization through public APIs and visible replies."
+summary_zh = "通过 Public API 与可见 Reply 演示 Crash Recovery、确定性 LFU，以及 Partial-vs-full Replica Resynchronization。"
+files = ["examples/aof_crash_recovery.py", "examples/lfu_eviction.py", "examples/replication_resync.py"]
+
+[[blocks]]
+id = "public-protocol-surface"
+title_en = "Public and protocol module contracts"
+title_zh = "公共接口与协议模块契约"
+summary_en = "Document the Direct-first API, adapter ownership, binary request/reply boundary, clock/config inputs, and typed command surface."
+summary_zh = "记录 Direct-first API、Adapter Ownership、Binary Request/Reply Boundary、Clock/Config Input 与 Typed Command Surface。"
+files = [
+  "src/miniredis/__init__.py",
+  "src/miniredis/adapters/direct.py",
+  "src/miniredis/adapters/resp2.py",
+  "src/miniredis/adapters/tcp.py",
+  "src/miniredis/clock.py",
+  "src/miniredis/commands/model.py",
+  "src/miniredis/commands/parser.py",
+  "src/miniredis/commands/request.py",
+  "src/miniredis/config.py",
+]
+
+[[blocks]]
+id = "core-reading-map"
+title_en = "Core state-machine reading map"
+title_zh = "核心状态机阅读地图"
+summary_en = "State the responsibility, Redis correspondence, and deliberate teaching trade-offs of commits, database state, planning, queues, transactions, Pub/Sub, expiry, eviction, and data-type planners."
+summary_zh = "说明 Commit、Database State、Planning、Queue、Transaction、Pub/Sub、Expiry、Eviction 与各数据类型 Planner 的职责、Redis 对应物和有意教学取舍。"
+files = [
+  "src/miniredis/core/blocking.py",
+  "src/miniredis/core/commit.py",
+  "src/miniredis/core/database.py",
+  "src/miniredis/core/eviction.py",
+  "src/miniredis/core/expiration.py",
+  "src/miniredis/core/frequency.py",
+  "src/miniredis/core/hash_planner.py",
+  "src/miniredis/core/list_planner.py",
+  "src/miniredis/core/mailbox.py",
+  "src/miniredis/core/outbound.py",
+  "src/miniredis/core/planner.py",
+  "src/miniredis/core/planning.py",
+  "src/miniredis/core/pubsub.py",
+  "src/miniredis/core/reply.py",
+  "src/miniredis/core/set_planner.py",
+  "src/miniredis/core/transactions.py",
+  "src/miniredis/core/ttl_planner.py",
+  "src/miniredis/core/values.py",
+  "src/miniredis/core/zset_planner.py",
+]
+
+[[blocks]]
+id = "durability-replication-map"
+title_en = "Durability and replication reading map"
+title_zh = "Durability 与 Replication 阅读地图"
+summary_en = "Document AOF, codec, recovery, snapshot, and logical replication-backlog boundaries, including where MiniRedis intentionally differs from Redis implementation details."
+summary_zh = "记录 AOF、Codec、Recovery、Snapshot 与 Logical Replication-backlog Boundary，包括 MiniRedis 有意不同于 Redis 实现细节的位置。"
+files = [
+  "src/miniredis/persistence/aof.py",
+  "src/miniredis/persistence/codec.py",
+  "src/miniredis/persistence/recovery.py",
+  "src/miniredis/persistence/snapshot.py",
+  "src/miniredis/replication/backlog.py",
+]

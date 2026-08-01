@@ -1,3 +1,7 @@
 tests/replication/test_promotion.py
-tests/reliability/test_final_acceptance.py
+tests/reliability/test_ambiguous_outcome.py
+tests/reliability/test_lost_acked_write.py
+tests/reliability/test_phase3_invariants.py
 tests/reliability/test_reliability_shutdown.py
+tests/reliability/test_restart.py
+tests/reliability/test_worker_failure.py

@@ -1,3 +1,5 @@
 tests/replication/test_sink_attach.py
+tests/replication/test_sink_failure_isolation.py
 tests/replication/test_sink_lag.py
 tests/replication/test_sink_overflow.py
+tests/unit/commands/test_command_traits.py

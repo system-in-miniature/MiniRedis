@@ -134,14 +134,14 @@ number = 17
 slug = "asynchronous-replication"
 endpoint = "e18be82"
 chapter = 8
-tests = ["tests/replication/test_sink_attach.py", "tests/replication/test_sink_lag.py", "tests/replication/test_sink_overflow.py"]
+tests = ["tests/replication/test_sink_attach.py", "tests/replication/test_sink_failure_isolation.py", "tests/replication/test_sink_lag.py", "tests/replication/test_sink_overflow.py", "tests/unit/commands/test_command_traits.py"]
 
 [[stages]]
 number = 18
 slug = "promotion-lifecycle"
 endpoint = "0fbaeee"
 chapter = 8
-tests = ["tests/replication/test_promotion.py", "tests/reliability/test_final_acceptance.py", "tests/reliability/test_reliability_shutdown.py"]
+tests = ["tests/replication/test_promotion.py", "tests/reliability/test_ambiguous_outcome.py", "tests/reliability/test_lost_acked_write.py", "tests/reliability/test_phase3_invariants.py", "tests/reliability/test_reliability_shutdown.py", "tests/reliability/test_restart.py", "tests/reliability/test_worker_failure.py"]
 
 [[stages]]
 number = 19

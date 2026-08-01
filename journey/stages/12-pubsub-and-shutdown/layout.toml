@@ -1,0 +1,46 @@
+failure_files = [
+  "tests/concurrency/test_async_invariants.py",
+  "tests/concurrency/test_shutdown.py",
+  "tests/concurrency/test_slow_endpoint.py",
+  "tests/mechanisms/test_pubsub.py",
+]
+
+[[blocks]]
+id = "typed-pubsub"
+title_en = "Typed Pub/Sub commands"
+title_zh = "类型化 Pub/Sub 命令"
+summary_en = "Preserve exact binary channels and explicit subscribe, unsubscribe, and publish intent at the parser boundary."
+summary_zh = "在 Parser 边界保留精确二进制 Channel 与显式 Subscribe、Unsubscribe、Publish 意图。"
+files = ["src/miniredis/commands/model.py", "src/miniredis/commands/parser.py"]
+
+[[blocks]]
+id = "pubsub-registry"
+title_en = "Bidirectional subscription ownership"
+title_zh = "双向 Subscription 所有权"
+summary_en = "Index channels by session and sessions by channel so publish and close cleanup are both bounded."
+summary_zh = "同时按 Session 索引 Channel、按 Channel 索引 Session，使 Publish 与 Close 清理都有界。"
+files = ["src/miniredis/core/pubsub.py"]
+
+[[blocks]]
+id = "pubsub-shutdown-executor"
+title_en = "Serialized Pub/Sub and shutdown barrier"
+title_zh = "串行化 Pub/Sub 与 Shutdown Barrier"
+summary_en = "Deliver push output and terminalize waiters, requests, subscriptions, and endpoints in executor order."
+summary_zh = "按 Executor 顺序发送 Push 输出，并终结 Waiter、Request、Subscription 与 Endpoint。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "lifecycle-supervision"
+title_en = "Supervised maintenance and shutdown"
+title_zh = "受监督维护与关闭"
+summary_en = "Quiesce control producers, bypass full user admission with a shutdown control, drain endpoints briefly, and release every owned task."
+summary_zh = "静止 Control Producer，用 Shutdown Control 绕过已满 User 准入，短暂排空 Endpoint，并释放每个 Owned Task。"
+files = ["src/miniredis/config.py", "src/miniredis/core/expiration.py", "src/miniredis/runtime.py"]
+
+[[blocks]]
+id = "direct-session-close"
+title_en = "Idempotent Direct session close"
+title_zh = "幂等 Direct Session 关闭"
+summary_en = "Turn client close into a shielded executor control and map lifecycle outcomes without bypassing session ownership."
+summary_zh = "把 Client Close 变成 Shielded Executor Control，并在不绕过 Session 所有权的前提下映射生命周期结果。"
+files = ["src/miniredis/adapters/direct.py"]

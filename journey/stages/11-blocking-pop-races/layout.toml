@@ -1,0 +1,46 @@
+failure_files = [
+  "tests/concurrency/test_blpop_races.py",
+  "tests/helpers/time.py",
+  "tests/mechanisms/test_blpop.py",
+  "tests/mechanisms/test_blpop_push_batch.py",
+]
+
+[[blocks]]
+id = "typed-blpop"
+title_en = "Typed BLPOP boundary"
+title_zh = "类型化 BLPOP 边界"
+summary_en = "Freeze ordered keys and a ceiling-rounded millisecond timeout before blocking state exists."
+summary_zh = "在 Blocking 状态存在前冻结有序 Key 与向上取整的毫秒 Timeout。"
+files = ["src/miniredis/commands/model.py", "src/miniredis/commands/parser.py"]
+
+[[blocks]]
+id = "deterministic-timers"
+title_en = "Injectable timer scheduling"
+title_zh = "可注入 Timer 调度"
+summary_en = "Separate reading time from scheduling callbacks so timeout-versus-push order can be driven deterministically."
+summary_zh = "分开读取时间与调度 Callback，使 Timeout 与 Push 顺序可被确定驱动。"
+files = ["src/miniredis/clock.py"]
+
+[[blocks]]
+id = "waiter-registry"
+title_en = "Indexed waiter ownership"
+title_zh = "索引化 Waiter 所有权"
+summary_en = "Index one waiter by identity, keys, and session, then permit only one generation-checked terminal transition."
+summary_zh = "按身份、Key 与 Session 索引一个 Waiter，并只允许一次经 Generation 校验的终态迁移。"
+files = ["src/miniredis/core/blocking.py"]
+
+[[blocks]]
+id = "blocking-arbitration"
+title_en = "Mailbox-ordered blocking arbitration"
+title_zh = "Mailbox 有序 Blocking 裁决"
+summary_en = "Resolve immediate pops, registrations, pushes, timeouts, cancellation, and session close through the single executor."
+summary_zh = "通过单一 Executor 裁决立即 Pop、注册、Push、Timeout、取消与 Session 关闭。"
+files = ["src/miniredis/core/planner.py", "src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "blocking-lifecycle"
+title_en = "Blocking client and runtime lifecycle"
+title_zh = "Blocking Client 与 Runtime 生命周期"
+summary_en = "Inject schedulers, expose causal waiter evidence, and map a closed blocking session to the public nil result."
+summary_zh = "注入 Scheduler、暴露有因果的 Waiter 证据，并把已关闭 Blocking Session 映射为公开 Nil 结果。"
+files = ["src/miniredis/adapters/direct.py", "src/miniredis/runtime.py"]

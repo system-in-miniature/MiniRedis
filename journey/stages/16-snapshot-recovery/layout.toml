@@ -1,0 +1,39 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/reliability/test_snapshot_barrier.py",
+  "tests/unit/persistence/test_corruption.py",
+  "tests/unit/persistence/test_recovery.py",
+  "tests/unit/persistence/test_snapshot_manager.py",
+]
+
+[[blocks]]
+id = "recovery"
+title_en = "Snapshot plus AOF recovery"
+title_zh = "Snapshot + AOF 恢复"
+summary_en = "Load a verified checkpoint, replay only its contiguous suffix, reject incompatible histories, and remove logically expired startup entries."
+summary_zh = "加载已验证 Checkpoint，只重放其连续 Suffix，拒绝不兼容 History，并移除启动时逻辑过期 Entry。"
+files = ["src/miniredis/persistence/recovery.py"]
+
+[[blocks]]
+id = "snapshot-manager"
+title_en = "Owned atomic snapshot job"
+title_zh = "Owned 原子 Snapshot Job"
+summary_en = "Allow one shielded save, capture quickly in executor order, and publish the encoded image through temp-write, fsync, rename, and directory fsync."
+summary_zh = "只允许一个 Shielded Save，按 Executor 顺序快速 Capture，再经 Temp-write、Fsync、Rename 与 Directory Fsync 发布 Encoded Image。"
+files = ["src/miniredis/persistence/snapshot.py"]
+
+[[blocks]]
+id = "snapshot-capture"
+title_en = "Consistent capture and restore"
+title_zh = "一致 Capture 与 Restore"
+summary_en = "Capture checkpoint sequence and logically live entries in one executor control turn, and restore deep-frozen state without access-policy history."
+summary_zh = "在一个 Executor Control Turn 中 Capture Checkpoint Sequence 与逻辑存活 Entry，并恢复不带 Access-policy History 的深度冻结状态。"
+files = ["src/miniredis/core/database.py", "src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "recovery-runtime"
+title_en = "Recovery-first runtime startup"
+title_zh = "Recovery-first Runtime 启动"
+summary_en = "Validate persistence paths, recover before accepting commands, wire snapshot ownership, and expose save as a runtime lifecycle operation."
+summary_zh = "校验 Persistence Path，在接受命令前恢复，接线 Snapshot 所有权，并把 Save 暴露为 Runtime Lifecycle Operation。"
+files = ["src/miniredis/config.py", "src/miniredis/runtime.py"]

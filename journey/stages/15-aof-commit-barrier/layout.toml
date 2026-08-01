@@ -1,0 +1,29 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/reliability/test_commit_barrier.py",
+  "tests/unit/persistence/test_aof_writer.py",
+]
+
+[[blocks]]
+id = "aof-writer"
+title_en = "Owned AOF writer and fsync policy"
+title_zh = "Owned AOF Writer 与 Fsync Policy"
+summary_en = "Serialize framed appends, acknowledge at the configured durability point, and settle every barrier after write or fsync failure."
+summary_zh = "串行 Framed Append，在配置 Durability Point 确认，并在 Write 或 Fsync 失败后收束每个 Barrier。"
+files = ["src/miniredis/persistence/aof.py"]
+
+[[blocks]]
+id = "durability-gate"
+title_en = "Append-before-apply commit gate"
+title_zh = "Append-before-apply Commit Gate"
+summary_en = "Wait for the exact sequence acknowledgement before applying memory, replying, waking waiters, or offering replication."
+summary_zh = "在应用内存、Reply、唤醒 Waiter 或 Offer Replication 前，等待精确 Sequence Ack。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "aof-runtime-wiring"
+title_en = "AOF configuration and supervision"
+title_zh = "AOF 配置与监督"
+summary_en = "Construct and supervise the writer from runtime configuration, inject only through test hooks, and fail closed on durability loss."
+summary_zh = "从 Runtime Config 构造并监督 Writer，仅通过 Test Hook 注入，并在 Durability 丢失时 Fail Closed。"
+files = ["src/miniredis/config.py", "src/miniredis/runtime.py"]

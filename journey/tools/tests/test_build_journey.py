@@ -109,6 +109,37 @@ def test_workspace_preparation_rejects_broad_destructive_targets() -> None:
             )
 
 
+def test_applying_next_stage_removes_stale_python_bytecode(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    subprocess.run(["git", "init", "-q"], cwd=workspace, check=True)
+    cache = workspace / "src" / "__pycache__"
+    cache.mkdir(parents=True)
+    cache.joinpath("example.cpython-312.pyc").write_bytes(b"stale")
+    patch = tmp_path / "stage.patch"
+    patch.write_text(
+        "diff --git a/src/example.py b/src/example.py\n"
+        "new file mode 100644\n"
+        "--- /dev/null\n"
+        "+++ b/src/example.py\n"
+        "@@ -0,0 +1 @@\n"
+        "+VALUE = 1\n"
+    )
+    stage = build_journey.Stage(
+        number=1,
+        slug="example",
+        directory=tmp_path,
+        goal=tmp_path / "goal.md",
+        patch=patch,
+        tests=tmp_path / "tests.txt",
+        layout=tmp_path / "layout.toml",
+    )
+
+    build_journey._apply_stage(stage, workspace)
+
+    assert not cache.exists()
+
+
 def test_two_stage_chain_runs_focused_tests_and_reaches_final_parity(
     tmp_path: Path,
 ) -> None:

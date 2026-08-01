@@ -177,6 +177,14 @@ def assert_tree_parity(
 
 
 def _apply_stage(stage: Stage, workspace: Path) -> None:
+    # Consecutive historical patches can rewrite a same-sized module within one
+    # filesystem timestamp tick. Timestamp-based pyc validation may then load
+    # the preceding Stage even though the source patch applied successfully.
+    for cache in sorted(workspace.rglob("__pycache__"), reverse=True):
+        if cache.is_dir():
+            shutil.rmtree(cache)
+    for bytecode in (*workspace.rglob("*.pyc"), *workspace.rglob("*.pyo")):
+        bytecode.unlink()
     _run(["git", "apply", "--check", str(stage.patch)], cwd=workspace)
     _run(["git", "apply", str(stage.patch)], cwd=workspace)
 

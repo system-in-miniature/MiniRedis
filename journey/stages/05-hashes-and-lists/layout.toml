@@ -1,0 +1,28 @@
+failure_files = [
+  "tests/contract/test_hashes.py",
+  "tests/contract/test_lists.py",
+]
+
+[[blocks]]
+id = "hash-planning"
+title_en = "Hash field planning"
+title_zh = "Hash Field 规划"
+summary_en = "Copy one field map, compute exact added/removed counts, preserve TTL, and delete the key when its last field disappears."
+summary_zh = "复制一份 Field Map，计算精确新增/删除数量，保留 TTL，并在最后一个 Field 消失时删除 Key。"
+files = ["src/miniredis/core/hash_planner.py"]
+
+[[blocks]]
+id = "list-planning"
+title_en = "Deque order and inclusive ranges"
+title_zh = "Deque 顺序与闭区间范围"
+summary_en = "Make left/right push-pop direction and Redis-style inclusive negative ranges explicit over copied deques."
+summary_zh = "在复制的 Deque 上显式定义左右 Push/Pop 方向与 Redis 风格的含负数闭区间。"
+files = ["src/miniredis/core/list_planner.py"]
+
+[[blocks]]
+id = "planner-routing"
+title_en = "Command-family routing"
+title_zh = "命令族路由"
+summary_en = "Route Hash and List typed commands without moving their semantics into the executor."
+summary_zh = "路由 Hash 与 List 类型命令，不把它们的语义移入 Executor。"
+files = ["src/miniredis/core/planner.py"]

@@ -1,0 +1,35 @@
+failure_files = ["tests/concurrency/test_direct_executor.py"]
+
+[[blocks]]
+id = "serialized-owner"
+title_en = "Bounded admission and one state owner"
+title_zh = "有界准入与单一状态所有者"
+summary_en = "Admit user work through a bounded mailbox while control work remains available, then let one executor own parse, plan, commit, and completion order."
+summary_zh = "通过有界 Mailbox 准入用户工作，同时保留控制通道，再由一个 Executor 拥有解析、规划、提交与完成顺序。"
+files = [
+  "src/miniredis/core/mailbox.py",
+  "src/miniredis/core/planner.py",
+  "src/miniredis/core/executor.py",
+]
+
+[[blocks]]
+id = "direct-runtime"
+title_en = "Direct client and runtime lifecycle"
+title_zh = "Direct Client 与 Runtime 生命周期"
+summary_en = "Assemble the owner behind a binary-safe in-process client with explicit startup, shutdown, clock, and bounded configuration."
+summary_zh = "把所有者组装到二进制安全的进程内 Client 后，并显式定义启动、关闭、时钟与有界配置。"
+files = [
+  "src/miniredis/adapters/direct.py",
+  "src/miniredis/clock.py",
+  "src/miniredis/config.py",
+  "src/miniredis/runtime.py",
+]
+
+[[blocks]]
+id = "public-export"
+title_en = "Public API wiring"
+title_zh = "公开 API 接线"
+summary_en = "Expose the Direct-first runtime without creating a separate mechanism at the package export layer."
+summary_zh = "暴露 Direct-first Runtime，不在包导出层创造独立机制。"
+files = ["src/miniredis/__init__.py"]
+supporting = true

@@ -1,0 +1,12 @@
+failure_files = ["tests/unit/commands/test_parser.py"]
+
+[[blocks]]
+id = "typed-command-boundary"
+title_en = "Closed command vocabulary and strict parser"
+title_zh = "封闭命令词汇与严格解析器"
+summary_en = "Validate the complete binary request first, then freeze it into one typed value that downstream planning can handle without reparsing options."
+summary_zh = "先完整校验二进制请求，再冻结成一个类型值，让后续规划无需重新解析选项。"
+files = [
+  "src/miniredis/commands/model.py",
+  "src/miniredis/commands/parser.py",
+]

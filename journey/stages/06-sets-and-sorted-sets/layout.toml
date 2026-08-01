@@ -1,0 +1,28 @@
+failure_files = [
+  "tests/contract/test_sets.py",
+  "tests/contract/test_sorted_sets.py",
+]
+
+[[blocks]]
+id = "set-planning"
+title_en = "Deterministic Set projection"
+title_zh = "确定性 Set 投影"
+summary_en = "Keep uniqueness semantics in a set while materializing public multi-item replies in binary order."
+summary_zh = "用 Set 保存唯一性语义，同时按二进制顺序物化公开多项 Reply。"
+files = ["src/miniredis/core/set_planner.py"]
+
+[[blocks]]
+id = "sorted-set-planning"
+title_en = "Score order with binary tie-breaks"
+title_zh = "Score 顺序与二进制 Tie-break"
+summary_en = "Order members by score then member bytes, and validate the complete score/member list before proposing mutation."
+summary_zh = "先按 Score、再按 Member Bytes 排序，并在提出变更前校验完整 Score/Member 列表。"
+files = ["src/miniredis/core/zset_planner.py"]
+
+[[blocks]]
+id = "planner-routing"
+title_en = "Set-family routing"
+title_zh = "Set 命令族路由"
+summary_en = "Extend the stable planner facade with Set and Sorted Set handlers."
+summary_zh = "用 Set 与 Sorted Set Handler 扩展稳定 Planner 门面。"
+files = ["src/miniredis/core/planner.py"]

@@ -1,0 +1,24 @@
+failure_files = [
+  "tests/concurrency/test_atomic_incr.py",
+  "tests/contract/test_strings.py",
+]
+
+[[blocks]]
+id = "string-planning"
+title_en = "Pure String planning"
+title_zh = "纯 String 规划"
+summary_en = "Turn String reads and mutations into replies plus immutable operations, including conditional no-ops and overflow failures."
+summary_zh = "把 String 读取与变更变成 Reply 加不可变操作，同时覆盖条件 No-op 与溢出失败。"
+files = [
+  "src/miniredis/core/expiration.py",
+  "src/miniredis/core/planning.py",
+  "src/miniredis/core/planner.py",
+]
+
+[[blocks]]
+id = "serialized-commit"
+title_en = "Serialized commit allocation"
+title_zh = "串行提交分配"
+summary_en = "Allocate the next sequence and apply a planned mutation only inside the executor's ordered turn."
+summary_zh = "只在 Executor 的有序 Turn 内分配下一个序列并应用规划好的变更。"
+files = ["src/miniredis/core/executor.py"]

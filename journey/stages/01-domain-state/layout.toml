@@ -1,0 +1,37 @@
+failure_files = [
+  "tests/__init__.py",
+  "tests/helpers/__init__.py",
+  "tests/unit/core/test_domain_types.py",
+]
+
+[[blocks]]
+id = "domain-vocabulary"
+title_en = "Binary-safe state and commit vocabulary"
+title_zh = "二进制安全状态与提交词汇"
+summary_en = "Separate live mutable values, immutable propagated state, transport-neutral replies, and atomic database application before adding commands."
+summary_zh = "在加入命令前，先分开可变运行时值、不可变传播状态、传输无关回复与原子数据库应用。"
+files = [
+  "src/miniredis/commands/request.py",
+  "src/miniredis/core/values.py",
+  "src/miniredis/core/reply.py",
+  "src/miniredis/core/commit.py",
+  "src/miniredis/core/database.py",
+]
+
+[[blocks]]
+id = "project-scaffold"
+title_en = "Package and test scaffold"
+title_zh = "包与测试脚手架"
+summary_en = "Install the package and test environment without treating exports, empty package markers, or the lockfile as Redis mechanisms."
+summary_zh = "接好包与测试环境，但不把导出、空包标记或锁文件当作 Redis 机制。"
+files = [
+  "pyproject.toml",
+  "src/miniredis/__init__.py",
+  "src/miniredis/adapters/__init__.py",
+  "src/miniredis/commands/__init__.py",
+  "src/miniredis/core/__init__.py",
+  "src/miniredis/persistence/__init__.py",
+  "src/miniredis/replication/__init__.py",
+  "uv.lock",
+]
+supporting = true

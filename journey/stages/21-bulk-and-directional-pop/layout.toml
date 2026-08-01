@@ -1,0 +1,39 @@
+failure_files = [
+  "tests/contract/test_strings.py",
+  "tests/mechanisms/test_blpop.py",
+  "tests/reliability/test_final_acceptance.py",
+  "tests/unit/commands/test_command_traits.py",
+  "tests/unit/commands/test_parser.py",
+]
+
+[[blocks]]
+id = "bulk-command-semantics"
+title_en = "Atomic bulk string commands"
+title_zh = "原子批量 String Command"
+summary_en = "Model and parse MGET, MSET, and DECR, then plan ordered reads and one-commit duplicate-normalized writes."
+summary_zh = "建模并解析 MGET、MSET 与 DECR，再规划有序读取以及一次 Commit、重复 Key 归一化的写入。"
+files = ["src/miniredis/commands/model.py", "src/miniredis/commands/parser.py", "src/miniredis/core/planning.py"]
+
+[[blocks]]
+id = "directional-blocking-pop"
+title_en = "Direction-preserving blocking pop"
+title_zh = "保持方向的 Blocking Pop"
+summary_en = "Unify BLPOP and BRPOP under one typed direction flag and preserve that choice through immediate execution and deferred wake-up."
+summary_zh = "用一个类型化方向 Flag 统一 BLPOP 与 BRPOP，并让该选择贯穿立即执行和延迟唤醒。"
+files = ["src/miniredis/core/planner.py", "src/miniredis/core/blocking.py", "src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "acceptance-observability"
+title_en = "Whole-runtime acceptance observability"
+title_zh = "完整 Runtime 验收可观测性"
+summary_en = "Expose ownership counts across adapters, durability, replication, and runtime so the full-system acceptance test can prove zero leaks."
+summary_zh = "暴露 Adapter、Durability、Replication 与 Runtime 的所有权计数，使全系统验收测试能够证明零泄漏。"
+files = ["src/miniredis/adapters/direct.py", "src/miniredis/persistence/aof.py", "src/miniredis/replication/sink.py", "src/miniredis/runtime.py"]
+
+[[blocks]]
+id = "acceptance-scaffold"
+title_en = "Acceptance test scaffold"
+title_zh = "验收测试脚手架"
+summary_en = "Adjust the test configuration used by the whole-runtime acceptance contract without treating project metadata as a runtime mechanism."
+summary_zh = "调整完整 Runtime 验收契约使用的测试配置，但不把 Project Metadata 当成 Runtime Mechanism。"
+files = ["pyproject.toml"]

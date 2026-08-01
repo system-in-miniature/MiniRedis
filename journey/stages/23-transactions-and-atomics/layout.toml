@@ -1,0 +1,41 @@
+failure_files = [
+  "tests/adapters/test_resp2_mapping.py",
+  "tests/contract/test_atomic_functions.py",
+  "tests/mechanisms/test_transactions.py",
+  "tests/mechanisms/test_watch.py",
+  "tests/reliability/test_transaction_commit.py",
+  "tests/unit/commands/test_parser.py",
+  "tests/unit/core/test_domain_types.py",
+]
+
+[[blocks]]
+id = "transaction-language"
+title_en = "Typed transaction language"
+title_zh = "类型化事务语言"
+summary_en = "Model and parse MULTI, EXEC, DISCARD, WATCH, UNWATCH, and two atomic functions, including an explicit null-array abort reply."
+summary_zh = "建模并解析 MULTI、EXEC、DISCARD、WATCH、UNWATCH 与两个原子函数，并加入显式 Null-array Abort Reply。"
+files = ["src/miniredis/commands/model.py", "src/miniredis/commands/parser.py", "src/miniredis/core/reply.py", "src/miniredis/adapters/resp2.py"]
+
+[[blocks]]
+id = "transaction-workspace"
+title_en = "Speculative transaction workspace"
+title_zh = "推测执行事务 Workspace"
+summary_en = "Keep per-session queue/watch state and execute queued commands against a deep database fork before publishing one combined commit."
+summary_zh = "保存 Per-session Queue/Watch State，在深拷贝 Database Fork 上执行排队命令，再发布一个合并 Commit。"
+files = ["src/miniredis/core/transactions.py", "src/miniredis/core/database.py"]
+
+[[blocks]]
+id = "transaction-executor"
+title_en = "Single-turn EXEC and WATCH fencing"
+title_zh = "单 Turn EXEC 与 WATCH Fencing"
+summary_en = "Route transaction controls, abort dirty or revised watches, reserve blocked waiters once, and settle one durable commit plus ordered result slots."
+summary_zh = "路由事务控制，遇到 Dirty 或 Revision 变化时 Abort，只保留一次 Blocked Waiter，并收敛为一个 Durable Commit 与有序结果槽。"
+files = ["src/miniredis/core/executor.py", "src/miniredis/core/blocking.py"]
+
+[[blocks]]
+id = "atomic-functions"
+title_en = "Reusable atomic function plans"
+title_zh = "可复用原子函数 Plan"
+summary_en = "Implement compare-and-delete and checked decrement as ordinary pure plans so standalone and transactional execution share exact semantics."
+summary_zh = "把 Compare-and-delete 与 Checked-decrement 实现为普通 Pure Plan，使独立执行与事务执行共享精确语义。"
+files = ["src/miniredis/core/planning.py"]

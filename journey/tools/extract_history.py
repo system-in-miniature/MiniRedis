@@ -169,10 +169,34 @@ def extract_patches(
             )
 
 
+def install_stage_artifacts(
+    manifest: HistoryManifest,
+    stages_root: Path,
+    *,
+    repo_root: Path = ROOT,
+) -> None:
+    """Write canonical patches and focused-test lists without touching lessons."""
+
+    stages_root.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="miniredis-journey-patches-") as raw:
+        extracted = Path(raw)
+        extract_patches(manifest, extracted, repo_root=repo_root)
+        for stage in manifest.stages:
+            directory = stages_root / f"{stage.number:02d}-{stage.slug}"
+            directory.mkdir(parents=True, exist_ok=True)
+            shutil.copyfile(
+                extracted / f"stage-{stage.number:02d}.patch",
+                directory / "stage.patch",
+            )
+            directory.joinpath("tests.txt").write_text(
+                "".join(f"{node}\n" for node in stage.tests)
+            )
+
+
 def main() -> int:
     manifest = load_manifest(ROOT / "journey" / "manifest.toml")
-    extract_patches(manifest, ROOT / "journey" / "generated-patches")
-    print(f"extracted {len(manifest.stages)} deterministic Journey patches")
+    install_stage_artifacts(manifest, ROOT / "journey" / "stages")
+    print(f"installed {len(manifest.stages)} deterministic Journey stage artifacts")
     return 0
 
 

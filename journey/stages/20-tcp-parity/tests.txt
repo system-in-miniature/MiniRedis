@@ -1,0 +1,3 @@
+tests/adapters/test_tcp_smoke.py
+tests/adapters/test_direct_resp_parity.py
+tests/interop/test_redis_py_resp2.py

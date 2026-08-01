@@ -1,0 +1,3 @@
+tests/adapters/test_resp2_decode.py
+tests/adapters/test_resp2_encode.py
+tests/adapters/test_resp2_mapping.py

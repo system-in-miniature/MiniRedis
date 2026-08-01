@@ -1,0 +1,3 @@
+tests/mechanisms/test_transactions.py
+tests/mechanisms/test_watch.py
+tests/contract/test_atomic_functions.py

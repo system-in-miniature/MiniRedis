@@ -1,0 +1,2 @@
+tests/adapters/test_direct_pipeline.py
+tests/adapters/test_tcp_async_semantics.py

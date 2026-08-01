@@ -1,0 +1,3 @@
+tests/replication/test_sink_attach.py
+tests/replication/test_sink_lag.py
+tests/replication/test_sink_overflow.py

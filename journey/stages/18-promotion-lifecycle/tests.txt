@@ -1,0 +1,3 @@
+tests/replication/test_promotion.py
+tests/reliability/test_final_acceptance.py
+tests/reliability/test_reliability_shutdown.py

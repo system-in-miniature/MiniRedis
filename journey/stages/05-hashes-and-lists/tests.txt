@@ -1,0 +1,2 @@
+tests/contract/test_hashes.py
+tests/contract/test_lists.py

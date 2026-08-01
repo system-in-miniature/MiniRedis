@@ -1,0 +1,2 @@
+tests/unit/core/test_outbound.py
+tests/concurrency/test_slow_endpoint.py

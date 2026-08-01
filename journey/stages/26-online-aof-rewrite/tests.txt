@@ -1,0 +1,2 @@
+tests/unit/persistence/test_aof_writer.py
+tests/reliability/test_aof_rewrite.py

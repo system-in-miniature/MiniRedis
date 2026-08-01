@@ -79,3 +79,24 @@ def test_patch_extraction_is_deterministic_and_reconstructs_owned_tree(
         if path.is_file() and ".git" not in path.parts
     }
     assert actual == expected
+
+
+def test_install_writes_canonical_stage_patch_and_focused_tests(tmp_path: Path) -> None:
+    manifest = extract_history.load_manifest(MANIFEST)
+    stages_root = tmp_path / "stages"
+
+    extract_history.install_stage_artifacts(
+        manifest,
+        stages_root,
+        repo_root=ROOT,
+    )
+
+    directories = sorted(path.name for path in stages_root.iterdir())
+    assert directories[0] == "01-domain-state"
+    assert directories[-1] == "30-public-parity"
+    assert len(directories) == 30
+    first = stages_root / directories[0]
+    assert first.joinpath("stage.patch").read_text().startswith("diff --git ")
+    assert first.joinpath("tests.txt").read_text() == (
+        "tests/unit/core/test_domain_types.py\n"
+    )

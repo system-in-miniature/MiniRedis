@@ -1,0 +1,2 @@
+tests/contract/test_eviction.py
+tests/contract/test_domain_invariants.py

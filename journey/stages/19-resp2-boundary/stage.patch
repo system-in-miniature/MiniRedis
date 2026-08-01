@@ -1,0 +1,416 @@
+diff --git a/src/miniredis/adapters/resp2.py b/src/miniredis/adapters/resp2.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..a609b3208acca3fa14690be45ebfff88365bb13c
+--- /dev/null
++++ b/src/miniredis/adapters/resp2.py
+@@ -0,0 +1,239 @@
++from __future__ import annotations
++
++from dataclasses import dataclass
++from typing import TypeAlias
++
++from miniredis.commands.request import CommandRequest
++from miniredis.core.outbound import (
++    Outbound,
++    PubSubMessage,
++    PubSubPong,
++    ReplyMessage,
++    ServerClosed,
++    SubscriptionAck,
++)
++from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
++
++
++class RespProtocolError(ValueError):
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class RespSimple:
++    data: bytes
++
++
++@dataclass(frozen=True, slots=True)
++class RespError:
++    data: bytes
++
++
++@dataclass(frozen=True, slots=True)
++class RespInteger:
++    value: int
++
++
++@dataclass(frozen=True, slots=True)
++class RespBulk:
++    data: bytes | None
++
++
++@dataclass(frozen=True, slots=True)
++class RespArray:
++    items: tuple[RespFrame, ...] | None
++
++
++RespFrame: TypeAlias = RespSimple | RespError | RespInteger | RespBulk | RespArray
++
++
++@dataclass(frozen=True, slots=True)
++class RespLimits:
++    max_buffer: int = 1 << 20
++    max_bulk: int = 1 << 20
++    max_array: int = 1024
++    max_depth: int = 8
++
++
++class _NeedMore(Exception):
++    pass
++
++
++class RespDecoder:
++    def __init__(self, limits: RespLimits | None = None) -> None:
++        self._limits = limits or RespLimits()
++        self._buffer = bytearray()
++
++    def feed(self, data: bytes) -> tuple[RespFrame, ...]:
++        self._buffer.extend(data)
++        if len(self._buffer) > self._limits.max_buffer:
++            raise RespProtocolError("RESP buffer limit exceeded")
++        frames: list[RespFrame] = []
++        offset = 0
++        while offset < len(self._buffer):
++            try:
++                frame, next_offset = self._parse(offset, 0)
++            except _NeedMore:
++                break
++            frames.append(frame)
++            offset = next_offset
++        if offset:
++            del self._buffer[:offset]
++        return tuple(frames)
++
++    def finish(self) -> tuple[RespFrame, ...]:
++        frames = self.feed(b"")
++        if self._buffer:
++            raise RespProtocolError("truncated RESP frame")
++        return frames
++
++    def _read_line(self, offset: int) -> tuple[bytes, int]:
++        end = self._buffer.find(b"\r\n", offset)
++        if end < 0:
++            raise _NeedMore
++        return bytes(self._buffer[offset:end]), end + 2
++
++    @staticmethod
++    def _decimal(data: bytes, label: str) -> int:
++        try:
++            text = data.decode("ascii")
++            if not text or text in {"+", "-"}:
++                raise ValueError
++            if text[0] == "-":
++                digits = text[1:]
++            else:
++                digits = text
++            if not digits.isdecimal():
++                raise ValueError
++            return int(text)
++        except (UnicodeDecodeError, ValueError) as exc:
++            raise RespProtocolError(f"invalid RESP {label}") from exc
++
++    def _parse(self, offset: int, depth: int) -> tuple[RespFrame, int]:
++        if depth > self._limits.max_depth:
++            raise RespProtocolError("RESP nesting limit exceeded")
++        if offset >= len(self._buffer):
++            raise _NeedMore
++        prefix = self._buffer[offset]
++        if prefix in (ord("+"), ord("-"), ord(":")):
++            line, end = self._read_line(offset + 1)
++            if prefix == ord("+"):
++                return RespSimple(line), end
++            if prefix == ord("-"):
++                return RespError(line), end
++            return RespInteger(self._decimal(line, "integer")), end
++        if prefix == ord("$"):
++            line, body = self._read_line(offset + 1)
++            length = self._decimal(line, "bulk length")
++            if length == -1:
++                return RespBulk(None), body
++            if length < 0 or length > self._limits.max_bulk:
++                raise RespProtocolError("invalid RESP bulk length")
++            end = body + length
++            if end + 2 > len(self._buffer):
++                raise _NeedMore
++            if self._buffer[end : end + 2] != b"\r\n":
++                raise RespProtocolError("invalid bulk terminator")
++            return RespBulk(bytes(self._buffer[body:end])), end + 2
++        if prefix == ord("*"):
++            line, cursor = self._read_line(offset + 1)
++            length = self._decimal(line, "array length")
++            if length == -1:
++                return RespArray(None), cursor
++            if length < 0 or length > self._limits.max_array:
++                raise RespProtocolError("invalid RESP array length")
++            items: list[RespFrame] = []
++            for _ in range(length):
++                item, cursor = self._parse(cursor, depth + 1)
++                items.append(item)
++            return RespArray(tuple(items)), cursor
++        raise RespProtocolError("unknown RESP type byte")
++
++
++def _line(prefix: bytes, data: bytes) -> bytes:
++    if b"\r" in data or b"\n" in data:
++        raise ValueError("RESP line values cannot contain CR or LF")
++    return prefix + data + b"\r\n"
++
++
++def encode_frame(frame: RespFrame) -> bytes:
++    match frame:
++        case RespSimple(data):
++            return _line(b"+", data)
++        case RespError(data):
++            return _line(b"-", data)
++        case RespInteger(value):
++            return b":" + str(value).encode("ascii") + b"\r\n"
++        case RespBulk(None):
++            return b"$-1\r\n"
++        case RespBulk(data):
++            return b"$" + str(len(data)).encode("ascii") + b"\r\n" + data + b"\r\n"
++        case RespArray(None):
++            return b"*-1\r\n"
++        case RespArray(items):
++            return (
++                b"*"
++                + str(len(items)).encode("ascii")
++                + b"\r\n"
++                + b"".join(encode_frame(item) for item in items)
++            )
++    raise TypeError(f"unsupported RESP frame: {type(frame)!r}")
++
++
++def frame_to_request(frame: RespFrame) -> CommandRequest:
++    if not isinstance(frame, RespArray) or not frame.items:
++        raise RespProtocolError("command must be a non-empty array")
++    parts: list[bytes] = []
++    for item in frame.items:
++        if not isinstance(item, RespBulk) or item.data is None:
++            raise RespProtocolError("command arguments must be bulk strings")
++        parts.append(item.data)
++    return CommandRequest(parts[0], tuple(parts[1:]))
++
++
++def _reply_frame(reply: Reply) -> RespFrame:
++    match reply:
++        case Ok(message):
++            return RespSimple(message)
++        case Bytes(value):
++            return RespBulk(value)
++        case Number(value):
++            return RespInteger(value)
++        case Items(values):
++            return RespArray(tuple(_reply_frame(value) for value in values))
++        case Failure(code, message):
++            return RespError(f"{code} {message}".encode())
++    raise TypeError(f"unsupported reply: {type(reply)!r}")
++
++
++def encode_outbound(outbound: Reply | Outbound) -> bytes:
++    if isinstance(outbound, ReplyMessage):
++        return encode_frame(_reply_frame(outbound.reply))
++    if isinstance(outbound, (Ok, Bytes, Number, Items, Failure)):
++        return encode_frame(_reply_frame(outbound))
++    if isinstance(outbound, SubscriptionAck):
++        channel = RespBulk(outbound.channel)
++        return encode_frame(
++            RespArray(
++                (
++                    RespBulk(outbound.kind.encode("ascii")),
++                    channel,
++                    RespInteger(outbound.subscription_count),
++                )
++            )
++        )
++    if isinstance(outbound, PubSubMessage):
++        return encode_frame(
++            RespArray(
++                (
++                    RespBulk(b"message"),
++                    RespBulk(outbound.channel),
++                    RespBulk(outbound.payload),
++                )
++            )
++        )
++    if isinstance(outbound, PubSubPong):
++        return encode_frame(RespArray((RespBulk(b"pong"), RespBulk(outbound.payload))))
++    if isinstance(outbound, ServerClosed):
++        return encode_frame(RespError(f"CLOSED {outbound.reason}".encode()))
++    raise TypeError(f"unsupported outbound: {type(outbound)!r}")
+diff --git a/tests/adapters/test_resp2_decode.py b/tests/adapters/test_resp2_decode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9652c7e73676188f7a9780d704752760d0812d33
+--- /dev/null
++++ b/tests/adapters/test_resp2_decode.py
+@@ -0,0 +1,52 @@
++import pytest
++
++from miniredis.adapters.resp2 import (
++    RespArray,
++    RespBulk,
++    RespDecoder,
++    RespLimits,
++    RespProtocolError,
++)
++
++
++def test_fragmented_command_emits_only_when_complete():
++    decoder = RespDecoder()
++    assert decoder.feed(b"*2\r\n$3\r\nGE") == ()
++    assert decoder.feed(b"T\r\n$1\r\nk\r\n") == (
++        RespArray((RespBulk(b"GET"), RespBulk(b"k"))),
++    )
++
++
++def test_coalesced_commands_remain_separate():
++    decoder = RespDecoder()
++    assert decoder.feed(b"*1\r\n$4\r\nPING\r\n*1\r\n$4\r\nPING\r\n") == (
++        RespArray((RespBulk(b"PING"),)),
++        RespArray((RespBulk(b"PING"),)),
++    )
++
++
++def test_binary_bulk_is_not_utf8_decoded():
++    decoder = RespDecoder()
++    assert decoder.feed(b"$3\r\n\xff\x00x\r\n") == (RespBulk(b"\xff\x00x"),)
++
++
++@pytest.mark.parametrize(
++    "wire",
++    [
++        b"+bad\n",
++        b"$x\r\n",
++        b"$3\r\nab\r\n",
++        b"*2\r\n$1\r\na\r\n",
++    ],
++)
++def test_invalid_or_incomplete_at_eof_is_rejected(wire):
++    decoder = RespDecoder()
++    with pytest.raises(RespProtocolError):
++        decoder.feed(wire)
++        decoder.finish()
++
++
++def test_bulk_and_buffer_limits_are_enforced():
++    decoder = RespDecoder(RespLimits(max_buffer=16, max_bulk=2))
++    with pytest.raises(RespProtocolError):
++        decoder.feed(b"$3\r\nabc\r\n")
+diff --git a/tests/adapters/test_resp2_encode.py b/tests/adapters/test_resp2_encode.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..fda9c796cbab0f087c87788224dd338b546c64f7
+--- /dev/null
++++ b/tests/adapters/test_resp2_encode.py
+@@ -0,0 +1,29 @@
++import pytest
++
++from miniredis.adapters.resp2 import (
++    RespArray,
++    RespBulk,
++    RespError,
++    RespInteger,
++    RespSimple,
++    encode_frame,
++)
++
++
++@pytest.mark.parametrize(
++    ("frame", "expected"),
++    [
++        (RespSimple(b"OK"), b"+OK\r\n"),
++        (RespError(b"ERR bad"), b"-ERR bad\r\n"),
++        (RespInteger(42), b":42\r\n"),
++        (RespBulk(b"a\x00b"), b"$3\r\na\x00b\r\n"),
++        (RespBulk(None), b"$-1\r\n"),
++        (
++            RespArray((RespBulk(b"GET"), RespBulk(b"k"))),
++            b"*2\r\n$3\r\nGET\r\n$1\r\nk\r\n",
++        ),
++        (RespArray(None), b"*-1\r\n"),
++    ],
++)
++def test_encode_frame(frame, expected):
++    assert encode_frame(frame) == expected
+diff --git a/tests/adapters/test_resp2_mapping.py b/tests/adapters/test_resp2_mapping.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..9a70f989e42cd376cf3eb0cfee42b49cb8544776
+--- /dev/null
++++ b/tests/adapters/test_resp2_mapping.py
+@@ -0,0 +1,72 @@
++import pytest
++
++from miniredis.adapters.resp2 import (
++    RespArray,
++    RespBulk,
++    RespInteger,
++    RespProtocolError,
++    encode_outbound,
++    frame_to_request,
++)
++from miniredis.commands.request import CommandRequest
++from miniredis.core.outbound import (
++    PubSubMessage,
++    PubSubPong,
++    ReplyMessage,
++    RequestToken,
++    ServerClosed,
++    SubscriptionAck,
++)
++from miniredis.core.reply import Bytes, Failure, Items, Number, Ok
++
++
++def test_command_array_maps_without_text_decoding():
++    frame = RespArray((RespBulk(b"SET"), RespBulk(b"k"), RespBulk(b"\xff")))
++    assert frame_to_request(frame) == CommandRequest(b"SET", (b"k", b"\xff"))
++
++
++@pytest.mark.parametrize(
++    "frame",
++    [
++        RespInteger(1),
++        RespArray(None),
++        RespArray(()),
++        RespArray((RespBulk(None),)),
++        RespArray((RespInteger(1),)),
++    ],
++)
++def test_non_command_frames_are_protocol_errors(frame):
++    with pytest.raises(RespProtocolError):
++        frame_to_request(frame)
++
++
++def test_domain_replies_encode_as_resp2():
++    assert encode_outbound(Ok()) == b"+OK\r\n"
++    assert encode_outbound(Bytes(None)) == b"$-1\r\n"
++    assert encode_outbound(Bytes(b"x")) == b"$1\r\nx\r\n"
++    assert encode_outbound(Number(2)) == b":2\r\n"
++    assert encode_outbound(Items((Bytes(b"a"), Number(1)))) == (
++        b"*2\r\n$1\r\na\r\n:1\r\n"
++    )
++    assert encode_outbound(Failure("WRONGTYPE", "bad")) == b"-WRONGTYPE bad\r\n"
++
++
++def test_every_frozen_outbound_value_encodes_as_resp2():
++    token = RequestToken(7)
++    assert encode_outbound(ReplyMessage(token, Number(3))) == b":3\r\n"
++    assert (
++        encode_outbound(SubscriptionAck("subscribe", b"c", 1))
++        == b"*3\r\n$9\r\nsubscribe\r\n$1\r\nc\r\n:1\r\n"
++    )
++    assert (
++        encode_outbound(SubscriptionAck("unsubscribe", None, 0))
++        == b"*3\r\n$11\r\nunsubscribe\r\n$-1\r\n:0\r\n"
++    )
++    assert (
++        encode_outbound(PubSubMessage(b"c", b"m"))
++        == b"*3\r\n$7\r\nmessage\r\n$1\r\nc\r\n$1\r\nm\r\n"
++    )
++    assert encode_outbound(PubSubPong(b"x")) == b"*2\r\n$4\r\npong\r\n$1\r\nx\r\n"
++    assert (
++        encode_outbound(ServerClosed("runtime closed")) == b"-CLOSED runtime closed\r\n"
++    )

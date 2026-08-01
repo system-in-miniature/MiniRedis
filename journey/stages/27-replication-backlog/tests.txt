@@ -1,0 +1,2 @@
+tests/unit/replication/test_backlog.py
+tests/replication/test_sink_attach.py

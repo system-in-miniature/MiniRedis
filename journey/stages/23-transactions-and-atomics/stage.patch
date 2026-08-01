@@ -1,0 +1,1203 @@
+diff --git a/src/miniredis/adapters/resp2.py b/src/miniredis/adapters/resp2.py
+index a609b3208acca3fa14690be45ebfff88365bb13c..ee40d126969a857e5921eaa5a14d3b672d36bca3 100644
+--- a/src/miniredis/adapters/resp2.py
++++ b/src/miniredis/adapters/resp2.py
+@@ -12,7 +12,7 @@ from miniredis.core.outbound import (
+     ServerClosed,
+     SubscriptionAck,
+ )
+-from miniredis.core.reply import Bytes, Failure, Items, Number, Ok, Reply
++from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok, Reply
+ 
+ 
+ class RespProtocolError(ValueError):
+@@ -201,6 +201,8 @@ def _reply_frame(reply: Reply) -> RespFrame:
+             return RespInteger(value)
+         case Items(values):
+             return RespArray(tuple(_reply_frame(value) for value in values))
++        case NullArray():
++            return RespArray(None)
+         case Failure(code, message):
+             return RespError(f"{code} {message}".encode())
+     raise TypeError(f"unsupported reply: {type(reply)!r}")
+@@ -209,7 +211,7 @@ def _reply_frame(reply: Reply) -> RespFrame:
+ def encode_outbound(outbound: Reply | Outbound) -> bytes:
+     if isinstance(outbound, ReplyMessage):
+         return encode_frame(_reply_frame(outbound.reply))
+-    if isinstance(outbound, (Ok, Bytes, Number, Items, Failure)):
++    if isinstance(outbound, (Ok, Bytes, Number, Items, NullArray, Failure)):
+         return encode_frame(_reply_frame(outbound))
+     if isinstance(outbound, SubscriptionAck):
+         channel = RespBulk(outbound.channel)
+diff --git a/src/miniredis/commands/model.py b/src/miniredis/commands/model.py
+index 176bec4afa7c6434ac106bb0dcb4bdb85d65012e..fa071fad55d9367d92633bbbe49278f1b688e208 100644
+--- a/src/miniredis/commands/model.py
++++ b/src/miniredis/commands/model.py
+@@ -14,6 +14,43 @@ class Echo:
+     message: bytes
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class Multi:
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class Exec:
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class Discard:
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class Watch:
++    keys: tuple[bytes, ...]
++
++
++@dataclass(frozen=True, slots=True)
++class Unwatch:
++    pass
++
++
++@dataclass(frozen=True, slots=True)
++class CompareDelete:
++    key: bytes
++    expected: bytes
++
++
++@dataclass(frozen=True, slots=True)
++class CheckDecrement:
++    key: bytes
++    amount: int
++
++
+ @dataclass(frozen=True, slots=True)
+ class SetString:
+     key: bytes
+@@ -223,6 +260,13 @@ class Persist:
+ Command: TypeAlias = (
+     Ping
+     | Echo
++    | Multi
++    | Exec
++    | Discard
++    | Watch
++    | Unwatch
++    | CompareDelete
++    | CheckDecrement
+     | SetString
+     | GetString
+     | MultiGet
+@@ -263,6 +307,8 @@ Command: TypeAlias = (
+ _DATASET_MUTATING_TYPES = frozenset(
+     {
+         SetString,
++        CompareDelete,
++        CheckDecrement,
+         MultiSet,
+         Delete,
+         Increment,
+@@ -285,6 +331,11 @@ _NON_DATASET_MUTATING_TYPES = frozenset(
+     {
+         Ping,
+         Echo,
++        Multi,
++        Exec,
++        Discard,
++        Watch,
++        Unwatch,
+         GetString,
+         MultiGet,
+         Exists,
+diff --git a/src/miniredis/commands/parser.py b/src/miniredis/commands/parser.py
+index b8d38cdebd5149134e591b4b663bf2fc395454f0..475d9c5f86d9f909a3017158f8027afd3d2f8976 100644
+--- a/src/miniredis/commands/parser.py
++++ b/src/miniredis/commands/parser.py
+@@ -12,11 +12,15 @@ from typing import Literal
+ 
+ from miniredis.commands.model import (
+     BlockingPop,
++    CheckDecrement,
+     Command,
++    CompareDelete,
+     Delete,
++    Discard,
+     Echo,
+     Exists,
+     Expire,
++    Exec,
+     GetString,
+     HashDelete,
+     HashGet,
+@@ -27,6 +31,7 @@ from miniredis.commands.model import (
+     ListPop,
+     ListPush,
+     ListRange,
++    Multi,
+     MultiGet,
+     MultiSet,
+     Persist,
+@@ -43,6 +48,8 @@ from miniredis.commands.model import (
+     TimeToLive,
+     TypeOf,
+     Unsubscribe,
++    Unwatch,
++    Watch,
+     ZAdd,
+     ZRange,
+     ZRangeByScore,
+@@ -171,6 +178,30 @@ def parse_request(request: CommandRequest) -> Command:
+         case b"ECHO":
+             _require_arity(name, args, 1)
+             return Echo(args[0])
++        case b"MULTI":
++            _require_arity(name, args, 0)
++            return Multi()
++        case b"EXEC":
++            _require_arity(name, args, 0)
++            return Exec()
++        case b"DISCARD":
++            _require_arity(name, args, 0)
++            return Discard()
++        case b"WATCH":
++            _require_min_arity(name, args, 1)
++            return Watch(args)
++        case b"UNWATCH":
++            _require_arity(name, args, 0)
++            return Unwatch()
++        case b"COMPAREDEL":
++            _require_arity(name, args, 2)
++            return CompareDelete(args[0], args[1])
++        case b"CHECKDECR":
++            _require_arity(name, args, 2)
++            amount = parse_int64(args[1])
++            if amount <= 0:
++                raise CommandParseError("amount must be a positive integer")
++            return CheckDecrement(args[0], amount)
+         case b"DEL":
+             _require_min_arity(name, args, 1)
+             return Delete(args)
+diff --git a/src/miniredis/core/blocking.py b/src/miniredis/core/blocking.py
+index ed2b95e0cbe7eaf8e71d885594c2bb0205418bd3..150a6afab8c80fa0db6d1f7c0f615074db12faab 100644
+--- a/src/miniredis/core/blocking.py
++++ b/src/miniredis/core/blocking.py
+@@ -174,18 +174,19 @@ def prepare_list_wakeups(
+     key: bytes,
+     pushed: PutEntry,
+     waiters: WaiterRegistry,
++    reserved: set[WaiterId] | None = None,
+ ) -> tuple[CommitOperation, tuple[WaiterWakeup, ...]]:
+     stored = pushed.entry.value
+     if not isinstance(stored, StoredList):
+         raise TypeError("push operation must contain StoredList")
+     remaining = deque(stored.items)
+-    reserved: set[WaiterId] = set()
++    owned = set() if reserved is None else reserved
+     wakeups: list[WaiterWakeup] = []
+     while remaining:
+-        waiter = waiters.peek(key, reserved)
++        waiter = waiters.peek(key, owned)
+         if waiter is None:
+             break
+-        reserved.add(waiter.waiter_id)
++        owned.add(waiter.waiter_id)
+         wakeups.append(
+             WaiterWakeup(
+                 waiter.waiter_id,
+diff --git a/src/miniredis/core/database.py b/src/miniredis/core/database.py
+index 737ca58bb64865f171cb4d257ed63bbe64c61ff2..e6dcaaa5bdd2318978c561533cc2c2f7ddbb1c36 100644
+--- a/src/miniredis/core/database.py
++++ b/src/miniredis/core/database.py
+@@ -121,6 +121,11 @@ class Database:
+         self.commit_seq = 0
+         self.access_tick = 0
+         self.logical_usage = 0
++        self.key_revisions: dict[bytes, int] = {}
++        self.revision_clock = 0
++
++    def revision(self, key: bytes) -> int:
++        return self.key_revisions.get(key, 0)
+ 
+     def apply_batch(self, batch: CommitBatch, *, track_access: bool) -> None:
+         next_seq = self.commit_seq + 1
+@@ -129,6 +134,8 @@ class Database:
+ 
+         staged = dict(self.entries)
+         staged_access_tick = self.access_tick
++        staged_key_revisions = dict(self.key_revisions)
++        staged_revision_clock = self.revision_clock
+ 
+         for operation in batch.operations:
+             match operation:
+@@ -149,6 +156,8 @@ class Database:
+                     raise TypeError(
+                         f"unsupported commit operation: {type(operation)!r}"
+                     )
++            staged_revision_clock += 1
++            staged_key_revisions[operation.key] = staged_revision_clock
+ 
+         staged_usage = sum(entry.logical_size for entry in staged.values())
+         if staged_usage < 0:
+@@ -159,8 +168,29 @@ class Database:
+         self.entries = staged
+         self.logical_usage = staged_usage
+         self.access_tick = staged_access_tick
++        self.key_revisions = staged_key_revisions
++        self.revision_clock = staged_revision_clock
+         self.commit_seq = batch.seq
+ 
++    def fork(self) -> Database:
++        forked = Database()
++        forked.entries = {
++            key: Entry(
++                value=thaw_value(freeze_value(entry.value)),
++                expire_at_ms=entry.expire_at_ms,
++                mutation_version=entry.mutation_version,
++                last_access_tick=entry.last_access_tick,
++                logical_size=entry.logical_size,
++            )
++            for key, entry in self.entries.items()
++        }
++        forked.commit_seq = self.commit_seq
++        forked.access_tick = self.access_tick
++        forked.logical_usage = self.logical_usage
++        forked.key_revisions = dict(self.key_revisions)
++        forked.revision_clock = self.revision_clock
++        return forked
++
+     def touch_if_live(self, key: bytes, now_ms: int) -> bool:
+         entry = self.entries.get(key)
+         if entry is None or (
+@@ -221,6 +251,11 @@ class Database:
+         self.logical_usage = staged_usage
+         self.commit_seq = image.checkpoint_seq
+         self.access_tick = 0
++        self.key_revisions = {
++            key: revision
++            for revision, key in enumerate(sorted(staged_entries), start=1)
++        }
++        self.revision_clock = len(self.key_revisions)
+ 
+     def discard_expired_for_recovery(self, now_ms: int) -> None:
+         expired = tuple(
+diff --git a/src/miniredis/core/executor.py b/src/miniredis/core/executor.py
+index f635151b0e2bdd61c13485fecc4af05ed1477ad8..a573de1fa794592770df57981ae5515b6499d716 100644
+--- a/src/miniredis/core/executor.py
++++ b/src/miniredis/core/executor.py
+@@ -11,11 +11,16 @@ from miniredis.clock import Clock, TimerScheduler
+ from miniredis.commands.model import (
+     BlockingPop,
+     Command,
++    Discard,
++    Exec,
+     ListPush,
++    Multi,
+     Ping,
+     Publish,
+     Subscribe,
+     Unsubscribe,
++    Unwatch,
++    Watch,
+     is_dataset_mutating,
+ )
+ from miniredis.core.blocking import (
+@@ -53,7 +58,8 @@ from miniredis.core.outbound import (
+     TransportClosed,
+ )
+ from miniredis.core.pubsub import PubSubRegistry
+-from miniredis.core.reply import Bytes, Failure, Items, Number, Reply
++from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok, Reply
++from miniredis.core.transactions import TransactionState, TransactionWorkspace
+ from miniredis.persistence.aof import (
+     AofAppendFailed,
+     AofAppendOk,
+@@ -65,6 +71,16 @@ if TYPE_CHECKING:
+     from miniredis.replication.sink import ReplicaSink
+ 
+ 
++TRANSACTION_DISALLOWED = (
++    BlockingPop,
++    Subscribe,
++    Unsubscribe,
++    Publish,
++    Multi,
++    Watch,
++)
++
++
+ @dataclass(slots=True)
+ class ExecuteRequest:
+     token: RequestToken
+@@ -269,6 +285,7 @@ class CommandExecutor:
+         self._next_replica_generation = 1
+         self._active_source_generation: int | None = None
+         self._replica_read_only = False
++        self._transactions: dict[int, TransactionState] = {}
+         self._replica_apply_failure = replica_apply_failure
+         if (replica_apply_entered is None) != (replica_apply_release is None):
+             raise ValueError(
+@@ -462,6 +479,9 @@ class CommandExecutor:
+         if isinstance(message, ExecuteRequest):
+             await self._execute(message)
+         elif isinstance(message, RejectRequest):
++            state = self._transactions.get(message.session_id)
++            if state is not None and state.active:
++                state.dirty = True
+             self._finish_reply(message.token, message.reply)
+         elif isinstance(message, AbandonRequest):
+             self._abandon(message)
+@@ -563,6 +583,7 @@ class CommandExecutor:
+             self._finish_reply(waiter.token, Bytes(None))
+ 
+     def _close_session(self, event: SessionClosed) -> None:
++        self._transactions.pop(event.session_id, None)
+         for waiter in self.waiters.for_session(event.session_id):
+             closed = self.waiters.transition(
+                 waiter.waiter_id,
+@@ -582,6 +603,7 @@ class CommandExecutor:
+ 
+     def _begin_shutdown(self, event: BeginShutdown) -> None:
+         self.mailbox.close_control_admission()
++        self._transactions.clear()
+         for waiter in self.waiters.active():
+             closed = self.waiters.transition(
+                 waiter.waiter_id,
+@@ -604,6 +626,7 @@ class CommandExecutor:
+         self._terminal_cleanup_complete = True
+         self._failure = failure
+         self._stopping = True
++        self._transactions.clear()
+         self.mailbox.close_user_admission()
+         self.mailbox.drain()
+         for token in tuple(self._requests):
+@@ -628,6 +651,11 @@ class CommandExecutor:
+ 
+     async def _execute(self, request: ExecuteRequest) -> None:
+         command = request.command
++        if isinstance(command, Exec):
++            await self._execute_transaction(request)
++            return
++        if self._route_transaction_command(request, command):
++            return
+         if self._replica_read_only and is_dataset_mutating(command):
+             self._finish_reply(
+                 request.token,
+@@ -693,6 +721,173 @@ class CommandExecutor:
+             plan = self.planner.plan(command, self.database, now_ms)
+         await self._apply_plan(request, plan, now_ms)
+ 
++    def _route_transaction_command(
++        self,
++        request: ExecuteRequest,
++        command: Command,
++    ) -> bool:
++        state = self._transactions.get(request.session_id)
++        if isinstance(command, Multi):
++            if state is None:
++                state = TransactionState()
++                self._transactions[request.session_id] = state
++            if state.active:
++                state.dirty = True
++                self._finish_reply(
++                    request.token,
++                    Failure("ERR", "MULTI calls can not be nested"),
++                )
++            else:
++                state.active = True
++                state.dirty = False
++                state.queued.clear()
++                self._finish_reply(request.token, Ok())
++            return True
++        if isinstance(command, Discard):
++            if state is None or not state.active:
++                self._finish_reply(
++                    request.token,
++                    Failure("ERR", "DISCARD without MULTI"),
++                )
++            else:
++                state.clear_all()
++                self._drop_empty_transaction_state(request.session_id, state)
++                self._finish_reply(request.token, Ok())
++            return True
++        if isinstance(command, Watch):
++            if state is None:
++                state = TransactionState()
++                self._transactions[request.session_id] = state
++            if state.active:
++                state.dirty = True
++                self._finish_reply(
++                    request.token,
++                    Failure("ERR", "WATCH inside MULTI is not allowed"),
++                )
++            else:
++                for key in command.keys:
++                    state.watched[key] = self.database.revision(key)
++                self._finish_reply(request.token, Ok())
++            return True
++        if isinstance(command, Unwatch):
++            if state is not None:
++                state.watched.clear()
++                self._drop_empty_transaction_state(request.session_id, state)
++            self._finish_reply(request.token, Ok())
++            return True
++        if state is None or not state.active:
++            return False
++        if isinstance(command, TRANSACTION_DISALLOWED):
++            state.dirty = True
++            self._finish_reply(
++                request.token,
++                Failure("ERR", "command is not allowed inside MULTI"),
++            )
++        else:
++            state.queued.append(command)
++            self._finish_reply(request.token, Ok(b"QUEUED"))
++        return True
++
++    def _drop_empty_transaction_state(
++        self,
++        session_id: int,
++        state: TransactionState,
++    ) -> None:
++        if not state.active and not state.watched:
++            self._transactions.pop(session_id, None)
++
++    async def _execute_transaction(self, request: ExecuteRequest) -> None:
++        state = self._transactions.get(request.session_id)
++        if state is None or not state.active:
++            self._finish_reply(
++                request.token,
++                Failure("ERR", "EXEC without MULTI"),
++            )
++            return
++        try:
++            if state.dirty:
++                self._finish_reply(
++                    request.token,
++                    Failure(
++                        "EXECABORT",
++                        "transaction discarded because of previous errors",
++                    ),
++                )
++                return
++            if any(
++                self.database.revision(key) != revision
++                for key, revision in state.watched.items()
++            ):
++                self._finish_reply(request.token, NullArray())
++                return
++
++            workspace = TransactionWorkspace(self.database.fork())
++            now_ms = self.clock.now_ms()
++            for command in state.queued:
++                if self._replica_read_only and is_dataset_mutating(command):
++                    workspace.replies.append(
++                        Failure("READONLY", "replica is read only")
++                    )
++                    continue
++                plan = self.planner.plan(command, workspace.database, now_ms)
++                plan = self._attach_push_wakeups(
++                    command,
++                    plan,
++                    workspace.reserved_waiters,
++                )
++                if plan.reply is None:
++                    raise AssertionError("queued command produced no transaction reply")
++                workspace.replies.append(plan.reply)
++                if isinstance(plan.reply, Failure):
++                    continue
++                workspace.touch_keys.extend(plan.touch_keys)
++                workspace.wakeups.extend(plan.waiter_wakeups)
++                if plan.operations:
++                    workspace.database.apply_batch(
++                        CommitBatch(
++                            workspace.database.commit_seq + 1,
++                            plan.operations,
++                            plan.trigger,
++                        ),
++                        track_access=plan.trigger is CommitTrigger.CLIENT,
++                    )
++                    workspace.operations.extend(plan.operations)
++                for key in dict.fromkeys(plan.touch_keys):
++                    workspace.database.touch_if_live(key, now_ms)
++
++            if workspace.operations:
++                try:
++                    await self._commit_prepared(
++                        PreparedCommit(
++                            tuple(workspace.operations),
++                            CommitTrigger.CLIENT,
++                        )
++                    )
++                except DurabilityFailure as exc:
++                    self._finish_reply(
++                        request.token,
++                        Failure("ERR", f"durability failure: {exc}"),
++                    )
++                    self._on_fatal(str(exc))
++                    return
++            for key in dict.fromkeys(workspace.touch_keys):
++                self.database.touch_if_live(key, now_ms)
++            for wakeup in workspace.wakeups:
++                waiter = self.waiters.transition(
++                    wakeup.waiter_id,
++                    wakeup.generation,
++                    WaiterState.FULFILLED,
++                )
++                if waiter is not None:
++                    self._finish_reply(
++                        waiter.token,
++                        Items((Bytes(wakeup.key), Bytes(wakeup.item))),
++                    )
++            self._finish_reply(request.token, Items(tuple(workspace.replies)))
++        finally:
++            state.clear_all()
++            self._drop_empty_transaction_state(request.session_id, state)
++
+     def _subscribe(self, request: ExecuteRequest, command: Subscribe) -> None:
+         items: list[SubscriptionAck] = []
+         for channel in command.channels:
+@@ -747,6 +942,7 @@ class CommandExecutor:
+         self,
+         command: Command,
+         plan: ExecutionPlan,
++        reserved_waiters: set[WaiterId] | None = None,
+     ) -> ExecutionPlan:
+         if not isinstance(command, ListPush) or isinstance(plan.reply, Failure):
+             return plan
+@@ -761,6 +957,7 @@ class CommandExecutor:
+                     command.key,
+                     operation,
+                     self.waiters,
++                    reserved_waiters,
+                 )
+                 operations[index] = final
+                 return replace(
+@@ -992,6 +1189,20 @@ class CommandExecutor:
+     def debug_accepted_count(self) -> int:
+         return len(self._requests)
+ 
++    @property
++    def active_transaction_count(self) -> int:
++        return sum(state.active for state in self._transactions.values())
++
++    @property
++    def dirty_transaction_count(self) -> int:
++        return sum(
++            state.active and state.dirty for state in self._transactions.values()
++        )
++
++    @property
++    def watched_key_count(self) -> int:
++        return sum(len(state.watched) for state in self._transactions.values())
++
+     @property
+     def accepted_tokens(self) -> tuple[RequestToken, ...]:
+         return tuple(self._accepted_tokens)
+diff --git a/src/miniredis/core/planning.py b/src/miniredis/core/planning.py
+index 6641aabca7e5bef9d02df61ecce431119fa6722c..a022a95636988ef86141838711a724d5cac722f0 100644
+--- a/src/miniredis/core/planning.py
++++ b/src/miniredis/core/planning.py
+@@ -122,6 +122,44 @@ def plan_general_and_strings(
+             return ExecutionPlan(Bytes(message))
+         case cmd.Echo(message):
+             return ExecutionPlan(Bytes(message))
++        case cmd.CompareDelete(key, expected):
++            entry, expired = lookup(database, key, now_ms)
++            if entry is None:
++                return ExecutionPlan(Number(0), expired)
++            if not isinstance(entry.value, StringValue):
++                return ExecutionPlan(WRONGTYPE)
++            if entry.value.data != expected:
++                return ExecutionPlan(Number(0), touch_keys=(key,))
++            return ExecutionPlan(
++                Number(1),
++                expired + (DeleteKey(key, DeleteReason.CLIENT),),
++            )
++        case cmd.CheckDecrement(key, amount):
++            previous, expired = lookup(database, key, now_ms)
++            if previous is None:
++                return ExecutionPlan(
++                    Failure("INSUFFICIENT", "insufficient value"),
++                    expired,
++                )
++            if not isinstance(previous.value, StringValue):
++                return ExecutionPlan(WRONGTYPE)
++            try:
++                old_value = parse_int64(previous.value.data)
++            except CommandParseError:
++                return _integer_failure()
++            if old_value < amount:
++                return ExecutionPlan(
++                    Failure("INSUFFICIENT", "insufficient value"),
++                    touch_keys=(key,),
++                )
++            new_value = old_value - amount
++            put = make_put(
++                key,
++                StringValue(str(new_value).encode("ascii")),
++                previous,
++                previous.expire_at_ms,
++            )
++            return ExecutionPlan(Number(new_value), expired + (put,))
+         case cmd.Delete(keys):
+             operations: list[CommitOperation] = []
+             removed = 0
+diff --git a/src/miniredis/core/reply.py b/src/miniredis/core/reply.py
+index cb58e6b129d8439bafce04320ae09a11f38c4d6b..c1744d7cc9cb63f49e0816a26ebb9e8a274028e3 100644
+--- a/src/miniredis/core/reply.py
++++ b/src/miniredis/core/reply.py
+@@ -24,10 +24,15 @@ class Items:
+     values: tuple[Reply, ...]
+ 
+ 
++@dataclass(frozen=True, slots=True)
++class NullArray:
++    pass
++
++
+ @dataclass(frozen=True, slots=True)
+ class Failure:
+     code: str
+     message: str
+ 
+ 
+-Reply: TypeAlias = Ok | Bytes | Number | Items | Failure
++Reply: TypeAlias = Ok | Bytes | Number | Items | NullArray | Failure
+diff --git a/src/miniredis/core/transactions.py b/src/miniredis/core/transactions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..259b7611361fa188e68acdea7303be91f5c31682
+--- /dev/null
++++ b/src/miniredis/core/transactions.py
+@@ -0,0 +1,34 @@
++from dataclasses import dataclass, field
++
++from miniredis.commands.model import Command
++from miniredis.core.blocking import WaiterId, WaiterWakeup
++from miniredis.core.commit import CommitOperation
++from miniredis.core.database import Database
++from miniredis.core.reply import Reply
++
++
++@dataclass(slots=True)
++class TransactionState:
++    active: bool = False
++    dirty: bool = False
++    queued: list[Command] = field(default_factory=list)
++    watched: dict[bytes, int] = field(default_factory=dict)
++
++    def reset_transaction(self) -> None:
++        self.active = False
++        self.dirty = False
++        self.queued.clear()
++
++    def clear_all(self) -> None:
++        self.reset_transaction()
++        self.watched.clear()
++
++
++@dataclass(slots=True)
++class TransactionWorkspace:
++    database: Database
++    operations: list[CommitOperation] = field(default_factory=list)
++    replies: list[Reply] = field(default_factory=list)
++    touch_keys: list[bytes] = field(default_factory=list)
++    wakeups: list[WaiterWakeup] = field(default_factory=list)
++    reserved_waiters: set[WaiterId] = field(default_factory=set)
+diff --git a/tests/adapters/test_resp2_mapping.py b/tests/adapters/test_resp2_mapping.py
+index 9a70f989e42cd376cf3eb0cfee42b49cb8544776..3c49231a6b82643c7a71be6c6c3932aa1fa61929 100644
+--- a/tests/adapters/test_resp2_mapping.py
++++ b/tests/adapters/test_resp2_mapping.py
+@@ -17,7 +17,7 @@ from miniredis.core.outbound import (
+     ServerClosed,
+     SubscriptionAck,
+ )
+-from miniredis.core.reply import Bytes, Failure, Items, Number, Ok
++from miniredis.core.reply import Bytes, Failure, Items, NullArray, Number, Ok
+ 
+ 
+ def test_command_array_maps_without_text_decoding():
+@@ -48,6 +48,7 @@ def test_domain_replies_encode_as_resp2():
+     assert encode_outbound(Items((Bytes(b"a"), Number(1)))) == (
+         b"*2\r\n$1\r\na\r\n:1\r\n"
+     )
++    assert encode_outbound(NullArray()) == b"*-1\r\n"
+     assert encode_outbound(Failure("WRONGTYPE", "bad")) == b"-WRONGTYPE bad\r\n"
+ 
+ 
+diff --git a/tests/contract/test_atomic_functions.py b/tests/contract/test_atomic_functions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..abb798bb4a67a16f8ae2109b42243447d5c2dfc4
+--- /dev/null
++++ b/tests/contract/test_atomic_functions.py
+@@ -0,0 +1,107 @@
++import asyncio
++
++import pytest
++
++from miniredis import CommandRequest, MiniRedis
++from miniredis.core.reply import Bytes, Failure, Items, Number, Ok
++from tests.helpers.time import FakeClock
++
++
++@pytest.mark.asyncio
++async def test_comparedel_only_removes_matching_string():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        await client.execute(
++            CommandRequest(b"SET", (b"lock", b"owner", b"PX", b"1000"))
++        )
++        before = runtime.debug_commit_seq
++
++        assert await client.execute(
++            CommandRequest(b"COMPAREDEL", (b"lock", b"other"))
++        ) == Number(0)
++        assert runtime.debug_commit_seq == before
++        assert await client.execute(
++            CommandRequest(b"COMPAREDEL", (b"lock", b"owner"))
++        ) == Number(1)
++        assert await client.execute(CommandRequest(b"GET", (b"lock",))) == Bytes(None)
++
++
++@pytest.mark.asyncio
++async def test_comparedel_missing_and_wrongtype_contracts():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        assert await client.execute(
++            CommandRequest(b"COMPAREDEL", (b"missing", b"token"))
++        ) == Number(0)
++        await client.execute(CommandRequest(b"LPUSH", (b"list", b"x")))
++        assert await client.execute(
++            CommandRequest(b"COMPAREDEL", (b"list", b"token"))
++        ) == Failure(
++            "WRONGTYPE",
++            "operation against a key holding the wrong kind of value",
++        )
++
++
++@pytest.mark.asyncio
++async def test_checkdecr_preserves_ttl_and_rejects_insufficient_stock():
++    clock = FakeClock(0)
++    async with MiniRedis.open(clock=clock) as runtime:
++        client = runtime.direct_client()
++        await client.execute(
++            CommandRequest(b"SET", (b"stock", b"5", b"PX", b"1000"))
++        )
++        ttl = await client.execute(CommandRequest(b"PTTL", (b"stock",)))
++
++        assert await client.execute(
++            CommandRequest(b"CHECKDECR", (b"stock", b"2"))
++        ) == Number(3)
++        assert await client.execute(CommandRequest(b"PTTL", (b"stock",))) == ttl
++        before = runtime.debug_commit_seq
++        assert await client.execute(
++            CommandRequest(b"CHECKDECR", (b"stock", b"4"))
++        ) == Failure("INSUFFICIENT", "insufficient value")
++        assert runtime.debug_commit_seq == before
++
++
++@pytest.mark.asyncio
++async def test_checkdecr_missing_wrongtype_and_invalid_integer_contracts():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        assert await client.execute(
++            CommandRequest(b"CHECKDECR", (b"missing", b"1"))
++        ) == Failure("INSUFFICIENT", "insufficient value")
++        await client.execute(CommandRequest(b"LPUSH", (b"list", b"x")))
++        assert await client.execute(
++            CommandRequest(b"CHECKDECR", (b"list", b"1"))
++        ) == Failure(
++            "WRONGTYPE",
++            "operation against a key holding the wrong kind of value",
++        )
++        await client.execute(CommandRequest(b"SET", (b"stock", b"01")))
++        assert await client.execute(
++            CommandRequest(b"CHECKDECR", (b"stock", b"1"))
++        ) == Failure("ERR", "value is not an integer or out of range")
++
++
++@pytest.mark.asyncio
++async def test_checkdecr_is_single_winner_and_queues_inside_transaction():
++    async with MiniRedis.open() as runtime:
++        owner = runtime.direct_client()
++        rival = runtime.direct_client()
++        await owner.execute(CommandRequest(b"SET", (b"stock", b"1")))
++
++        results = await asyncio.gather(
++            owner.execute(CommandRequest(b"CHECKDECR", (b"stock", b"1"))),
++            rival.execute(CommandRequest(b"CHECKDECR", (b"stock", b"1"))),
++        )
++        assert sorted(results, key=repr) == sorted(
++            [Number(0), Failure("INSUFFICIENT", "insufficient value")],
++            key=repr,
++        )
++
++        await owner.execute(CommandRequest(b"SET", (b"stock", b"2")))
++        assert await owner.execute(CommandRequest(b"MULTI")) == Ok()
++        assert await owner.execute(
++            CommandRequest(b"CHECKDECR", (b"stock", b"1"))
++        ) == Ok(b"QUEUED")
++        assert await owner.execute(CommandRequest(b"EXEC")) == Items((Number(1),))
+diff --git a/tests/mechanisms/test_transactions.py b/tests/mechanisms/test_transactions.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..3c0dc8e00dd197da91ffb5cf445bcdca2e316adc
+--- /dev/null
++++ b/tests/mechanisms/test_transactions.py
+@@ -0,0 +1,128 @@
++import asyncio
++
++import pytest
++
++from miniredis import CommandRequest, MiniRedis
++from miniredis.core.reply import Bytes, Failure, Items, Number, Ok
++
++
++@pytest.mark.asyncio
++async def test_multi_queues_and_discard_clears_state():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++
++        assert await client.execute(CommandRequest(b"MULTI")) == Ok()
++        assert await client.execute(
++            CommandRequest(b"SET", (b"k", b"v"))
++        ) == Ok(b"QUEUED")
++        assert await client.execute(CommandRequest(b"DISCARD")) == Ok()
++        assert await client.execute(CommandRequest(b"GET", (b"k",))) == Bytes(None)
++
++
++@pytest.mark.asyncio
++async def test_transaction_control_errors_and_parse_error_marks_dirty():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++
++        assert await client.execute(CommandRequest(b"EXEC")) == Failure(
++            "ERR", "EXEC without MULTI"
++        )
++        assert await client.execute(CommandRequest(b"DISCARD")) == Failure(
++            "ERR", "DISCARD without MULTI"
++        )
++        assert await client.execute(CommandRequest(b"MULTI")) == Ok()
++        assert await client.execute(CommandRequest(b"MULTI")) == Failure(
++            "ERR", "MULTI calls can not be nested"
++        )
++        assert await client.execute(CommandRequest(b"GET")) == Failure(
++            "ERR", "wrong number of arguments for GET"
++        )
++        assert runtime.executor.active_transaction_count == 1
++        assert runtime.executor.dirty_transaction_count == 1
++        assert await client.execute(CommandRequest(b"DISCARD")) == Ok()
++
++
++@pytest.mark.asyncio
++async def test_disallowed_blocking_command_marks_transaction_dirty():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++
++        assert await client.execute(CommandRequest(b"MULTI")) == Ok()
++        assert await client.execute(
++            CommandRequest(b"BLPOP", (b"q", b"0"))
++        ) == Failure("ERR", "command is not allowed inside MULTI")
++        assert runtime.executor.dirty_transaction_count == 1
++        assert await client.execute(CommandRequest(b"DISCARD")) == Ok()
++
++
++@pytest.mark.asyncio
++async def test_exec_reads_prior_write_and_keeps_runtime_error_slots():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        await client.execute(CommandRequest(b"MULTI"))
++        await client.execute(CommandRequest(b"SET", (b"k", b"1")))
++        await client.execute(CommandRequest(b"LPUSH", (b"k", b"x")))
++        await client.execute(CommandRequest(b"INCR", (b"k",)))
++        before = runtime.debug_commit_seq
++
++        assert await client.execute(CommandRequest(b"EXEC")) == Items(
++            (
++                Ok(),
++                Failure(
++                    "WRONGTYPE",
++                    "operation against a key holding the wrong kind of value",
++                ),
++                Number(2),
++            )
++        )
++        assert runtime.debug_commit_seq == before + 1
++        assert await client.execute(CommandRequest(b"GET", (b"k",))) == Bytes(b"2")
++
++
++@pytest.mark.asyncio
++async def test_dirty_exec_aborts_without_applying_queued_commands():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        await client.execute(CommandRequest(b"MULTI"))
++        await client.execute(CommandRequest(b"SET", (b"k", b"v")))
++        await client.execute(CommandRequest(b"GET"))
++
++        assert await client.execute(CommandRequest(b"EXEC")) == Failure(
++            "EXECABORT", "transaction discarded because of previous errors"
++        )
++        assert await client.execute(CommandRequest(b"GET", (b"k",))) == Bytes(None)
++
++
++@pytest.mark.asyncio
++async def test_empty_exec_is_a_noop_without_commit():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++        before = runtime.debug_commit_seq
++        await client.execute(CommandRequest(b"MULTI"))
++
++        assert await client.execute(CommandRequest(b"EXEC")) == Items(())
++        assert runtime.debug_commit_seq == before
++
++
++@pytest.mark.asyncio
++async def test_exec_reserves_each_blocked_waiter_at_most_once():
++    async with MiniRedis.open() as runtime:
++        first = runtime.direct_client()
++        second = runtime.direct_client()
++        producer = runtime.direct_client()
++        blocked_first = asyncio.create_task(
++            first.execute(CommandRequest(b"BLPOP", (b"q", b"0")))
++        )
++        blocked_second = asyncio.create_task(
++            second.execute(CommandRequest(b"BLPOP", (b"q", b"0")))
++        )
++        await runtime.debug_wait_for_waiters(2)
++        await producer.execute(CommandRequest(b"MULTI"))
++        await producer.execute(CommandRequest(b"RPUSH", (b"q", b"a")))
++        await producer.execute(CommandRequest(b"RPUSH", (b"q", b"b")))
++
++        assert await producer.execute(CommandRequest(b"EXEC")) == Items(
++            (Number(1), Number(1))
++        )
++        assert await blocked_first == Items((Bytes(b"q"), Bytes(b"a")))
++        assert await blocked_second == Items((Bytes(b"q"), Bytes(b"b")))
+diff --git a/tests/mechanisms/test_watch.py b/tests/mechanisms/test_watch.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..d42b382c70408468110e9685c60701d5f67d830e
+--- /dev/null
++++ b/tests/mechanisms/test_watch.py
+@@ -0,0 +1,49 @@
++import pytest
++
++from miniredis import CommandRequest, MiniRedis
++from miniredis.core.reply import Bytes, Failure, NullArray, Ok
++
++
++@pytest.mark.asyncio
++async def test_unwatch_clears_recorded_revisions():
++    async with MiniRedis.open() as runtime:
++        owner = runtime.direct_client()
++
++        assert await owner.execute(CommandRequest(b"WATCH", (b"k", b"other"))) == Ok()
++        assert runtime.executor.watched_key_count == 2
++        assert await owner.execute(CommandRequest(b"UNWATCH")) == Ok()
++        assert runtime.executor.watched_key_count == 0
++
++
++@pytest.mark.asyncio
++async def test_watch_after_multi_is_rejected_and_session_close_cleans_state():
++    async with MiniRedis.open() as runtime:
++        client = runtime.direct_client()
++
++        assert await client.execute(CommandRequest(b"WATCH", (b"k",))) == Ok()
++        assert await client.execute(CommandRequest(b"MULTI")) == Ok()
++        assert await client.execute(CommandRequest(b"WATCH", (b"other",))) == Failure(
++            "ERR", "WATCH inside MULTI is not allowed"
++        )
++        assert runtime.executor.dirty_transaction_count == 1
++
++        await client.close()
++
++        assert runtime.executor.active_transaction_count == 0
++        assert runtime.executor.watched_key_count == 0
++
++
++@pytest.mark.asyncio
++async def test_watch_detects_create_then_delete():
++    async with MiniRedis.open() as runtime:
++        owner = runtime.direct_client()
++        rival = runtime.direct_client()
++        assert await owner.execute(CommandRequest(b"WATCH", (b"k",))) == Ok()
++        await rival.execute(CommandRequest(b"SET", (b"k", b"v")))
++        await rival.execute(CommandRequest(b"DEL", (b"k",)))
++        await owner.execute(CommandRequest(b"MULTI"))
++        await owner.execute(CommandRequest(b"GET", (b"k",)))
++
++        assert await owner.execute(CommandRequest(b"EXEC")) == NullArray()
++        assert runtime.executor.watched_key_count == 0
++        assert await owner.execute(CommandRequest(b"GET", (b"k",))) == Bytes(None)
+diff --git a/tests/reliability/test_transaction_commit.py b/tests/reliability/test_transaction_commit.py
+new file mode 100644
+index 0000000000000000000000000000000000000000..7533410c3190fcbe8927536ddb3451037ef41e13
+--- /dev/null
++++ b/tests/reliability/test_transaction_commit.py
+@@ -0,0 +1,33 @@
++import pytest
++
++from miniredis import CommandRequest, MiniRedis, MiniRedisConfig
++from miniredis.core.reply import Bytes, Items, Ok
++from miniredis.persistence.aof import AofPolicy
++
++
++@pytest.mark.asyncio
++async def test_transaction_is_one_aof_batch_and_recovers_as_one_commit(tmp_path):
++    config = MiniRedisConfig(
++        aof_path=tmp_path / "appendonly.mraof",
++        aof_policy=AofPolicy.ALWAYS,
++    )
++    first = MiniRedis.open(config)
++    await first.start()
++    client = first.direct_client()
++    before = first.debug_commit_seq
++    await client.execute(CommandRequest(b"MULTI"))
++    await client.execute(CommandRequest(b"SET", (b"a", b"1")))
++    await client.execute(CommandRequest(b"SET", (b"b", b"2")))
++
++    assert await client.execute(CommandRequest(b"EXEC")) == Items((Ok(), Ok()))
++    assert first.debug_commit_seq == before + 1
++    assert len(first.debug_applied_batches()[-1].operations) == 2
++    await first.close()
++
++    second = MiniRedis.open(config)
++    await second.start()
++    recovered = second.direct_client()
++    assert await recovered.execute(CommandRequest(b"GET", (b"a",))) == Bytes(b"1")
++    assert await recovered.execute(CommandRequest(b"GET", (b"b",))) == Bytes(b"2")
++    assert second.debug_commit_seq == before + 1
++    await second.close()
+diff --git a/tests/unit/commands/test_parser.py b/tests/unit/commands/test_parser.py
+index 27846170c493ee7b1df68fa0561568affa8996f0..2df4240d5af7edc4ee2fbdfc6d091ff41c9c56b5 100644
+--- a/tests/unit/commands/test_parser.py
++++ b/tests/unit/commands/test_parser.py
+@@ -5,7 +5,12 @@ import math
+ import pytest
+ 
+ from miniredis.commands.model import (
++    CheckDecrement,
++    CompareDelete,
++    Discard,
+     Echo,
++    Exec,
++    Multi,
+     Ping,
+     SetString,
+     TimeToLive,
+@@ -19,6 +24,8 @@ from miniredis.commands.model import (
+     SetMembers,
+     ZRemove,
+     ZRangeByScore,
++    Unwatch,
++    Watch,
+ )
+ from miniredis.commands.parser import CommandParseError, parse_command_request
+ from miniredis.commands.request import CommandRequest
+@@ -94,6 +101,34 @@ def test_parse_representative_commands_return_exact_typed_command(
+     assert parse_command_request(command_request) == expected
+ 
+ 
++def test_parse_transaction_and_atomic_commands():
++    assert parse(b"MULTI") == Multi()
++    assert parse(b"EXEC") == Exec()
++    assert parse(b"DISCARD") == Discard()
++    assert parse(b"WATCH", b"a", b"b") == Watch((b"a", b"b"))
++    assert parse(b"UNWATCH") == Unwatch()
++    assert parse(b"COMPAREDEL", b"k", b"token") == CompareDelete(b"k", b"token")
++    assert parse(b"CHECKDECR", b"stock", b"2") == CheckDecrement(b"stock", 2)
++
++
++@pytest.mark.parametrize(
++    "command_request",
++    [
++        CommandRequest(b"MULTI", (b"x",)),
++        CommandRequest(b"EXEC", (b"x",)),
++        CommandRequest(b"DISCARD", (b"x",)),
++        CommandRequest(b"WATCH"),
++        CommandRequest(b"UNWATCH", (b"x",)),
++        CommandRequest(b"COMPAREDEL", (b"k",)),
++        CommandRequest(b"CHECKDECR", (b"k", b"0")),
++        CommandRequest(b"CHECKDECR", (b"k", b"-1")),
++    ],
++)
++def test_transaction_and_atomic_command_arity_is_rejected(command_request):
++    with pytest.raises(CommandParseError):
++        parse_command_request(command_request)
++
++
+ @pytest.mark.parametrize(
+     "command_request",
+     [
+diff --git a/tests/unit/core/test_domain_types.py b/tests/unit/core/test_domain_types.py
+index 94046c22fc982415ce8833b79c105a1b016b0525..905d09eb5c319fe6d7518ed27101e4eac173aca2 100644
+--- a/tests/unit/core/test_domain_types.py
++++ b/tests/unit/core/test_domain_types.py
+@@ -263,6 +263,67 @@ def test_apply_batch_unsupported_operation_is_atomic() -> None:
+     ) == before_state
+ 
+ 
++def test_revision_survives_create_delete_cycle_and_absent_delete():
++    database = Database()
++    database.apply_batch(
++        CommitBatch(
++            1,
++            (PutEntry(b"k", StoredEntry(StoredString(b"v"), None, 1)),),
++            CommitTrigger.CLIENT,
++        ),
++        track_access=True,
++    )
++    created = database.revision(b"k")
++    database.apply_batch(
++        CommitBatch(2, (DeleteKey(b"k", DeleteReason.CLIENT),), CommitTrigger.CLIENT),
++        track_access=True,
++    )
++    deleted = database.revision(b"k")
++    database.apply_batch(
++        CommitBatch(
++            3,
++            (DeleteKey(b"missing", DeleteReason.CLIENT),),
++            CommitTrigger.CLIENT,
++        ),
++        track_access=True,
++    )
++
++    assert b"k" not in database.entries
++    assert deleted > created
++    assert database.revision(b"missing") > deleted
++
++
++def test_database_fork_is_deep_and_preserves_runtime_metadata():
++    database = Database()
++    database.apply_batch(
++        CommitBatch(
++            1,
++            (PutEntry(b"k", StoredEntry(StoredString(b"v"), None, 1)),),
++            CommitTrigger.CLIENT,
++        ),
++        track_access=True,
++    )
++
++    fork = database.fork()
++    fork.touch_if_live(b"k", 0)
++    fork.apply_batch(
++        CommitBatch(
++            2,
++            (DeleteKey(b"k", DeleteReason.CLIENT),),
++            CommitTrigger.CLIENT,
++        ),
++        track_access=True,
++    )
++
++    assert b"k" in database.entries
++    assert b"k" not in fork.entries
++    assert database.access_tick == 1
++    assert fork.access_tick == 2
++    assert database.revision(b"k") != fork.revision(b"k")
++    assert database.logical_usage > 0
++    assert fork.logical_usage == 0
++
++
+ def test_apply_batch_tracks_each_put_and_touch_only_live_entries() -> None:
+     database = Database()
+     database.apply_batch(

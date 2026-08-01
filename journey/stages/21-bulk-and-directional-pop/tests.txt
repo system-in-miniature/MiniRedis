@@ -1,0 +1,2 @@
+tests/contract/test_strings.py
+tests/mechanisms/test_blpop.py

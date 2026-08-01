@@ -1,31 +1,7 @@
 name: Polished Journey
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - "journey/**"
-      - "docs/**"
-      - "src/**"
-      - "tests/**"
-      - "AGENTS.md"
-      - "README*.md"
-      - "mkdocs.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/journey.yml"
-  pull_request:
-    paths:
-      - "journey/**"
-      - "docs/**"
-      - "src/**"
-      - "tests/**"
-      - "AGENTS.md"
-      - "README*.md"
-      - "mkdocs.yml"
-      - "pyproject.toml"
-      - "uv.lock"
-      - ".github/workflows/journey.yml"
+  workflow_dispatch:
 
 permissions:
   contents: read

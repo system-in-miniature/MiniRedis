@@ -1,0 +1,42 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/replication/test_promotion.py",
+  "tests/reliability/test_ambiguous_outcome.py",
+  "tests/reliability/test_lost_acked_write.py",
+  "tests/reliability/test_phase3_invariants.py",
+  "tests/reliability/test_reliability_shutdown.py",
+  "tests/reliability/test_restart.py",
+  "tests/reliability/test_worker_failure.py",
+]
+
+[[blocks]]
+id = "promotion-barrier"
+title_en = "Generation-safe promotion barrier"
+title_zh = "Generation 安全的晋升屏障"
+summary_en = "Order already-admitted replica applies before promotion, retire the source generation, and reopen writes only after the barrier."
+summary_zh = "把已接纳的 Replica Apply 排在 Promotion 之前，作废旧 Source Generation，并只在屏障之后重新开放写入。"
+files = ["src/miniredis/replication/sink.py", "src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "admission-lifecycle"
+title_en = "Reopenable user admission"
+title_zh = "可重开的用户接纳"
+summary_en = "Keep control admission alive while a replica is read-only, then reopen user admission when that runtime becomes the new primary."
+summary_zh = "Replica 只读期间保持 Control Admission 存活，并在 Runtime 成为新 Primary 时重新开放 User Admission。"
+files = ["src/miniredis/core/mailbox.py"]
+
+[[blocks]]
+id = "aof-terminal-settlement"
+title_en = "AOF terminal settlement"
+title_zh = "AOF 终态收敛"
+summary_en = "Distinguish graceful close from crash close and settle in-flight sync work before the file descriptor disappears."
+summary_zh = "区分 Graceful Close 与 Crash Close，并在文件描述符消失前收敛正在进行的 Sync 工作。"
+files = ["src/miniredis/persistence/aof.py"]
+
+[[blocks]]
+id = "runtime-supervision"
+title_en = "Recovery-first supervised lifecycle"
+title_zh = "Recovery-first 受监督生命周期"
+summary_en = "Recover before admission, coordinate snapshot, AOF, replica, and executor shutdown, and fail all pending ownership when a worker dies."
+summary_zh = "在接纳请求前完成恢复，协调 Snapshot、AOF、Replica 与 Executor 的关闭，并在 Worker 死亡时终结所有待处理所有权。"
+files = ["src/miniredis/runtime.py"]

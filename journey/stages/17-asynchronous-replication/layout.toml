@@ -1,0 +1,40 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/replication/test_sink_attach.py",
+  "tests/replication/test_sink_failure_isolation.py",
+  "tests/replication/test_sink_lag.py",
+  "tests/replication/test_sink_overflow.py",
+  "tests/unit/commands/test_command_traits.py",
+]
+
+[[blocks]]
+id = "command-traits"
+title_en = "Typed read-only boundary"
+title_zh = "类型化只读边界"
+summary_en = "Classify every command by whether it mutates dataset state, then reject only those commands while a runtime follows a primary."
+summary_zh = "按是否修改数据集状态对每种命令做完备分类，并在 Runtime 跟随 Primary 时只拒绝真正的数据写入。"
+files = ["src/miniredis/commands/model.py"]
+
+[[blocks]]
+id = "attachment-order"
+title_en = "Atomic attachment handoff"
+title_zh = "原子接入交接"
+summary_en = "Capture snapshot sequence and state, register the sink, and enqueue every later commit in the same executor order."
+summary_zh = "在同一 Executor 顺序中捕获 Snapshot 序号与状态、注册 Sink，并把此后的每个 Commit 排入队列。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "replica-sink"
+title_en = "Bounded asynchronous replica sink"
+title_zh = "有界异步 Replica Sink"
+summary_en = "Install the baseline, apply contiguous batches asynchronously, expose exact lag, and detach a slow or failed follower without stalling the primary."
+summary_zh = "安装 Baseline，异步应用连续 Batch，暴露精确 Lag，并在 Follower 过慢或失败时将其分离而不阻塞 Primary。"
+files = ["src/miniredis/replication/sink.py"]
+
+[[blocks]]
+id = "replication-runtime"
+title_en = "Replication ownership and limits"
+title_zh = "复制所有权与边界"
+summary_en = "Validate queue and drain limits, own attachment tasks and sinks in the runtime, and report live link counts."
+summary_zh = "校验 Queue 与 Drain 边界，由 Runtime 持有接入任务与 Sink，并报告存活 Link 数量。"
+files = ["src/miniredis/config.py", "src/miniredis/runtime.py"]

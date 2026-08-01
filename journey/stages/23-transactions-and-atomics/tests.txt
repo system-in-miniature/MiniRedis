@@ -1,3 +1,7 @@
+tests/adapters/test_resp2_mapping.py
+tests/contract/test_atomic_functions.py
 tests/mechanisms/test_transactions.py
 tests/mechanisms/test_watch.py
-tests/contract/test_atomic_functions.py
+tests/reliability/test_transaction_commit.py
+tests/unit/commands/test_parser.py
+tests/unit/core/test_domain_types.py

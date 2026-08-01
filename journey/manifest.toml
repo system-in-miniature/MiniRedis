@@ -162,7 +162,7 @@ number = 21
 slug = "bulk-and-directional-pop"
 endpoint = "40d00de"
 chapter = 3
-tests = ["tests/contract/test_strings.py", "tests/mechanisms/test_blpop.py"]
+tests = ["tests/contract/test_strings.py", "tests/mechanisms/test_blpop.py", "tests/reliability/test_final_acceptance.py", "tests/test_sloc_report.py", "tests/unit/commands/test_command_traits.py", "tests/unit/commands/test_parser.py"]
 
 [[stages]]
 number = 22

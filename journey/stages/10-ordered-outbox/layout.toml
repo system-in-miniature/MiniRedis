@@ -1,0 +1,36 @@
+failure_files = ["tests/unit/core/test_outbound.py"]
+
+[[blocks]]
+id = "direct-endpoint"
+title_en = "Session-backed Direct client"
+title_zh = "Session-backed Direct Client"
+summary_en = "Bind each Direct client to a registered endpoint so replies, unsolicited output, and close share one session identity."
+summary_zh = "把每个 Direct Client 绑定到已注册 Endpoint，使 Reply、非请求输出与关闭共用一个 Session 身份。"
+files = ["src/miniredis/adapters/direct.py"]
+
+[[blocks]]
+id = "ordered-outbox"
+title_en = "Bounded close-aware outbox"
+title_zh = "有界 Close-aware Outbox"
+summary_en = "Preserve accepted output order, drain graceful closes without sentinels, and abort a slow session on overflow."
+summary_zh = "保留已接受输出顺序，无 Sentinel 排空优雅关闭，并在溢出时中止慢 Session。"
+files = ["src/miniredis/core/outbound.py"]
+
+[[blocks]]
+id = "endpoint-ownership"
+title_en = "Executor-owned endpoints"
+title_zh = "Executor 所有的 Endpoint"
+summary_en = "Register endpoints with the single writer and resolve accepted requests when their transport closes or outbox rejects output."
+summary_zh = "由单 Writer 注册 Endpoint，并在 Transport 关闭或 Outbox 拒绝输出时收束已接受请求。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "session-wiring"
+title_en = "Session capacity and runtime wiring"
+title_zh = "Session 容量与 Runtime 接线"
+summary_en = "Validate one outbox bound, allocate monotonic session IDs, and route slow-session closure back through executor control."
+summary_zh = "校验单一 Outbox 上限，分配单调 Session ID，再把慢 Session 关闭经 Executor Control 路由回去。"
+files = [
+  "src/miniredis/config.py",
+  "src/miniredis/runtime.py",
+]

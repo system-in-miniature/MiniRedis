@@ -1,0 +1,36 @@
+failure_files = ["tests/concurrency/test_request_ownership.py"]
+
+[[blocks]]
+id = "direct-cancellation"
+title_en = "Caller cancellation boundary"
+title_zh = "调用方取消边界"
+summary_en = "Shield executor-owned completion and translate caller cancellation into an ordered abandonment control message."
+summary_zh = "Shield Executor 所有的完成态，再把调用方取消翻译成有序 Abandon Control Message。"
+files = ["src/miniredis/adapters/direct.py"]
+
+[[blocks]]
+id = "request-ownership"
+title_en = "Runtime-owned request outcomes"
+title_zh = "Runtime 所有的请求结果"
+summary_en = "Give every accepted request a monotonic token, one runtime-owned Future, and exactly one terminal outcome."
+summary_zh = "让每个已接受请求拥有单调 Token、一个 Runtime-owned Future 与唯一终态结果。"
+files = [
+  "src/miniredis/core/executor.py",
+  "src/miniredis/core/outbound.py",
+]
+
+[[blocks]]
+id = "admission-lanes"
+title_en = "User and control admission lanes"
+title_zh = "User 与 Control 准入通道"
+summary_en = "Bound user pressure while keeping lifecycle and abandonment controls admissible during shutdown."
+summary_zh = "限制 User 压力，同时在关闭期间保持 Lifecycle 与 Abandon Control 可准入。"
+files = ["src/miniredis/core/mailbox.py"]
+
+[[blocks]]
+id = "runtime-request-boundary"
+title_en = "Runtime parsing and lifecycle evidence"
+title_zh = "Runtime 解析与生命周期证据"
+summary_en = "Centralize parse ownership and expose narrow predicates that observe accepted-request cleanup without timing sleeps."
+summary_zh = "集中 Parse 所有权，并用窄化 Predicate 观察已接受请求清理，不依赖 Sleep。"
+files = ["src/miniredis/runtime.py"]

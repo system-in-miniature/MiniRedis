@@ -1,0 +1,34 @@
+failure_files = [
+  "tests/reliability/test_final_acceptance.py",
+  "tests/reliability/test_phase3_invariants.py",
+  "tests/reliability/test_restart.py",
+  "tests/replication/test_sink_attach.py",
+  "tests/unit/persistence/test_aof_repair.py",
+  "tests/unit/persistence/test_codec.py",
+  "tests/unit/persistence/test_framing.py",
+  "tests/unit/persistence/test_recovery.py",
+]
+
+[[blocks]]
+id = "aof-state-base-codec"
+title_en = "First-record AOF state base"
+title_zh = "首 Record AOF State Base"
+summary_en = "Encode a checkpoint image as a checksummed AOF record that may appear exactly once and only before contiguous commit batches."
+summary_zh = "把 Checkpoint Image 编码成带 Checksum 的 AOF Record，它最多出现一次且只能位于连续 Commit Batch 之前。"
+files = ["src/miniredis/persistence/codec.py"]
+
+[[blocks]]
+id = "aof-log-model"
+title_en = "Structured AOF log loading"
+title_zh = "结构化 AOF Log 加载"
+summary_en = "Return an explicit optional state base plus delta batches while preserving truncated-tail repair boundaries."
+summary_zh = "返回显式 Optional State Base 与 Delta Batches，同时保持 Truncated-tail Repair Boundary。"
+files = ["src/miniredis/persistence/aof.py"]
+
+[[blocks]]
+id = "base-aware-recovery"
+title_en = "Newest compatible recovery base"
+title_zh = "最新兼容 Recovery Base"
+summary_en = "Choose the newer snapshot or AOF state base, replay only later contiguous deltas, and reject an AOF that ends before the chosen checkpoint."
+summary_zh = "选择更新的 Snapshot 或 AOF State Base，只重放其后的连续 Delta，并拒绝早于所选 Checkpoint 结束的 AOF。"
+files = ["src/miniredis/persistence/recovery.py"]

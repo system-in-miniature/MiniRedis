@@ -1,3 +1,4 @@
 tests/mechanisms/test_pubsub.py
 tests/concurrency/test_shutdown.py
 tests/concurrency/test_async_invariants.py
+tests/concurrency/test_slow_endpoint.py

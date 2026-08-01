@@ -85,7 +85,7 @@ number = 10
 slug = "ordered-outbox"
 endpoint = "5436512"
 chapter = 2
-tests = ["tests/unit/core/test_outbound.py", "tests/concurrency/test_slow_endpoint.py"]
+tests = ["tests/unit/core/test_outbound.py"]
 
 [[stages]]
 number = 11
@@ -99,7 +99,7 @@ number = 12
 slug = "pubsub-and-shutdown"
 endpoint = "6ff1e5f"
 chapter = 9
-tests = ["tests/mechanisms/test_pubsub.py", "tests/concurrency/test_shutdown.py", "tests/concurrency/test_async_invariants.py"]
+tests = ["tests/mechanisms/test_pubsub.py", "tests/concurrency/test_shutdown.py", "tests/concurrency/test_async_invariants.py", "tests/concurrency/test_slow_endpoint.py"]
 
 [[stages]]
 number = 13

@@ -168,7 +168,11 @@ It rejects overlap as busy, captures through an async callback, writes off-loop,
 
 ```python
 os.replace(temporary, destination)
-self.fsync_directory(destination.parent)
+directory_fd = os.open(destination.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
 ```
 
 ##### Statement understanding
@@ -189,9 +193,11 @@ It rejects incompatible histories, restores checkpoint state, replays the contig
 ##### Key code
 
 ```python
-expected = database.commit_seq + 1
+expected = staged.commit_seq + 1
 if batch.seq != expected:
-    raise RecoveryError(f"expected replay seq {expected}, got {batch.seq}")
+    raise RecoveryError(
+        f"expected replay seq {expected}, got {batch.seq}"
+    )
 ```
 
 ##### Statement understanding
@@ -237,7 +243,8 @@ It reads clock and database in one ordered turn, returns the frozen image, and r
 
 ```python
 image = self.database.snapshot_image(self.clock.now_ms())
-message.future.set_result(image)
+if not message.future.done():
+    message.future.set_result(image)
 ```
 
 ##### Statement understanding
@@ -470,7 +477,11 @@ Snapshot 限制 Replay Cost，但不削弱 AOF Commit Contract。分开 Capture 
 
 ```python
 os.replace(temporary, destination)
-self.fsync_directory(destination.parent)
+directory_fd = os.open(destination.parent, os.O_RDONLY)
+try:
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
 ```
 
 ##### 关键语句理解
@@ -491,9 +502,11 @@ Recovery 在显式 Sequence Rule 下组合 Verified Snapshot State 与 AOF Histo
 ##### 关键代码
 
 ```python
-expected = database.commit_seq + 1
+expected = staged.commit_seq + 1
 if batch.seq != expected:
-    raise RecoveryError(f"expected replay seq {expected}, got {batch.seq}")
+    raise RecoveryError(
+        f"expected replay seq {expected}, got {batch.seq}"
+    )
 ```
 
 ##### 关键语句理解
@@ -539,7 +552,8 @@ Executor 接收 Snapshot-capture Control Message。
 
 ```python
 image = self.database.snapshot_image(self.clock.now_ms())
-message.future.set_result(image)
+if not message.future.done():
+    message.future.set_result(image)
 ```
 
 ##### 关键语句理解

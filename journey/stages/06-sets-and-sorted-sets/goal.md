@@ -96,7 +96,7 @@ It uses live sets for membership math and binary sorting only when returning pub
 ##### Key code
 
 ```python
-Items(tuple(Bytes(member) for member in sorted(entry.value.items)))
+Items(tuple(Bytes(member) for member in sorted(entry.value.items))),
 ```
 
 ##### Statement understanding
@@ -256,7 +256,7 @@ Set Planner 拥有改变唯一性的操作与确定性读取投影。
 ##### 关键代码
 
 ```python
-Items(tuple(Bytes(member) for member in sorted(entry.value.items)))
+Items(tuple(Bytes(member) for member in sorted(entry.value.items))),
 ```
 
 ##### 关键语句理解

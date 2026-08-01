@@ -215,9 +215,11 @@ It offers ordered acknowledgements/messages, removes slow sessions, and closes w
 ##### Key code
 
 ```python
+self.pubsub.clear()
 for token in tuple(self._requests):
     self._finish_request(token, event.outcome)
-self.pubsub.clear()
+for endpoint in self._endpoints.values():
+    endpoint.offer_best_effort(ServerClosed("runtime closed"))
 ```
 
 ##### Statement understanding
@@ -286,7 +288,10 @@ It shields one idempotent shutdown task, quiesces producers, posts the barrier, 
 ```python
 self.executor.mailbox.close_user_admission()
 await asyncio.gather(
-    *(producer.quiesce() for producer in tuple(self._control_producers))
+    *(
+        producer.quiesce()  # type: ignore[attr-defined]
+        for producer in tuple(self._control_producers)
+    )
 )
 ```
 
@@ -544,9 +549,11 @@ Executor 集成 Subscribed-mode 命令与终态 Shutdown Control。
 ##### 关键代码
 
 ```python
+self.pubsub.clear()
 for token in tuple(self._requests):
     self._finish_request(token, event.outcome)
-self.pubsub.clear()
+for endpoint in self._endpoints.values():
+    endpoint.offer_best_effort(ServerClosed("runtime closed"))
 ```
 
 ##### 关键语句理解
@@ -615,7 +622,10 @@ Runtime 成为 Producer、Executor、Endpoint、Shutdown Task 与 Failure Fallba
 ```python
 self.executor.mailbox.close_user_admission()
 await asyncio.gather(
-    *(producer.quiesce() for producer in tuple(self._control_producers))
+    *(
+        producer.quiesce()  # type: ignore[attr-defined]
+        for producer in tuple(self._control_producers)
+    )
 )
 ```
 

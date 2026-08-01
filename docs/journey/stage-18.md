@@ -1,0 +1,1854 @@
+# Stage 18 · Promotion and supervised lifecycle
+
+### Goal
+
+Promote a replica without letting old-source work overwrite new-primary writes, and make startup, failure, crash, and graceful shutdown settle every owned resource in an explainable order.
+
+??? note "Deliverable files"
+    - `src/miniredis/core/executor.py`
+    - `src/miniredis/core/mailbox.py`
+    - `src/miniredis/persistence/aof.py`
+    - `src/miniredis/replication/sink.py`
+    - `src/miniredis/runtime.py`
+    - `tests/helpers/runtime.py`
+    - `tests/reliability/test_ambiguous_outcome.py`
+    - `tests/reliability/test_lost_acked_write.py`
+    - `tests/reliability/test_phase3_invariants.py`
+    - `tests/reliability/test_reliability_shutdown.py`
+    - `tests/reliability/test_restart.py`
+    - `tests/reliability/test_worker_failure.py`
+    - `tests/replication/test_promotion.py`
+
+### The problem at this point
+
+A replica can receive an apply message just before promotion while the caller is already preparing local writes. Without an executor barrier and generation retirement, that old-source batch can arrive late and overwrite new-primary state. Lifecycle ownership is the same ordering problem at a larger scale: admission, recovery, durability workers, snapshots, replica tasks, and the executor cannot be stopped independently.
+
+### Test contract
+
+#### See the failure first
+
+Promotion can return before an already-accepted apply, or a stale generation can mutate state afterward. A lagging replica promoted after source loss can also lose a write that the old primary acknowledged; this stage must expose that limit rather than imply synchronous durability. During failure, pending waiters can hang, startup can admit clients before recovery, or close can tear down AOF and executor before owned work settles.
+
+??? note "File diff: tests/helpers/runtime.py"
+    ```diff
+    diff --git a/tests/helpers/runtime.py b/tests/helpers/runtime.py
+    index 73d7f4cb16db30bca888f59c6dee1daa75990fcd..53e77515b06a20108b9ef21a05b85bd61a3856fe 100644
+    --- a/tests/helpers/runtime.py
+    +++ b/tests/helpers/runtime.py
+    @@ -1,11 +1,13 @@
+     import asyncio
+     import threading
+    +from collections.abc import Awaitable, Callable
+     from pathlib import Path
+
+     from miniredis.persistence.snapshot import (
+         PosixSnapshotFileOps,
+         SnapshotFileOps,
+     )
+    +from miniredis.persistence.aof import AofFileOps
+     from miniredis.runtime import MiniRedis, _RuntimeTestHooks
+
+
+    @@ -30,6 +32,8 @@ class GateSnapshotFileOps:
+     class TestMiniRedis(MiniRedis):
+         debug_snapshot_write_entered: asyncio.Event
+         debug_snapshot_write_release: threading.Event
+    +    debug_replica_apply_entered: asyncio.Event
+    +    debug_replica_apply_release: asyncio.Event
+
+
+     async def open_test_runtime(
+    @@ -40,9 +44,15 @@ async def open_test_runtime(
+         config=None,
+         snapshot_write_gate: bool = False,
+         replica_apply_failure: BaseException | None = None,
+    +    replica_apply_gate: bool = False,
+    +    aof_ops: AofFileOps | None = None,
+    +    aof_sleep: Callable[[float], Awaitable[None]] | None = None,
+    +    lifecycle_trace: bool = False,
+     ) -> TestMiniRedis:
+         loop = asyncio.get_running_loop()
+         snapshot_gate = GateSnapshotFileOps(loop) if snapshot_write_gate else None
+    +    apply_entered = asyncio.Event() if replica_apply_gate else None
+    +    apply_release = asyncio.Event() if replica_apply_gate else None
+         runtime = TestMiniRedis._for_test(
+             config=config,
+             clock=clock,
+    @@ -51,10 +61,18 @@ async def open_test_runtime(
+                 aof_appender=aof_appender,
+                 snapshot_ops=snapshot_gate,
+                 replica_apply_failure=replica_apply_failure,
+    +            replica_apply_entered=apply_entered,
+    +            replica_apply_release=apply_release,
+    +            aof_ops=aof_ops,
+    +            aof_sleep=aof_sleep,
+    +            lifecycle_trace=[] if lifecycle_trace else None,
+             ),
+         )
+         if snapshot_gate is not None:
+             runtime.debug_snapshot_write_entered = snapshot_gate.entered
+             runtime.debug_snapshot_write_release = snapshot_gate.release
+    +    if apply_entered is not None and apply_release is not None:
+    +        runtime.debug_replica_apply_entered = apply_entered
+    +        runtime.debug_replica_apply_release = apply_release
+         await runtime.start()
+         return runtime
+    ```
+
+**What this test locks**
+
+The helper provides narrow gates, AOF operations, sleep, and lifecycle trace hooks through the real runtime.
+
+**How it constructs the counterexample**
+
+It allocates paired apply events and passes explicit hooks into `MiniRedis._for_test`.
+
+**Key test statement**
+
+```python
+replica_apply_entered=apply_entered,
+replica_apply_release=apply_release,
+```
+
+**What a failure means**
+
+Race tests cannot place a deterministic boundary around real executor ordering.
+
+??? note "File diff: tests/replication/test_promotion.py"
+    ```diff
+    diff --git a/tests/replication/test_promotion.py b/tests/replication/test_promotion.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..51406f5ca1557311343cf026d2a6bd7dcf3e8909
+    --- /dev/null
+    +++ b/tests/replication/test_promotion.py
+    @@ -0,0 +1,101 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.commit import (
+    +    CommitBatch,
+    +    CommitTrigger,
+    +    PutEntry,
+    +    StoredEntry,
+    +    StoredString,
+    +)
+    +from miniredis.core.reply import Bytes, Ok
+    +from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +def batch(seq: int, value: bytes) -> CommitBatch:
+    +    return CommitBatch(
+    +        seq,
+    +        (
+    +            PutEntry(
+    +                b"k",
+    +                StoredEntry(StoredString(value), None, seq),
+    +            ),
+    +        ),
+    +        CommitTrigger.CLIENT,
+    +    )
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_apply_accepted_before_promotion_finishes_before_barrier():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime(replica_apply_gate=True)
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +    generation = sink.status.generation
+    +    assert generation is not None
+    +
+    +    accepted = asyncio.create_task(
+    +        replica.executor.apply_replica_batch(generation, batch(1, b"old"))
+    +    )
+    +    await replica.debug_replica_apply_entered.wait()
+    +    promoting = asyncio.create_task(sink.promote(source_alive=True))
+    +    replica.debug_replica_apply_release.set()
+    +    promotion = await promoting
+    +
+    +    assert await accepted is True
+    +    assert promotion.applied_seq == 1
+    +    assert promotion.writable is True
+    +    assert sink.status.state is ReplicaSinkState.PROMOTED
+    +    assert await replica.direct_client().execute(
+    +        CommandRequest(b"GET", (b"k",))
+    +    ) == Bytes(b"old")
+    +    await primary.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_late_old_generation_cannot_overwrite_post_promotion_write():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +    generation = sink.status.generation
+    +    assert generation is not None
+    +    await sink.promote(source_alive=True)
+    +
+    +    assert await replica.direct_client().execute(
+    +        CommandRequest(b"SET", (b"k", b"new"))
+    +    ) == Ok()
+    +    applied = await replica.executor.apply_replica_batch(
+    +        generation,
+    +        batch(2, b"stale"),
+    +    )
+    +
+    +    assert applied is False
+    +    assert await replica.direct_client().execute(
+    +        CommandRequest(b"GET", (b"k",))
+    +    ) == Bytes(b"new")
+    +    await primary.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_link_generations_are_never_reused():
+    +    primary = await open_test_runtime()
+    +    first_replica = await open_test_runtime()
+    +    second_replica = await open_test_runtime()
+    +    first = ReplicaSink(first_replica, queue_limit=2)
+    +    second = ReplicaSink(second_replica, queue_limit=2)
+    +    await primary.attach_replica(first)
+    +    first_generation = first.status.generation
+    +    await first.promote(source_alive=True)
+    +    await primary.attach_replica(second)
+    +
+    +    assert first_generation is not None
+    +    assert second.status.generation == first_generation + 1
+    +    await primary.close()
+    +    await first_replica.close()
+    +    await second_replica.close()
+    ```
+
+**What this test locks**
+
+It locks promotion behind already-admitted apply controls, retires old generations, and keeps link generations monotonic.
+
+**How it constructs the counterexample**
+
+It gates an accepted apply, starts promotion, releases the apply, performs a post-promotion write, then submits a late old-generation batch.
+
+**Key test statement**
+
+```python
+assert await accepted is True
+assert applied is False
+```
+
+**What a failure means**
+
+Promotion is not an ordered executor barrier or stale-source work can cross the role change.
+
+??? note "File diff: tests/reliability/test_ambiguous_outcome.py"
+    ```diff
+    diff --git a/tests/reliability/test_ambiguous_outcome.py b/tests/reliability/test_ambiguous_outcome.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..4a0056fd51cf9a4d287d8329dc383dfb114268b6
+    --- /dev/null
+    +++ b/tests/reliability/test_ambiguous_outcome.py
+    @@ -0,0 +1,41 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.reply import Failure
+    +from miniredis.persistence.aof import AofAppendFailed
+    +from miniredis.persistence.codec import AOF_HEADER, encode_aof_record
+    +from miniredis.persistence.recovery import recover_database
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +class WriteThenFailAppender:
+    +    def __init__(self, path) -> None:
+    +        self.path = path
+    +
+    +    async def append(self, batch):
+    +        self.path.write_bytes(AOF_HEADER + encode_aof_record(batch))
+    +        return AofAppendFailed("uncertain write")
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_disk_may_contain_a_write_that_never_applied_or_replied_ok(
+    +    tmp_path,
+    +):
+    +    path = tmp_path / "appendonly.mraof"
+    +    runtime = await open_test_runtime(aof_appender=WriteThenFailAppender(path))
+    +
+    +    reply = await runtime.direct_client().execute(CommandRequest(b"SET", (b"k", b"v")))
+    +
+    +    assert isinstance(reply, Failure)
+    +    assert b"k" not in runtime.database.entries
+    +    assert runtime.debug_commit_seq == 0
+    +    await runtime.close()
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=None,
+    +        aof_path=path,
+    +        now_ms=0,
+    +        repair_truncated_tail=True,
+    +    )
+    +    assert recovered.entries[b"k"].value.data == b"v"
+    +    assert recovered.commit_seq == 1
+    ```
+
+**What this test locks**
+
+It locks conservative live-state behavior when append may have reached disk but completion reports failure.
+
+**How it constructs the counterexample**
+
+An appender writes a valid record and then returns an uncertain failure; live state rejects it while later recovery can observe the bytes.
+
+**Key test statement**
+
+```python
+assert runtime.debug_commit_seq == 0
+assert recovered.commit_seq == 1
+```
+
+**What a failure means**
+
+An ambiguous durability result was falsely turned into a successful live reply or silently erased from recovery evidence.
+
+??? note "File diff: tests/reliability/test_lost_acked_write.py"
+    ```diff
+    diff --git a/tests/reliability/test_lost_acked_write.py b/tests/reliability/test_lost_acked_write.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..ac1ad0e8ba53095d0d64f798b4771bd79a5ab3fe
+    --- /dev/null
+    +++ b/tests/reliability/test_lost_acked_write.py
+    @@ -0,0 +1,35 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.reply import Bytes, Ok
+    +from miniredis.replication.sink import ReplicaSink
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_acknowledged_primary_write_can_be_lost_on_lagging_promotion():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +    sink.pause()
+    +
+    +    acknowledged = await primary.direct_client().execute(
+    +        CommandRequest(b"SET", (b"x", b"1"))
+    +    )
+    +    assert acknowledged == Ok()
+    +    assert sink.status.lag == 1
+    +    waiting = asyncio.create_task(sink.wait_until_applied(1))
+    +
+    +    await primary.simulate_crash()
+    +    with pytest.raises(RuntimeError, match="replica stopped at seq 0"):
+    +        await asyncio.wait_for(waiting, timeout=1)
+    +    promotion = await sink.promote(source_alive=False)
+    +
+    +    assert promotion.applied_seq == 0
+    +    assert await replica.direct_client().execute(
+    +        CommandRequest(b"GET", (b"x",))
+    +    ) == Bytes(None)
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks the explicit durability limitation of asynchronous replication.
+
+**How it constructs the counterexample**
+
+It pauses the follower, acknowledges one primary write, crashes the source, and promotes the still-lagging replica.
+
+**Key test statement**
+
+```python
+assert promotion.applied_seq == 0
+assert await replica.direct_client().execute(
+    CommandRequest(b"GET", (b"x",))
+) == Bytes(None)
+```
+
+**What a failure means**
+
+The implementation or documentation is hiding where acknowledged data can be lost.
+
+??? note "File diff: tests/reliability/test_phase3_invariants.py"
+    ```diff
+    diff --git a/tests/reliability/test_phase3_invariants.py b/tests/reliability/test_phase3_invariants.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..2e336c157d3ebd51d80c646b64ce960f4ab47f47
+    --- /dev/null
+    +++ b/tests/reliability/test_phase3_invariants.py
+    @@ -0,0 +1,106 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest, MiniRedis
+    +from miniredis.config import MiniRedisConfig
+    +from miniredis.core.commit import DeleteKey, DeleteReason
+    +from miniredis.persistence.aof import AofPolicy, load_aof
+    +from miniredis.replication.sink import ReplicaSink
+    +from tests.helpers.runtime import open_test_runtime
+    +from tests.helpers.time import FakeClock
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_seq_n_is_equal_live_recovered_and_on_caught_up_replica(
+    +    tmp_path,
+    +):
+    +    config = MiniRedisConfig(
+    +        aof_path=tmp_path / "appendonly.mraof",
+    +        aof_policy=AofPolicy.ALWAYS,
+    +        snapshot_path=tmp_path / "dump.mrsnap",
+    +    )
+    +    primary = await open_test_runtime(config=config)
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=16)
+    +    await primary.attach_replica(sink)
+    +    client = primary.direct_client()
+    +
+    +    await client.execute(CommandRequest(b"SET", (b"s", b"1")))
+    +    await client.execute(CommandRequest(b"HSET", (b"h", b"f", b"v")))
+    +    await client.execute(CommandRequest(b"RPUSH", (b"l", b"a", b"b")))
+    +    await primary.save_snapshot()
+    +    await client.execute(CommandRequest(b"SADD", (b"set", b"a", b"b")))
+    +    await client.execute(CommandRequest(b"ZADD", (b"z", b"1.5", b"m")))
+    +    seq = primary.debug_commit_seq
+    +    await sink.wait_until_applied(seq)
+    +    expected = primary.debug_logical_items()
+    +
+    +    assert replica.debug_commit_seq == seq
+    +    assert replica.debug_logical_items() == expected
+    +    await primary.close()
+    +
+    +    recovered = MiniRedis.open(config)
+    +    await recovered.start()
+    +    assert recovered.debug_commit_seq == seq
+    +    assert recovered.debug_logical_items() == expected
+    +    await recovered.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_expiration_and_eviction_reasons_are_in_the_same_aof_stream(
+    +    tmp_path,
+    +):
+    +    clock = FakeClock(1000)
+    +    path = tmp_path / "appendonly.mraof"
+    +    runtime = await open_test_runtime(
+    +        clock=clock,
+    +        config=MiniRedisConfig(
+    +            aof_path=path,
+    +            aof_policy=AofPolicy.ALWAYS,
+    +            maxmemory=260,
+    +            eviction_policy="allkeys-lru",
+    +        ),
+    +    )
+    +    client = runtime.direct_client()
+    +    await client.execute(CommandRequest(b"SET", (b"exp", b"x", b"PX", b"1")))
+    +    clock.advance(1)
+    +    await client.execute(CommandRequest(b"GET", (b"exp",)))
+    +    await client.execute(CommandRequest(b"SET", (b"cold", b"x")))
+    +    await client.execute(CommandRequest(b"SET", (b"hot", b"x")))
+    +    await client.execute(CommandRequest(b"GET", (b"hot",)))
+    +    await client.execute(CommandRequest(b"SET", (b"new", b"x" * 60)))
+    +    await runtime.close()
+    +
+    +    reasons = tuple(
+    +        operation.reason
+    +        for batch in load_aof(path, repair_truncated_tail=False)
+    +        for operation in batch.operations
+    +        if isinstance(operation, DeleteKey)
+    +    )
+    +    assert DeleteReason.EXPIRED in reasons
+    +    assert DeleteReason.EVICTED in reasons
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_waiters_and_pubsub_allocate_no_commit_or_durable_state():
+    +    runtime = await open_test_runtime()
+    +    blocked_client = runtime.direct_client()
+    +    publisher = runtime.direct_client()
+    +    before = runtime.debug_commit_seq
+    +
+    +    blocked = asyncio.create_task(
+    +        blocked_client.execute(CommandRequest(b"BLPOP", (b"q", b"0")))
+    +    )
+    +    await runtime.debug_wait_for_waiters(1)
+    +    delivered = await publisher.execute(
+    +        CommandRequest(b"PUBLISH", (b"channel", b"payload"))
+    +    )
+    +
+    +    assert delivered.value == 0
+    +    assert runtime.debug_commit_seq == before
+    +    blocked.cancel()
+    +    with pytest.raises(asyncio.CancelledError):
+    +        await blocked
+    +    await runtime.close()
+    ```
+
+**What this test locks**
+
+It locks one sequence-N logical state across live primary, recovered runtime, and caught-up replica, including expiry and eviction reasons in durable history.
+
+**How it constructs the counterexample**
+
+It mixes data types around a snapshot, catches up a replica, restarts the primary, and compares sequence and logical items.
+
+**Key test statement**
+
+```python
+assert replica.debug_logical_items() == expected
+assert recovered.debug_logical_items() == expected
+```
+
+**What a failure means**
+
+Durability and replication no longer encode the same state transition history.
+
+??? note "File diff: tests/reliability/test_reliability_shutdown.py"
+    ```diff
+    diff --git a/tests/reliability/test_reliability_shutdown.py b/tests/reliability/test_reliability_shutdown.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..a4f29c9bfc21b71ae1169d8f3e153d914f17d269
+    --- /dev/null
+    +++ b/tests/reliability/test_reliability_shutdown.py
+    @@ -0,0 +1,112 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.config import MiniRedisConfig
+    +from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+    +from miniredis.runtime import RuntimeState
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_close_awaits_owned_snapshot_before_closing_aof(tmp_path):
+    +    runtime = await open_test_runtime(
+    +        config=MiniRedisConfig(
+    +            aof_path=tmp_path / "appendonly.mraof",
+    +            snapshot_path=tmp_path / "dump.mrsnap",
+    +        ),
+    +        snapshot_write_gate=True,
+    +        lifecycle_trace=True,
+    +    )
+    +    await runtime.direct_client().execute(CommandRequest(b"SET", (b"k", b"v")))
+    +    saving = asyncio.create_task(runtime.save_snapshot())
+    +    await runtime.debug_snapshot_write_entered.wait()
+    +
+    +    closing = asyncio.create_task(runtime.close())
+    +    await runtime.debug_wait_for_state(RuntimeState.DRAINING.value)
+    +    assert not closing.done()
+    +    runtime.debug_snapshot_write_release.set()
+    +    await saving
+    +    await closing
+    +
+    +    trace = runtime.debug_lifecycle_trace()
+    +    assert trace.index("snapshot-job-done") < trace.index("aof-closed")
+    +    assert trace.index("aof-closed") < trace.index("replicas-stopped")
+    +    assert trace.index("replicas-stopped") < trace.index("executor-stopped")
+    +    stats = runtime.debug_stats()
+    +    assert stats.owned_tasks == 0
+    +    assert stats.snapshot_jobs == 0
+    +    assert stats.replica_links == 0
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_graceful_close_bounds_replica_drain_then_detaches():
+    +    primary = await open_test_runtime(config=MiniRedisConfig(replica_drain_grace_ms=0))
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=2)
+    +    await primary.attach_replica(sink)
+    +    sink.pause()
+    +    await primary.direct_client().execute(CommandRequest(b"SET", (b"k", b"v")))
+    +
+    +    await primary.close()
+    +
+    +    assert sink.status.state is ReplicaSinkState.STOPPED
+    +    assert sink.status.applied_seq == 0
+    +    stats = primary.debug_stats()
+    +    assert stats.owned_tasks == 0
+    +    assert stats.snapshot_jobs == 0
+    +    assert stats.replica_links == 0
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_cancelling_one_close_waiter_cannot_cancel_cleanup(tmp_path):
+    +    runtime = await open_test_runtime(
+    +        config=MiniRedisConfig(snapshot_path=tmp_path / "dump.mrsnap"),
+    +        snapshot_write_gate=True,
+    +    )
+    +    saving = asyncio.create_task(runtime.save_snapshot())
+    +    await runtime.debug_snapshot_write_entered.wait()
+    +    first = asyncio.create_task(runtime.close())
+    +    second = asyncio.create_task(runtime.close())
+    +    first.cancel()
+    +    with pytest.raises(asyncio.CancelledError):
+    +        await first
+    +
+    +    runtime.debug_snapshot_write_release.set()
+    +    await saving
+    +    await second
+    +    stats = runtime.debug_stats()
+    +    assert stats.owned_tasks == 0
+    +    assert stats.snapshot_jobs == 0
+    +    assert stats.replica_links == 0
+    +
+    +
+    +@pytest.mark.asyncio
+    +@pytest.mark.parametrize("crash", [False, True])
+    +async def test_close_or_crash_joins_a_bootstrap_blocked_on_install_gate(
+    +    crash,
+    +):
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    install_gate = asyncio.Event()
+    +    sink = ReplicaSink(
+    +        replica,
+    +        queue_limit=2,
+    +        install_gate=install_gate,
+    +    )
+    +    attaching = asyncio.create_task(primary.attach_replica(sink))
+    +    await sink.attachment_captured.wait()
+    +
+    +    if crash:
+    +        await primary.simulate_crash()
+    +    else:
+    +        await primary.close()
+    +
+    +    with pytest.raises(asyncio.CancelledError):
+    +        await attaching
+    +    expected = ReplicaSinkState.SOURCE_LOST if crash else ReplicaSinkState.STOPPED
+    +    assert sink.status.state is expected
+    +    assert primary.debug_stats().replica_links == 0
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks ordered cleanup, bounded replica drain, shielded shared close, and distinct stopped/source-lost outcomes.
+
+**How it constructs the counterexample**
+
+It blocks snapshot publication or replica bootstrap, overlaps close callers, and compares graceful close with simulated crash.
+
+**Key test statement**
+
+```python
+assert trace.index("aof-closed") < trace.index("replicas-stopped")
+assert trace.index("replicas-stopped") < trace.index("executor-stopped")
+```
+
+**What a failure means**
+
+Resource owners are being torn down in an order that can strand work or allow use-after-close behavior.
+
+??? note "File diff: tests/reliability/test_restart.py"
+    ```diff
+    diff --git a/tests/reliability/test_restart.py b/tests/reliability/test_restart.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..31eddea5a8fd912ef3dce617e08f60c8caed2bfb
+    --- /dev/null
+    +++ b/tests/reliability/test_restart.py
+    @@ -0,0 +1,55 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest, MiniRedis
+    +from miniredis.config import MiniRedisConfig
+    +from miniredis.core.reply import Bytes, Ok
+    +from miniredis.persistence.aof import AofPolicy
+    +from miniredis.persistence.recovery import RecoveryError
+    +from miniredis.runtime import RuntimeState
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_runtime_recovers_snapshot_then_later_aof_commits(tmp_path):
+    +    config = MiniRedisConfig(
+    +        aof_path=tmp_path / "appendonly.mraof",
+    +        aof_policy=AofPolicy.ALWAYS,
+    +        snapshot_path=tmp_path / "dump.mrsnap",
+    +    )
+    +    first = MiniRedis.open(config)
+    +    await first.start()
+    +    client = first.direct_client()
+    +    assert await client.execute(CommandRequest(b"SET", (b"before", b"1"))) == Ok()
+    +    saved = await first.save_snapshot()
+    +    assert saved.checkpoint_seq == 1
+    +    assert await client.execute(CommandRequest(b"SET", (b"after", b"2"))) == Ok()
+    +    await first.close()
+    +
+    +    second = MiniRedis.open(config)
+    +    await second.start()
+    +    recovered = second.direct_client()
+    +    assert await recovered.execute(CommandRequest(b"GET", (b"before",))) == Bytes(b"1")
+    +    assert await recovered.execute(CommandRequest(b"GET", (b"after",))) == Bytes(b"2")
+    +    assert second.debug_commit_seq == 2
+    +    await second.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_corrupt_startup_never_accepts_clients_or_leaks_workers(
+    +    tmp_path,
+    +):
+    +    snapshot = tmp_path / "dump.mrsnap"
+    +    snapshot.write_bytes(b"corrupt")
+    +    runtime = MiniRedis.open(MiniRedisConfig(snapshot_path=snapshot))
+    +    prestart = runtime.direct_client()
+    +    rejected = await prestart.execute(CommandRequest(b"PING"))
+    +    assert rejected.code == "CLOSED"
+    +
+    +    with pytest.raises(RecoveryError, match="snapshot"):
+    +        await runtime.start()
+    +
+    +    assert runtime.state is RuntimeState.FAILED
+    +    stats = runtime.debug_stats()
+    +    assert stats.accepting_users is False
+    +    assert stats.owned_tasks == 0
+    +    assert stats.sessions == 0
+    +    await runtime.close()
+    ```
+
+**What this test locks**
+
+It locks recovery before user admission and failed-start cleanup without workers or sessions leaking.
+
+**How it constructs the counterexample**
+
+It restarts from snapshot plus later AOF, then separately starts from corrupt snapshot bytes.
+
+**Key test statement**
+
+```python
+assert runtime.state is RuntimeState.FAILED
+assert stats.accepting_users is False
+```
+
+**What a failure means**
+
+Clients can observe unrecovered state or startup failure leaves live ownership behind.
+
+??? note "File diff: tests/reliability/test_worker_failure.py"
+    ```diff
+    diff --git a/tests/reliability/test_worker_failure.py b/tests/reliability/test_worker_failure.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..fc0f8e4302d1080ef023913326836ed2850e5436
+    --- /dev/null
+    +++ b/tests/reliability/test_worker_failure.py
+    @@ -0,0 +1,93 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.config import MiniRedisConfig
+    +from miniredis.core.reply import Ok
+    +from miniredis.persistence.aof import (
+    +    AofPolicy,
+    +    PosixAofFileOps,
+    +)
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +class ManualAofSleep:
+    +    def __init__(self) -> None:
+    +        self.entered = asyncio.Event()
+    +        self.release = asyncio.Event()
+    +
+    +    async def __call__(self, _delay: float) -> None:
+    +        self.entered.set()
+    +        await self.release.wait()
+    +
+    +
+    +class FailingFsyncOps(PosixAofFileOps):
+    +    def __init__(self) -> None:
+    +        self.fail_fsync = False
+    +
+    +    def fsync(self, fd: int) -> None:
+    +        if self.fail_fsync:
+    +            raise OSError("fsync failed")
+    +        super().fsync(fd)
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_background_fsync_failure_terminalizes_pending_work(tmp_path):
+    +    sleep = ManualAofSleep()
+    +    ops = FailingFsyncOps()
+    +    runtime = await open_test_runtime(
+    +        config=MiniRedisConfig(
+    +            aof_path=tmp_path / "appendonly.mraof",
+    +            aof_policy=AofPolicy.EVERYSEC,
+    +        ),
+    +        aof_ops=ops,
+    +        aof_sleep=sleep,
+    +    )
+    +    await sleep.entered.wait()
+    +    client = runtime.direct_client()
+    +    assert await client.execute(CommandRequest(b"SET", (b"dirty", b"1"))) == Ok()
+    +    blocked = asyncio.create_task(
+    +        client.execute(CommandRequest(b"BLPOP", (b"q", b"0")))
+    +    )
+    +    await runtime.debug_wait_for_waiters(1)
+    +    ops.fail_fsync = True
+    +    sleep.release.set()
+    +    await runtime.debug_wait_for_failure()
+    +
+    +    reply = await blocked
+    +    assert reply.code == "ERR"
+    +    assert "runtime failed" in reply.message
+    +    stats = runtime.debug_stats()
+    +    assert stats.accepted_requests == 0
+    +    assert stats.waiters == 0
+    +    assert stats.pending_futures == 0
+    +    await runtime.close()
+    +    closed = runtime.debug_stats()
+    +    assert closed.owned_tasks == 0
+    +    assert closed.snapshot_jobs == 0
+    +    assert closed.replica_links == 0
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_unexpected_executor_death_uses_one_fallback_drain():
+    +    runtime = await open_test_runtime()
+    +    blocked = asyncio.create_task(
+    +        runtime.direct_client().execute(CommandRequest(b"BLPOP", (b"q", b"0")))
+    +    )
+    +    await runtime.debug_wait_for_waiters(1)
+    +
+    +    runtime.debug_fail_executor(RuntimeError("executor died"))
+    +    await runtime.debug_wait_for_failure()
+    +
+    +    reply = await blocked
+    +    assert reply.code == "ERR"
+    +    stats = runtime.debug_stats()
+    +    assert stats.accepted_requests == 0
+    +    assert stats.waiters == 0
+    +    assert stats.pending_futures == 0
+    +    await runtime.close()
+    +    closed = runtime.debug_stats()
+    +    assert closed.owned_tasks == 0
+    +    assert closed.snapshot_jobs == 0
+    +    assert closed.replica_links == 0
+    ```
+
+**What this test locks**
+
+It locks terminal settlement of accepted requests, waiters, futures, and owned tasks when AOF fsync or executor work dies.
+
+**How it constructs the counterexample**
+
+It injects background fsync failure and unexpected executor death while a blocking request is pending.
+
+**Key test statement**
+
+```python
+assert stats.accepted_requests == 0
+assert stats.pending_futures == 0
+```
+
+**What a failure means**
+
+A worker can die without transferring or terminating the ownership it held.
+
+### Basic concepts
+
+Promotion is a role transition guarded by the replica source generation. A barrier means all earlier accepted executor messages finish before the promotion message. Graceful close drains within configured bounds; crash close preserves only work already in flight. Terminal settlement means every accepted request, waiter, worker, file, snapshot job, and link ends in a visible outcome.
+
+### Why this mechanism is necessary
+
+Changing `read_only = False` is not promotion: it lacks an order relative to old-source traffic. Likewise, setting runtime state to closed is not shutdown: resource owners may still be active. One serialized barrier handles the role boundary, and one supervised lifecycle makes recovery and cleanup ordering auditable.
+
+### Runtime mental model
+
+Promotion first detaches a live source, stops the sink worker, and posts `PromoteReplica` behind accepted apply messages. The executor verifies the active generation, clears it, and reopens writes. Startup keeps user admission closed through recovery and worker initialization. Shutdown stops new users, settles requests, finishes snapshot and AOF ownership, drains or loses replica links according to close mode, then releases the executor barrier.
+
+### Mechanism blocks
+
+#### Generation-safe promotion barrier
+
+Order already-admitted replica applies before promotion, retire the source generation, and reopen writes only after the barrier.
+
+??? note "File diff: src/miniredis/replication/sink.py"
+    ```diff
+    diff --git a/src/miniredis/replication/sink.py b/src/miniredis/replication/sink.py
+    index 48a1ac101fd4d303da97d89969fc09c755c5ed09..184e3509d4d81289aab17372ed283f4ab62c68eb 100644
+    --- a/src/miniredis/replication/sink.py
+    +++ b/src/miniredis/replication/sink.py
+    @@ -9,6 +9,7 @@ from typing import TYPE_CHECKING
+     from miniredis.core.commit import CommitBatch, SnapshotImage
+
+     if TYPE_CHECKING:
+    +    from miniredis.core.executor import PromotionResult
+         from miniredis.runtime import MiniRedis
+
+
+    @@ -122,12 +123,10 @@ class ReplicaSink:
+                     await self._install_gate.wait()
+                 if self._state is not ReplicaSinkState.BOOTSTRAPPING:
+                     return self.status
+    -            installed = (
+    -                await self._replica.executor.install_replica_snapshot(
+    -                    self,
+    -                    attachment.generation,
+    -                    attachment.image,
+    -                )
+    +            installed = await self._replica.executor.install_replica_snapshot(
+    +                self,
+    +                attachment.generation,
+    +                attachment.image,
+                 )
+                 if not installed:
+                     return self.status
+    @@ -188,9 +187,7 @@ class ReplicaSink:
+                         self._state = ReplicaSinkState.NEEDS_RESYNC
+                         self._signal_status_change()
+                         if self._primary is not None:
+    -                        await self._primary.executor.detach_replica(
+    -                            self._generation
+    -                        )
+    +                        await self._primary.executor.detach_replica(self._generation)
+                         return
+                     self._applied_seq = batch.seq
+                     self._signal_status_change()
+    @@ -201,9 +198,7 @@ class ReplicaSink:
+                 self._queue.clear()
+                 self._signal_status_change()
+                 if self._primary is not None and self._generation is not None:
+    -                await self._primary.executor.detach_replica(
+    -                    self._generation
+    -                )
+    +                await self._primary.executor.detach_replica(self._generation)
+             finally:
+                 self._signal_status_change()
+
+    @@ -218,19 +213,119 @@ class ReplicaSink:
+                 if self._applied_seq >= seq:
+                     return
+                 if self._state in terminal:
+    -                raise RuntimeError(
+    -                    f"replica stopped at seq {self._applied_seq}"
+    -                )
+    +                raise RuntimeError(f"replica stopped at seq {self._applied_seq}")
+                 self._status_changed.clear()
+                 if self._applied_seq >= seq:
+                     return
+                 if self._state in terminal:
+    -                raise RuntimeError(
+    -                    f"replica stopped at seq {self._applied_seq}"
+    -                )
+    +                raise RuntimeError(f"replica stopped at seq {self._applied_seq}")
+                 await self._status_changed.wait()
+
+         async def wait_until_stopped(self) -> None:
+             task = self._task
+             if task is not None:
+                 await asyncio.shield(task)
+    +
+    +    async def promote(self, *, source_alive: bool) -> PromotionResult:
+    +        if self._generation is None:
+    +            raise RuntimeError("replica sink has no generation")
+    +        if self._state not in {
+    +            ReplicaSinkState.BOOTSTRAPPING,
+    +            ReplicaSinkState.STREAMING,
+    +            ReplicaSinkState.NEEDS_RESYNC,
+    +            ReplicaSinkState.SOURCE_LOST,
+    +        }:
+    +            raise RuntimeError(f"cannot promote sink in state {self._state}")
+    +        self._state = ReplicaSinkState.PROMOTING
+    +        self._signal_status_change()
+    +
+    +        if source_alive:
+    +            if self._primary is None:
+    +                raise RuntimeError("live source is unavailable")
+    +            primary = self._primary
+    +            await primary.executor.detach_replica(self._generation)
+    +            primary._release_replica_sink(self)
+    +
+    +        task = self._task
+    +        if task is not None and not task.done():
+    +            task.cancel()
+    +            try:
+    +                await task
+    +            except asyncio.CancelledError:
+    +                pass
+    +        self._queue.clear()
+    +        result = await self._replica.executor.promote_replica(self._generation)
+    +        if not result.writable:
+    +            self._state = ReplicaSinkState.FAILED
+    +            self._signal_status_change()
+    +            raise RuntimeError("replica generation is no longer promotable")
+    +        self._applied_seq = result.applied_seq
+    +        self._primary_seq = max(self._primary_seq, result.applied_seq)
+    +        self._state = ReplicaSinkState.PROMOTED
+    +        self._primary = None
+    +        self._signal_status_change()
+    +        return result
+    +
+    +    async def source_crashed(self) -> None:
+    +        self._state = ReplicaSinkState.SOURCE_LOST
+    +        self._signal_status_change()
+    +        attach_task = self._attach_task
+    +        current = asyncio.current_task()
+    +        if (
+    +            attach_task is not None
+    +            and attach_task is not current
+    +            and not attach_task.done()
+    +        ):
+    +            attach_task.cancel()
+    +            try:
+    +                await attach_task
+    +            except asyncio.CancelledError:
+    +                pass
+    +        task = self._task
+    +        if task is not None and not task.done():
+    +            task.cancel()
+    +            try:
+    +                await task
+    +            except asyncio.CancelledError:
+    +                pass
+    +        self._queue.clear()
+    +        self._primary = None
+    +        self._signal_status_change()
+    +
+    +    async def drain_and_stop(self, grace_ms: int) -> None:
+    +        attach_task = self._attach_task
+    +        current = asyncio.current_task()
+    +        if (
+    +            attach_task is not None
+    +            and attach_task is not current
+    +            and not attach_task.done()
+    +        ):
+    +            attach_task.cancel()
+    +            try:
+    +                await attach_task
+    +            except asyncio.CancelledError:
+    +                pass
+    +
+    +        task = self._task
+    +        if task is not None and not task.done() and self._queue:
+    +            self._apply_allowed.set()
+    +            try:
+    +                async with asyncio.timeout(grace_ms / 1000):
+    +                    while self._queue and not task.done():
+    +                        self._status_changed.clear()
+    +                        if not self._queue or task.done():
+    +                            break
+    +                        await self._status_changed.wait()
+    +            except TimeoutError:
+    +                pass
+    +
+    +        if task is not None and not task.done():
+    +            task.cancel()
+    +            try:
+    +                await task
+    +            except asyncio.CancelledError:
+    +                pass
+    +        self._queue.clear()
+    +        self._state = ReplicaSinkState.STOPPED
+    +        self._primary = None
+    +        self._signal_status_change()
+    ```
+
+**What it is and why it appears**
+
+The sink gains promotion, source-loss, bounded drain, and stopped-state transitions.
+
+**Runtime role**
+
+It detaches from a live source, cancels streaming ownership, clears queued old history, and asks the replica executor to cross the role barrier.
+
+**Key code**
+
+```python
+result = await self._replica.executor.promote_replica(self._generation)
+if not result.writable:
+    self._state = ReplicaSinkState.FAILED
+    self._signal_status_change()
+    raise RuntimeError("replica generation is no longer promotable")
+```
+
+**Statement understanding**
+
+The sink reports promoted only after the executor has retired that source generation and made the local database writable.
+
+??? note "File diff: src/miniredis/core/executor.py"
+    ```diff
+    diff --git a/src/miniredis/core/executor.py b/src/miniredis/core/executor.py
+    index 17421ea1ed3c88f056bebb8ac1573db2211f8b10..24e5c4edd784e2020ec4dac137e244bae0b0c97a 100644
+    --- a/src/miniredis/core/executor.py
+    +++ b/src/miniredis/core/executor.py
+    @@ -134,6 +134,18 @@ class ApplyReplicaBatch:
+         future: asyncio.Future[bool]
+
+
+    +@dataclass(frozen=True, slots=True)
+    +class PromotionResult:
+    +    applied_seq: int
+    +    writable: bool
+    +
+    +
+    +@dataclass(slots=True)
+    +class PromoteReplica:
+    +    generation: int
+    +    future: asyncio.Future[PromotionResult]
+    +
+    +
+     @dataclass(frozen=True, slots=True)
+     class ExecutionPlan:
+         reply: Reply | None
+    @@ -163,6 +175,10 @@ class DurabilityFailure(RuntimeError):
+         pass
+
+
+    +class _InjectedExecutorFailure(RuntimeError):
+    +    pass
+    +
+    +
+     class Planner(Protocol):
+         def plan(
+             self, command: Command, database: Database, now_ms: int
+    @@ -200,6 +216,9 @@ class CommandExecutor:
+             on_terminal_failure: Callable[[BaseException], None] | None = None,
+             on_fatal: Callable[[str], None] | None = None,
+             replica_apply_failure: BaseException | None = None,
+    +        replica_apply_entered: asyncio.Event | None = None,
+    +        replica_apply_release: asyncio.Event | None = None,
+    +        allow_failure_injection: bool = False,
+         ) -> None:
+             self.database = database
+             self.planner = planner
+    @@ -237,12 +256,33 @@ class CommandExecutor:
+             self._active_source_generation: int | None = None
+             self._replica_read_only = False
+             self._replica_apply_failure = replica_apply_failure
+    +        if (replica_apply_entered is None) != (replica_apply_release is None):
+    +            raise ValueError(
+    +                "replica apply gate requires both entered and release events"
+    +            )
+    +        self._replica_apply_entered = replica_apply_entered
+    +        self._replica_apply_release = replica_apply_release
+             self._handling_message = False
+             self._failure: BaseException | None = None
+             self._terminal_cleanup_complete = False
+    -        self._stop_after_current_message = False
+    +        self._shutdown_barrier_held = False
+    +        self._shutdown_release = asyncio.Event()
+             self._stopping = False
+             self._started = False
+    +        self._allow_failure_injection = allow_failure_injection
+    +
+    +    def install_database_before_start(self, database: Database) -> None:
+    +        if self._started:
+    +            raise RuntimeError("database can only be installed before start")
+    +        self.database = database
+    +
+    +    def set_commit_barrier_before_start(
+    +        self,
+    +        commit_barrier: CommitBarrier,
+    +    ) -> None:
+    +        if self._started:
+    +            raise RuntimeError("commit barrier can only be installed before start")
+    +        self.commit_barrier = commit_barrier
+
+         async def start(self) -> None:
+             if self._started:
+    @@ -348,7 +388,8 @@ class CommandExecutor:
+                         if isinstance(message, _StopExecutor):
+                             return
+                         await self._dispatch(message)
+    -                    if self._stop_after_current_message:
+    +                    if self._shutdown_barrier_held:
+    +                        await self._shutdown_release.wait()
+                             return
+                     finally:
+                         self._handling_message = False
+    @@ -380,10 +421,18 @@ class CommandExecutor:
+                 self._close_session(message)
+             elif isinstance(message, BeginShutdown):
+                 self._begin_shutdown(message)
+    +        elif isinstance(message, _InjectedExecutorFailure):
+    +            raise message
+             elif isinstance(message, SnapshotBarrier):
+    -            image = self.database.snapshot_image(self.clock.now_ms())
+    -            if not message.future.done():
+    -                message.future.set_result(image)
+    +            try:
+    +                image = self.database.snapshot_image(self.clock.now_ms())
+    +            except BaseException as exc:
+    +                if not message.future.done():
+    +                    message.future.set_exception(exc)
+    +                self._on_fatal(str(exc) or type(exc).__name__)
+    +            else:
+    +                if not message.future.done():
+    +                    message.future.set_result(image)
+             elif isinstance(message, AttachReplica):
+                 generation = self._next_replica_generation
+                 self._next_replica_generation += 1
+    @@ -412,6 +461,10 @@ class CommandExecutor:
+                     message.future.set_result(False)
+                     return
+                 try:
+    +                if self._replica_apply_entered is not None:
+    +                    assert self._replica_apply_release is not None
+    +                    self._replica_apply_entered.set()
+    +                    await self._replica_apply_release.wait()
+                     if self._replica_apply_failure is not None:
+                         error = self._replica_apply_failure
+                         self._replica_apply_failure = None
+    @@ -421,6 +474,15 @@ class CommandExecutor:
+                     message.future.set_exception(exc)
+                 else:
+                     message.future.set_result(True)
+    +        elif isinstance(message, PromoteReplica):
+    +            if message.generation != self._active_source_generation:
+    +                message.future.set_result(
+    +                    PromotionResult(self.database.commit_seq, False)
+    +                )
+    +                return
+    +            self._active_source_generation = None
+    +            self._replica_read_only = False
+    +            message.future.set_result(PromotionResult(self.database.commit_seq, True))
+             else:
+                 raise AssertionError(f"unknown executor message: {message!r}")
+
+    @@ -475,13 +537,14 @@ class CommandExecutor:
+                 if closed is not None:
+                     self._finish_request(closed.token, event.outcome)
+             self.pubsub.clear()
+    +        self._replica_sinks.clear()
+             for token in tuple(self._requests):
+                 self._finish_request(token, event.outcome)
+             for endpoint in self._endpoints.values():
+                 endpoint.offer_best_effort(ServerClosed("runtime closed"))
+             if not event.completion.done():
+                 event.completion.set_result(None)
+    -        self._stop_after_current_message = True
+    +        self._shutdown_barrier_held = True
+
+         def _complete_terminal_failure(self, failure: BaseException) -> None:
+             if self._terminal_cleanup_complete:
+    @@ -751,12 +814,18 @@ class CommandExecutor:
+             batch: CommitBatch,
+         ) -> bool:
+             future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    -        if not self.post_control(
+    -            ApplyReplicaBatch(generation, batch, future)
+    -        ):
+    +        if not self.post_control(ApplyReplicaBatch(generation, batch, future)):
+                 return False
+             return await asyncio.shield(future)
+
+    +    async def promote_replica(self, generation: int) -> PromotionResult:
+    +        future: asyncio.Future[PromotionResult] = (
+    +            asyncio.get_running_loop().create_future()
+    +        )
+    +        if not self.post_control(PromoteReplica(generation, future)):
+    +            raise RuntimeError("executor control admission is closed")
+    +        return await asyncio.shield(future)
+    +
+         async def _active_expire_once(self, now_ms: int) -> int:
+             keys = sorted(
+                 key
+    @@ -817,6 +886,17 @@ class CommandExecutor:
+                 self.mailbox.close_control_admission()
+                 self._on_debug_change()
+
+    +    async def stop_after_shutdown_barrier(self) -> None:
+    +        self._stopping = True
+    +        self._shutdown_release.set()
+    +        await self.join()
+    +
+    +    def debug_fail(self, failure: BaseException) -> None:
+    +        if not self._allow_failure_injection:
+    +            raise RuntimeError("executor failure injection is test-only")
+    +        if not self.post_control(_InjectedExecutorFailure(str(failure))):
+    +            raise RuntimeError("executor control admission is closed")
+    +
+         def debug_pause(self) -> None:
+             self._run_gate.clear()
+
+    @@ -888,9 +968,7 @@ class CommandExecutor:
+
+         def fallback_terminalize(self, outcome: RequestOutcome) -> None:
+             if not self.worker_done:
+    -            raise RuntimeError(
+    -                "fallback terminalization requires a stopped worker"
+    -            )
+    +            raise RuntimeError("fallback terminalization requires a stopped worker")
+             self.mailbox.close_control_admission()
+             for waiter in self.waiters.active():
+                 closed = self.waiters.transition(
+    ```
+
+**What it is and why it appears**
+
+The executor gains the promotion message, a shutdown barrier, and deterministic failure settlement hooks.
+
+**Runtime role**
+
+Mailbox order places promotion after earlier applies; generation equality authorizes the role change; the held shutdown barrier leaves the worker available until outer resources close.
+
+**Key code**
+
+```python
+if message.generation != self._active_source_generation:
+    message.future.set_result(False)
+    return
+```
+
+**Statement understanding**
+
+Generation is a fencing token: once retired, delayed work from that source cannot mutate the promoted primary.
+
+#### Reopenable user admission
+
+Keep control admission alive while a replica is read-only, then reopen user admission when that runtime becomes the new primary.
+
+??? note "File diff: src/miniredis/core/mailbox.py"
+    ```diff
+    diff --git a/src/miniredis/core/mailbox.py b/src/miniredis/core/mailbox.py
+    index e0d20c2a3574215b82178beceed920abbb47c10c..92a92de7719200fece94570e0e9a4be9e169a33e 100644
+    --- a/src/miniredis/core/mailbox.py
+    +++ b/src/miniredis/core/mailbox.py
+    @@ -86,6 +86,12 @@ class EventLoopMailbox[T]:
+             self._user_open = False
+             self._changed.set()
+
+    +    def open_user_admission(self) -> None:
+    +        if not self._control_open:
+    +            raise RuntimeError("cannot reopen user admission after control close")
+    +        self._user_open = True
+    +        self._changed.set()
+    +
+         def close_control_admission(self) -> None:
+             self._control_open = False
+             self._changed.set()
+    ```
+
+**What it is and why it appears**
+
+The mailbox can reopen user admission while control admission remains valid.
+
+**Runtime role**
+
+Startup and replica roles can keep user requests closed without destroying the control plane needed for recovery or promotion.
+
+**Key code**
+
+```python
+if not self._control_open:
+    raise RuntimeError("cannot reopen user admission after control close")
+```
+
+**Statement understanding**
+
+User admission is reversible during lifecycle transitions; closing the control plane is terminal.
+
+#### AOF terminal settlement
+
+Distinguish graceful close from crash close and settle in-flight sync work before the file descriptor disappears.
+
+??? note "File diff: src/miniredis/persistence/aof.py"
+    ```diff
+    diff --git a/src/miniredis/persistence/aof.py b/src/miniredis/persistence/aof.py
+    index 19d004cb72aa9dfb47c0577cf3097f38d14e795d..a14ead1a5a0d3becde9249d4de5dd67830caa2b6 100644
+    --- a/src/miniredis/persistence/aof.py
+    +++ b/src/miniredis/persistence/aof.py
+    @@ -364,3 +364,22 @@ class AofWriter:
+                     self._record_failure(exc)
+             fd, self._fd = self._fd, None
+             await asyncio.to_thread(self._ops.close, fd)
+    +
+    +    async def crash_close(self) -> None:
+    +        if self._fd is None:
+    +            return
+    +        self._accepting = False
+    +        if self._worker is not None and not self._worker.done():
+    +            self._queue.put_nowait(_STOP)
+    +            await asyncio.shield(self._worker)
+    +        if self._sync_task is not None:
+    +            if self._sync_inflight:
+    +                await asyncio.shield(self._sync_task)
+    +            else:
+    +                self._sync_task.cancel()
+    +                try:
+    +                    await self._sync_task
+    +                except asyncio.CancelledError:
+    +                    pass
+    +        fd, self._fd = self._fd, None
+    +        await asyncio.to_thread(self._ops.close, fd)
+    ```
+
+**What it is and why it appears**
+
+The AOF writer gains crash-specific closure semantics.
+
+**Runtime role**
+
+It stops accepting appends, joins its worker, shields an already-running sync, cancels an idle timer, and only then closes the descriptor.
+
+**Key code**
+
+```python
+if self._sync_inflight:
+    await asyncio.shield(self._sync_task)
+```
+
+**Statement understanding**
+
+Crash simulation does not invent disk completion, but it must not close a descriptor underneath physical I/O already executing.
+
+#### Recovery-first supervised lifecycle
+
+Recover before admission, coordinate snapshot, AOF, replica, and executor shutdown, and fail all pending ownership when a worker dies.
+
+??? note "File diff: src/miniredis/runtime.py"
+    ```diff
+    diff --git a/src/miniredis/runtime.py b/src/miniredis/runtime.py
+    index 8e6d41b18a22e563c92475eb3a5ebe1f4a059ba7..29b1d432b8fba6a6a7e6b5c7e50e702da06f8df9 100644
+    --- a/src/miniredis/runtime.py
+    +++ b/src/miniredis/runtime.py
+    @@ -2,7 +2,7 @@ from __future__ import annotations
+
+     import asyncio
+     import itertools
+    -from collections.abc import Callable
+    +from collections.abc import Awaitable, Callable
+     from dataclasses import dataclass
+     from enum import Enum
+     from typing import Any, Self
+    @@ -39,7 +39,8 @@ from miniredis.core.outbound import (
+     )
+     from miniredis.core.planner import CommandPlanner
+     from miniredis.core.reply import Failure
+    -from miniredis.persistence.aof import AofWriter
+    +from miniredis.persistence.aof import AofFileOps, AofWriter
+    +from miniredis.persistence.recovery import recover_database
+     from miniredis.persistence.snapshot import (
+         SnapshotFailed,
+         SnapshotFileOps,
+    @@ -67,6 +68,8 @@ class RuntimeStats:
+         timer_handles: int
+         owned_tasks: int
+         replica_links: int
+    +    accepting_users: bool
+    +    snapshot_jobs: int
+
+
+     @dataclass(slots=True)
+    @@ -74,6 +77,11 @@ class _RuntimeTestHooks:
+         aof_appender: CommitBarrier | None = None
+         snapshot_ops: SnapshotFileOps | None = None
+         replica_apply_failure: BaseException | None = None
+    +    replica_apply_entered: asyncio.Event | None = None
+    +    replica_apply_release: asyncio.Event | None = None
+    +    aof_ops: AofFileOps | None = None
+    +    aof_sleep: Callable[[float], Awaitable[None]] | None = None
+    +    lifecycle_trace: list[str] | None = None
+
+
+     def _direct_transport_close(_reason: str) -> None:
+    @@ -122,15 +130,25 @@ class MiniRedis:
+                     if self._test_hooks is None
+                     else self._test_hooks.replica_apply_failure
+                 ),
+    +            replica_apply_entered=(
+    +                None
+    +                if self._test_hooks is None
+    +                else self._test_hooks.replica_apply_entered
+    +            ),
+    +            replica_apply_release=(
+    +                None
+    +                if self._test_hooks is None
+    +                else self._test_hooks.replica_apply_release
+    +            ),
+    +            allow_failure_injection=self._test_hooks is not None,
+             )
+    +        self.executor.mailbox.close_user_admission()
+             self._snapshot_manager = (
+                 SnapshotManager(
+                     config.snapshot_path,
+                     self.executor.capture_snapshot,
+                     ops=(
+    -                    None
+    -                    if self._test_hooks is None
+    -                    else self._test_hooks.snapshot_ops
+    +                    None if self._test_hooks is None else self._test_hooks.snapshot_ops
+                     ),
+                 )
+                 if config.snapshot_path is not None
+    @@ -205,29 +223,96 @@ class MiniRedis:
+                 raise RuntimeError("runtime is closed")
+             if self._start_task is None:
+                 self._start_task = asyncio.create_task(
+    -                self._start_once(), name="miniredis:runtime-start"
+    +                self._start_owned(), name="miniredis:runtime-start"
+                 )
+             await asyncio.shield(self._start_task)
+
+    -    async def _start_once(self) -> None:
+    -        await self.executor.start()
+    -        if self.state is not RuntimeState.STARTING:
+    -            return
+    -        worker = self.executor.worker_task
+    -        if worker is None:
+    -            raise RuntimeError("executor did not create its worker")
+    -        self._track_owned_task(worker)
+    -        worker.add_done_callback(self._executor_stopped)
+    -        producer = ActiveExpireProducer(
+    -            self.clock,
+    -            self.scheduler,
+    -            self.config.active_expire_interval_ms,
+    -            self.executor.post_control,
+    -            lambda now_ms: ActiveExpireTick(now_ms, None),
+    -        )
+    -        self._control_producers.add(producer)
+    -        producer.start()
+    -        self._set_state(RuntimeState.RUNNING)
+    +    async def _start_owned(self) -> None:
+    +        async with self._lifecycle_lock:
+    +            if self.state is not RuntimeState.STARTING:
+    +                return
+    +            try:
+    +                recovered = await asyncio.to_thread(
+    +                    recover_database,
+    +                    snapshot_path=self.config.snapshot_path,
+    +                    aof_path=self.config.aof_path,
+    +                    now_ms=self.clock.now_ms(),
+    +                    repair_truncated_tail=self.config.aof_repair_truncated_tail,
+    +                )
+    +                self.database = recovered
+    +                self.executor.install_database_before_start(recovered)
+    +                if self.config.aof_path is not None:
+    +                    hooks = self._test_hooks
+    +                    self._aof_writer = AofWriter(
+    +                        self.config.aof_path,
+    +                        self.config.aof_policy,
+    +                        fsync_interval_seconds=(self.config.aof_fsync_interval_seconds),
+    +                        ops=None if hooks is None else hooks.aof_ops,
+    +                        sleep=(
+    +                            asyncio.sleep
+    +                            if hooks is None or hooks.aof_sleep is None
+    +                            else hooks.aof_sleep
+    +                        ),
+    +                        on_failure=self._aof_worker_failed,
+    +                    )
+    +                    await self._aof_writer.start()
+    +                    self.commit_barrier = self._aof_writer
+    +                    self.executor.set_commit_barrier_before_start(self._aof_writer)
+    +                await self.executor.start()
+    +                if self.state is not RuntimeState.STARTING:
+    +                    return
+    +                worker = self.executor.worker_task
+    +                if worker is None:
+    +                    raise RuntimeError("executor did not create its worker")
+    +                self._track_owned_task(worker)
+    +                worker.add_done_callback(self._executor_stopped)
+    +                producer = ActiveExpireProducer(
+    +                    self.clock,
+    +                    self.scheduler,
+    +                    self.config.active_expire_interval_ms,
+    +                    self.executor.post_control,
+    +                    lambda now_ms: ActiveExpireTick(now_ms, None),
+    +                )
+    +                self._control_producers.add(producer)
+    +                producer.start()
+    +                self.executor.mailbox.open_user_admission()
+    +                self._set_state(RuntimeState.RUNNING)
+    +            except BaseException as exc:
+    +                self._failure_reason = str(exc) or type(exc).__name__
+    +                self._set_state(RuntimeState.FAILED)
+    +                self.executor.mailbox.close_user_admission()
+    +                await self._cleanup_failed_start()
+    +                raise
+    +
+    +    async def _cleanup_failed_start(self) -> None:
+    +        outcome = RuntimeFailed(self._failure_reason or "startup failed")
+    +        if self.executor.worker_done:
+    +            self.executor.fallback_terminalize(outcome)
+    +        else:
+    +            completion = asyncio.get_running_loop().create_future()
+    +            if self.executor.post_control(BeginShutdown(outcome, completion)):
+    +                worker = self.executor.worker_task
+    +                assert worker is not None
+    +                await asyncio.wait(
+    +                    (completion, worker),
+    +                    return_when=asyncio.FIRST_COMPLETED,
+    +                )
+    +                if completion.done():
+    +                    await self.executor.stop_after_shutdown_barrier()
+    +                else:
+    +                    self.executor.fallback_terminalize(outcome)
+    +            else:
+    +                await self.executor.join()
+    +                self.executor.fallback_terminalize(outcome)
+    +        self.executor.release_endpoints()
+    +        if self._snapshot_manager is not None:
+    +            await self._snapshot_manager.close()
+    +        if self._aof_writer is not None:
+    +            await self._aof_writer.close()
+    +        self._control_producers.clear()
+    +
+    +    def _aof_worker_failed(self, failure: BaseException) -> None:
+    +        self._transition_failed(str(failure) or type(failure).__name__)
+
+         def parse(self, request: CommandRequest) -> Command | Failure:
+             try:
+    @@ -273,7 +358,6 @@ class MiniRedis:
+                 self._set_state(RuntimeState.CLOSED)
+
+         async def _shutdown_once(self, crash: bool = False) -> None:
+    -        del crash
+             if self._shutdown_complete:
+                 return
+             failure = self._failure_reason
+    @@ -310,12 +394,14 @@ class MiniRedis:
+             endpoints = self.executor.endpoints()
+             for endpoint in endpoints:
+                 endpoint.outbox.begin_close("runtime closed")
+    -        drainers = [endpoint.outbox.wait_empty() for endpoint in endpoints]
+    +        drainers = (
+    +            [endpoint.outbox.wait_empty() for endpoint in endpoints]
+    +            if not crash
+    +            else []
+    +        )
+             if drainers:
+                 try:
+    -                async with asyncio.timeout(
+    -                    self.config.outbox_drain_grace_ms / 1000
+    -                ):
+    +                async with asyncio.timeout(self.config.outbox_drain_grace_ms / 1000):
+                         await asyncio.gather(*drainers)
+                 except TimeoutError:
+                     pass
+    @@ -323,7 +409,32 @@ class MiniRedis:
+                 endpoint.outbox.abort("runtime closed")
+                 endpoint.request_transport_close("runtime closed")
+             self.executor.release_endpoints()
+    -        await self.executor.join()
+    +
+    +        if self._snapshot_manager is not None:
+    +            await self._snapshot_manager.close()
+    +        self._trace_lifecycle("snapshot-job-done")
+    +
+    +        if self._aof_writer is not None:
+    +            if crash:
+    +                await asyncio.shield(self._aof_writer.crash_close())
+    +            else:
+    +                await asyncio.shield(self._aof_writer.close())
+    +        self._trace_lifecycle("aof-closed")
+    +
+    +        for sink in tuple(self._owned_replica_sinks):
+    +            if crash:
+    +                await sink.source_crashed()
+    +            else:
+    +                await sink.drain_and_stop(self.config.replica_drain_grace_ms)
+    +        self._owned_replica_sinks.clear()
+    +        self._trace_lifecycle("replicas-stopped")
+    +
+    +        if self.executor.worker_done:
+    +            await self.executor.join()
+    +        else:
+    +            await self.executor.stop_after_shutdown_barrier()
+    +        self._trace_lifecycle("executor-stopped")
+    +
+             self._control_producers.clear()
+             current = asyncio.current_task()
+             for owned in tuple(self._owned_tasks):
+    @@ -331,9 +442,7 @@ class MiniRedis:
+                     self._owned_tasks.discard(owned)
+             self._shutdown_complete = True
+             self._set_state(
+    -            RuntimeState.FAILED
+    -            if preserve_failed_state
+    -            else RuntimeState.CLOSED
+    +            RuntimeState.FAILED if preserve_failed_state else RuntimeState.CLOSED
+             )
+
+         def _on_executor_terminal_failure(self, failure: BaseException) -> None:
+    @@ -369,9 +478,12 @@ class MiniRedis:
+         def _transition_failed(self, reason: str) -> None:
+             if self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}:
+                 return
+    +        was_starting = self.state is RuntimeState.STARTING
+             self._failure_reason = reason
+             self._set_state(RuntimeState.FAILED)
+             self.executor.mailbox.close_user_admission()
+    +        if was_starting:
+    +            return
+             if self._shutdown_task is None:
+                 self._shutdown_task = asyncio.create_task(
+                     self._shutdown_once(),
+    @@ -379,6 +491,13 @@ class MiniRedis:
+                 )
+                 self._track_owned_task(self._shutdown_task)
+
+    +    def _trace_lifecycle(self, event: str) -> None:
+    +        if (
+    +            self._test_hooks is not None
+    +            and self._test_hooks.lifecycle_trace is not None
+    +        ):
+    +            self._test_hooks.lifecycle_trace.append(event)
+    +
+         def _set_state(self, state: RuntimeState) -> None:
+             self.state = state
+             self._debug_notify()
+    @@ -401,9 +520,7 @@ class MiniRedis:
+             try:
+                 return await asyncio.shield(task)
+             except BaseException:
+    -            if task.done() and (
+    -                task.cancelled() or task.exception() is not None
+    -            ):
+    +            if task.done() and (task.cancelled() or task.exception() is not None):
+                     self._owned_replica_sinks.discard(sink)
+                 raise
+
+    @@ -415,6 +532,20 @@ class MiniRedis:
+             if task.cancelled() or task.exception() is not None:
+                 self._owned_replica_sinks.discard(sink)
+
+    +    def _release_replica_sink(self, sink: ReplicaSink) -> None:
+    +        self._owned_replica_sinks.discard(sink)
+    +
+    +    async def simulate_crash(self) -> None:
+    +        async with self._lifecycle_lock:
+    +            if self._shutdown_task is None:
+    +                self._shutdown_task = asyncio.create_task(
+    +                    self._shutdown_once(crash=True),
+    +                    name="miniredis:simulated-crash",
+    +                )
+    +                self._track_owned_task(self._shutdown_task)
+    +            task = self._shutdown_task
+    +        await asyncio.shield(task)
+    +
+         async def __aenter__(self) -> Self:
+             await self.start()
+             return self
+    @@ -437,14 +568,14 @@ class MiniRedis:
+         @property
+         def accepting_commands(self) -> bool:
+             return (
+    -            self.state is RuntimeState.RUNNING
+    -            and self.executor.mailbox.accepting_users
+    +            self.state is RuntimeState.RUNNING and self.executor.mailbox.accepting_users
+             )
+
+         @property
+         def normal_shutdown_started(self) -> bool:
+             return (
+                 self._failure_reason is None
+    +            and self.executor.debug_failure is None
+                 and self.state in {RuntimeState.DRAINING, RuntimeState.CLOSED}
+             )
+
+    @@ -464,7 +595,7 @@ class MiniRedis:
+             return self.executor.debug_applied_batches()
+
+         def debug_logical_items(self) -> tuple[tuple[bytes, StoredEntry], ...]:
+    -        return self.database.logical_items()
+    +        return self.database.export_stored_entries(self.clock.now_ms())
+
+         def debug_pause_executor(self) -> None:
+             self.executor.debug_pause()
+    @@ -493,6 +624,11 @@ class MiniRedis:
+                     if task is not asyncio.current_task()
+                 ),
+                 replica_links=self.executor.replica_link_count,
+    +            accepting_users=self.executor.mailbox.accepting_users,
+    +            snapshot_jobs=int(
+    +                self._snapshot_manager is not None
+    +                and self._snapshot_manager.active_job is not None
+    +            ),
+             )
+
+         def _debug_notify(self) -> None:
+    @@ -520,6 +656,17 @@ class MiniRedis:
+         async def debug_wait_for_state(self, value: str) -> None:
+             await self._debug_wait(lambda: self.state.value == value)
+
+    +    async def debug_wait_for_failure(self) -> None:
+    +        await self._debug_wait(lambda: self._failure_reason is not None)
+    +
+    +    def debug_fail_executor(self, failure: BaseException) -> None:
+    +        self.executor.debug_fail(failure)
+    +
+    +    def debug_lifecycle_trace(self) -> tuple[str, ...]:
+    +        if self._test_hooks is None or self._test_hooks.lifecycle_trace is None:
+    +            return ()
+    +        return tuple(self._test_hooks.lifecycle_trace)
+    +
+         def debug_register_control_producer(self, producer: object) -> None:
+             if self.state is not RuntimeState.RUNNING:
+                 raise RuntimeError("control producers register only while running")
+    ```
+
+**What it is and why it appears**
+
+The runtime becomes the supervisor for recovery, durability workers, snapshots, replica links, and executor shutdown.
+
+**Runtime role**
+
+It recovers before opening admission, turns worker failure into runtime failure, and closes owners in a recorded dependency order.
+
+**Key code**
+
+```python
+if self._snapshot_manager is not None:
+    await self._snapshot_manager.close()
+self._trace_lifecycle("snapshot-job-done")
+
+if self._aof_writer is not None:
+    if crash:
+        await asyncio.shield(self._aof_writer.crash_close())
+    else:
+        await asyncio.shield(self._aof_writer.close())
+self._trace_lifecycle("aof-closed")
+
+for sink in tuple(self._owned_replica_sinks):
+    if crash:
+        await sink.source_crashed()
+    else:
+        await sink.drain_and_stop(self.config.replica_drain_grace_ms)
+```
+
+**Statement understanding**
+
+Shutdown order follows ownership dependencies: producers and durable jobs settle before the state executor they still call disappears.
+
+### Verification evidence
+
+Run the seven focused test modules from `tests.txt`, then cumulatively build Stages 1–18 and compare the complete owned source tree with commit `0fbaeee`.
+
+### Durable takeaways
+
+- Promotion needs an ordered barrier and a fencing generation.
+- Asynchronous replication deliberately permits acknowledged-write loss while lagging.
+- Recovery must finish before user admission opens.
+- Shutdown correctness is terminal settlement, not merely task cancellation.
+
+### Explain it in your own words
+
+Why can an old generation not overwrite a post-promotion write, yet an acknowledged primary write can still be absent after promoting a lagging replica?
+
+### Textbook
+
+Generation checking is a fencing-token pattern; ordered promotion resembles a view change at one process boundary. The lost-write example exposes the consistency level of asynchronous primary–backup replication, while supervised shutdown applies structured-concurrency ownership to a storage runtime.
+
+[Compare this stage on GitHub](https://github.com/system-in-miniature/mini-redis/compare/e18be82...0fbaeee)
+
+After finishing, run `python -m journey.tools.build_journey check 18` to verify the learner workspace.
+
+[Complete reference patch / 完整参考补丁](https://github.com/system-in-miniature/mini-redis/blob/main/journey/stages/18-promotion-lifecycle/stage.patch)

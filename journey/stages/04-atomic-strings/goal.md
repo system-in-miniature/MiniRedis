@@ -142,7 +142,9 @@ The executor invokes one method without learning String-specific branches.
 ##### Key code
 
 ```python
-return plan_general_and_strings(command, database, now_ms)
+plan = plan_general_and_strings(command, database, now_ms)
+if plan is not None:
+    return plan
 ```
 
 ##### Statement understanding
@@ -163,8 +165,15 @@ It samples time, plans against current state, allocates the next sequence, appli
 ##### Key code
 
 ```python
-batch = prepared.to_batch(self.database.commit_seq + 1)
-self.database.apply_batch(batch, track_access=True)
+batch = CommitBatch(
+    seq=self.database.commit_seq + 1,
+    operations=plan.operations,
+    trigger=plan.trigger,
+)
+await self.commit_barrier.append(batch)
+self.database.apply_batch(
+    batch, track_access=plan.trigger is CommitTrigger.CLIENT
+)
 ```
 
 ##### Statement understanding
@@ -327,7 +336,9 @@ Executor 调用一个方法，不学习 String 专属分支。
 ##### 关键代码
 
 ```python
-return plan_general_and_strings(command, database, now_ms)
+plan = plan_general_and_strings(command, database, now_ms)
+if plan is not None:
+    return plan
 ```
 
 ##### 关键语句理解
@@ -348,8 +359,15 @@ Executor 现在把非空 Plan 变成有序 Commit Batch，并恰好应用一次�
 ##### 关键代码
 
 ```python
-batch = prepared.to_batch(self.database.commit_seq + 1)
-self.database.apply_batch(batch, track_access=True)
+batch = CommitBatch(
+    seq=self.database.commit_seq + 1,
+    operations=plan.operations,
+    trigger=plan.trigger,
+)
+await self.commit_barrier.append(batch)
+self.database.apply_batch(
+    batch, track_access=plan.trigger is CommitTrigger.CLIENT
+)
 ```
 
 ##### 关键语句理解

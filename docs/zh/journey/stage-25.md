@@ -1,0 +1,915 @@
+# Stage 25 · AOF 状态基线
+
+### 目标
+
+允许 AOF 从完整 Checkpoint Image 开始，后接连续 Delta Commit，使后续 Online Rewrite 能替换旧 History 而不依赖单独 Snapshot File。
+
+??? note "交付文件"
+    - `src/miniredis/persistence/aof.py`
+    - `src/miniredis/persistence/codec.py`
+    - `src/miniredis/persistence/recovery.py`
+    - `tests/reliability/test_final_acceptance.py`
+    - `tests/reliability/test_phase3_invariants.py`
+    - `tests/reliability/test_restart.py`
+    - `tests/replication/test_sink_attach.py`
+    - `tests/unit/persistence/test_aof_repair.py`
+    - `tests/unit/persistence/test_codec.py`
+    - `tests/unit/persistence/test_framing.py`
+    - `tests/unit/persistence/test_recovery.py`
+
+### 当前遇到的问题
+
+当前 AOF 只有 Commit Delta Sequence。若没有其他 Artifact 提供早期记录的最终状态，Compact 就不能丢弃它们。Online Rewrite 因此需要一个自包含首 Record：State Through Checkpoint N，之后只能是 N+1、N+2……。Recovery 还可能同时看到独立 Snapshot，必须选一个 Base 且不能 Double Replay。
+
+### 测试契约
+
+#### 先看会坏在哪里
+
+Commit 后出现 State Base 或重复 Base 会让 History 含糊。第一个 Delta 跳过或重复 Checkpoint Boundary 表示 History 不完整。用旧 Base 覆盖更新 Snapshot 会丢状态；应用所选 Base 以前的 Delta 会重复历史。Tail Repair 若截进 Partial Base，必须退回 AOF Header，而不能解码半个 Checkpoint。
+
+??? note "文件差异：tests/reliability/test_final_acceptance.py"
+    ```diff
+    diff --git a/tests/reliability/test_final_acceptance.py b/tests/reliability/test_final_acceptance.py
+    index 58e5f09984ea10543252b483cbda4c912150f18e..a0124be399116d5c8f10ead1fa6720fe5df7ed7b 100644
+    --- a/tests/reliability/test_final_acceptance.py
+    +++ b/tests/reliability/test_final_acceptance.py
+    @@ -167,7 +167,9 @@ async def test_final_acceptance_activates_components_then_leaves_no_owners(
+             writer.close()
+             await writer.wait_closed()
+
+    -    batches = load_aof(aof_path, repair_truncated_tail=False)
+    +    batches = load_aof(
+    +        aof_path, repair_truncated_tail=False
+    +    ).batches
+         assert batches[-1].seq == primary.debug_commit_seq
+         aof_entries = {
+             operation.key: operation.entry
+    ```
+
+把最终 Durable-state Evidence 更新为检查 `AofLog.batches`，不把 State Base 误当 Commit Batch。
+
+??? note "文件差异：tests/reliability/test_phase3_invariants.py"
+    ```diff
+    diff --git a/tests/reliability/test_phase3_invariants.py b/tests/reliability/test_phase3_invariants.py
+    index 2e336c157d3ebd51d80c646b64ce960f4ab47f47..3520bbf19c7fed662df27a7fcbd394da6fb4c9fb 100644
+    --- a/tests/reliability/test_phase3_invariants.py
+    +++ b/tests/reliability/test_phase3_invariants.py
+    @@ -75,7 +75,9 @@ async def test_expiration_and_eviction_reasons_are_in_the_same_aof_stream(
+
+         reasons = tuple(
+             operation.reason
+    -        for batch in load_aof(path, repair_truncated_tail=False)
+    +        for batch in load_aof(
+    +            path, repair_truncated_tail=False
+    +        ).batches
+             for operation in batch.operations
+             if isinstance(operation, DeleteKey)
+         )
+    ```
+
+把 Invariant Inspection 更新为从 Structured AOF Log 读取 Commit Delta，保留 Expiry/Eviction Evidence。
+
+??? note "文件差异：tests/reliability/test_restart.py"
+    ```diff
+    diff --git a/tests/reliability/test_restart.py b/tests/reliability/test_restart.py
+    index 31eddea5a8fd912ef3dce617e08f60c8caed2bfb..2ebe298c08176aafd238be5b8671ceeb9c3d629d 100644
+    --- a/tests/reliability/test_restart.py
+    +++ b/tests/reliability/test_restart.py
+    @@ -53,3 +53,26 @@ async def test_corrupt_startup_never_accepts_clients_or_leaks_workers(
+         assert stats.owned_tasks == 0
+         assert stats.sessions == 0
+         await runtime.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_restart_resets_volatile_lfu_metadata(tmp_path):
+    +    config = MiniRedisConfig(
+    +        aof_path=tmp_path / "appendonly.mraof",
+    +        aof_policy=AofPolicy.ALWAYS,
+    +        eviction_policy="allkeys-lfu",
+    +    )
+    +    first = MiniRedis.open(config)
+    +    await first.start()
+    +    client = first.direct_client()
+    +    await client.execute(CommandRequest(b"SET", (b"k", b"v")))
+    +    for _ in range(4):
+    +        await client.execute(CommandRequest(b"GET", (b"k",)))
+    +    assert first.database.entries[b"k"].frequency == 5
+    +    await first.close()
+    +
+    +    second = MiniRedis.open(config)
+    +    await second.start()
+    +    assert second.database.entries[b"k"].frequency == 0
+    +    assert second.database.entries[b"k"].last_access_tick == 0
+    +    await second.close()
+    ```
+
+锁定 Restart 只恢复 Logical State，而 Volatile LFU/Access Metadata 归零。
+
+??? note "文件差异：tests/replication/test_sink_attach.py"
+    ```diff
+    diff --git a/tests/replication/test_sink_attach.py b/tests/replication/test_sink_attach.py
+    index 8d585882b79399e5686b5be3bca84cce2b2280e0..8e84dbfa9212f34f5d130ba3e13ce1745ffd9b14 100644
+    --- a/tests/replication/test_sink_attach.py
+    +++ b/tests/replication/test_sink_attach.py
+    @@ -3,6 +3,7 @@ import asyncio
+     import pytest
+
+     from miniredis import CommandRequest
+    +from miniredis.config import MiniRedisConfig
+     from miniredis.core.reply import Bytes, Ok
+     from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+     from tests.helpers.runtime import open_test_runtime
+    @@ -64,3 +65,23 @@ async def test_attached_replica_rejects_user_writes():
+         assert replica.debug_commit_seq == sink.status.applied_seq
+         await primary.close()
+         await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_full_sync_resets_volatile_lfu_metadata():
+    +    config = MiniRedisConfig(eviction_policy="allkeys-lfu")
+    +    primary = await open_test_runtime(config=config)
+    +    replica = await open_test_runtime(config=config)
+    +    client = primary.direct_client()
+    +    await client.execute(CommandRequest(b"SET", (b"k", b"v")))
+    +    for _ in range(4):
+    +        await client.execute(CommandRequest(b"GET", (b"k",)))
+    +    assert primary.database.entries[b"k"].frequency == 5
+    +
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +
+    +    assert replica.database.entries[b"k"].frequency == 0
+    +    assert replica.database.entries[b"k"].last_access_tick == 0
+    +    await primary.close()
+    +    await replica.close()
+    ```
+
+锁定 Full-sync Snapshot Installation 在 Follower 上使用中性 LFU/Access Metadata。
+
+??? note "文件差异：tests/unit/persistence/test_aof_repair.py"
+    ```diff
+    diff --git a/tests/unit/persistence/test_aof_repair.py b/tests/unit/persistence/test_aof_repair.py
+    index a7aac38335c6359abe2451474f08f98b6af2f681..ed30c96d52029da7f726b823f61cf0c8afbc3291 100644
+    --- a/tests/unit/persistence/test_aof_repair.py
+    +++ b/tests/unit/persistence/test_aof_repair.py
+    @@ -1,6 +1,6 @@
+     import pytest
+
+    -from miniredis.persistence.aof import AofCorruption, load_aof
+    +from miniredis.persistence.aof import AofCorruption, AofLog, load_aof
+     from miniredis.persistence.codec import AOF_HEADER, encode_aof_record
+
+     from tests.unit.persistence.test_framing import batch
+    @@ -12,9 +12,9 @@ def test_repair_enabled_truncates_one_incomplete_tail(tmp_path):
+         second = encode_aof_record(batch(2, b"two"))
+         path.write_bytes(AOF_HEADER + first + second[:-3])
+
+    -    batches = load_aof(path, repair_truncated_tail=True)
+    +    log = load_aof(path, repair_truncated_tail=True)
+
+    -    assert batches == (batch(1, b"one"),)
+    +    assert log == AofLog(None, (batch(1, b"one"),))
+         assert path.read_bytes() == AOF_HEADER + first
+
+
+    @@ -42,18 +42,18 @@ def test_missing_aof_is_an_empty_stream(tmp_path):
+         assert load_aof(
+             tmp_path / "missing.mraof",
+             repair_truncated_tail=True,
+    -    ) == ()
+    +    ) == AofLog(None, ())
+
+
+     def test_existing_zero_byte_aof_is_an_empty_stream(tmp_path):
+         path = tmp_path / "empty.mraof"
+         path.write_bytes(b"")
+    -    assert load_aof(path, repair_truncated_tail=True) == ()
+    +    assert load_aof(path, repair_truncated_tail=True) == AofLog(None, ())
+         assert path.read_bytes() == b""
+
+
+     def test_header_only_aof_is_an_empty_stream(tmp_path):
+         path = tmp_path / "header-only.mraof"
+         path.write_bytes(AOF_HEADER)
+    -    assert load_aof(path, repair_truncated_tail=True) == ()
+    +    assert load_aof(path, repair_truncated_tail=True) == AofLog(None, ())
+         assert path.read_bytes() == AOF_HEADER
+    ```
+
+锁定 Repaired、Missing、Empty、Header-only Log 的新 `AofLog(state_base, batches)` 返回契约。
+
+??? note "文件差异：tests/unit/persistence/test_codec.py"
+    ```diff
+    diff --git a/tests/unit/persistence/test_codec.py b/tests/unit/persistence/test_codec.py
+    index 7f459c65a84a2989c84b2e82d2a93bc83c6fcd70..7cedbb571331e8b95c15434194d825b51e1ee324 100644
+    --- a/tests/unit/persistence/test_codec.py
+    +++ b/tests/unit/persistence/test_codec.py
+    @@ -16,8 +16,10 @@ from miniredis.core.commit import (
+     )
+     from miniredis.persistence.codec import (
+         CodecError,
+    +    decode_aof_state_base_payload,
+         decode_commit_payload,
+         decode_snapshot_payload,
+    +    encode_aof_state_base_payload,
+         encode_commit_payload,
+         encode_snapshot_payload,
+     )
+    @@ -96,6 +98,45 @@ def test_snapshot_payload_round_trips_sorted_entries():
+         assert decode_snapshot_payload(encode_snapshot_payload(image)) == image
+
+
+    +def test_aof_state_base_payload_round_trips_sorted_entries():
+    +    image = SnapshotImage(
+    +        checkpoint_seq=7,
+    +        entries=(
+    +            (b"a", StoredEntry(StoredString(b"1"), None, 1)),
+    +            (b"z", StoredEntry(StoredSet((b"a", b"b")), 8000, 2)),
+    +        ),
+    +    )
+    +
+    +    assert (
+    +        decode_aof_state_base_payload(encode_aof_state_base_payload(image))
+    +        == image
+    +    )
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "payload",
+    +    [
+    +        b"{}",
+    +        b'{"checkpoint_seq":0,"entries":[],"record":"state_base"}',
+    +        (
+    +            b'{"checkpoint_seq":0,"entries":[],"record":"state_base",'
+    +            b'"version":2}'
+    +        ),
+    +        (
+    +            b'{"checkpoint_seq":true,"entries":[],"record":"state_base",'
+    +            b'"version":1}'
+    +        ),
+    +        (
+    +            b'{"checkpoint_seq":0,"entries":[],"record":"commit",'
+    +            b'"version":1}'
+    +        ),
+    +    ],
+    +)
+    +def test_invalid_aof_state_base_schema_is_rejected(payload):
+    +    with pytest.raises(CodecError):
+    +        decode_aof_state_base_payload(payload)
+    +
+    +
+     @pytest.mark.parametrize(
+         "payload",
+         [
+    ```
+
+锁定确定性 State-base Payload Round Trip 与严格 Schema/Version/Record-type Validation。
+
+??? note "文件差异：tests/unit/persistence/test_framing.py"
+    ```diff
+    diff --git a/tests/unit/persistence/test_framing.py b/tests/unit/persistence/test_framing.py
+    index 62494a18eb1e92c4977a82daec8e242cadd52199..31496f9eaa50d7e13e24d2dfd9e98d40bcb344d8 100644
+    --- a/tests/unit/persistence/test_framing.py
+    +++ b/tests/unit/persistence/test_framing.py
+    @@ -17,6 +17,7 @@ from miniredis.persistence.codec import (
+         CodecError,
+         decode_snapshot_file,
+         encode_aof_record,
+    +    encode_aof_state_base_record,
+         encode_commit_payload,
+         encode_snapshot_file,
+         scan_aof_bytes,
+    @@ -48,6 +49,7 @@ def test_aof_record_has_length_payload_and_crc32():
+         assert scan.batches == (batch(1),)
+         assert scan.valid_offset == len(AOF_HEADER + record)
+         assert scan.has_truncated_tail is False
+    +    assert scan.state_base is None
+
+
+     def test_snapshot_file_has_versioned_header_length_and_crc():
+    @@ -85,3 +87,83 @@ def test_aof_segment_may_start_after_a_snapshot_checkpoint():
+         )
+
+         assert scan_aof_bytes(encoded).batches == (batch(8), batch(9))
+    +
+    +
+    +def test_aof_state_base_round_trips_before_contiguous_batches():
+    +    image = SnapshotImage(
+    +        7,
+    +        ((b"k", StoredEntry(StoredString(b"v"), None, 3)),),
+    +    )
+    +    data = (
+    +        AOF_HEADER
+    +        + encode_aof_state_base_record(image)
+    +        + encode_aof_record(batch(8))
+    +    )
+    +
+    +    scan = scan_aof_bytes(data)
+    +
+    +    assert scan.state_base == image
+    +    assert scan.batches == (batch(8),)
+    +    assert not scan.has_truncated_tail
+    +
+    +
+    +def test_aof_state_base_may_be_the_only_record():
+    +    image = SnapshotImage(7, ())
+    +
+    +    scan = scan_aof_bytes(
+    +        AOF_HEADER + encode_aof_state_base_record(image)
+    +    )
+    +
+    +    assert scan.state_base == image
+    +    assert scan.batches == ()
+    +    assert not scan.has_truncated_tail
+    +
+    +
+    +def test_state_base_after_commit_is_corruption():
+    +    data = (
+    +        AOF_HEADER
+    +        + encode_aof_record(batch(1))
+    +        + encode_aof_state_base_record(SnapshotImage(1, ()))
+    +    )
+    +
+    +    with pytest.raises(CodecError, match="state base must be first"):
+    +        scan_aof_bytes(data)
+    +
+    +
+    +def test_duplicate_state_base_is_corruption():
+    +    base = encode_aof_state_base_record(SnapshotImage(1, ()))
+    +
+    +    with pytest.raises(CodecError, match="state base must be first"):
+    +        scan_aof_bytes(AOF_HEADER + base + base)
+    +
+    +
+    +@pytest.mark.parametrize("seq", [6, 7, 9])
+    +def test_first_batch_after_state_base_must_follow_checkpoint(seq):
+    +    data = (
+    +        AOF_HEADER
+    +        + encode_aof_state_base_record(SnapshotImage(7, ()))
+    +        + encode_aof_record(batch(seq))
+    +    )
+    +
+    +    with pytest.raises(CodecError, match=f"expected AOF seq 8, got {seq}"):
+    +        scan_aof_bytes(data)
+    +
+    +
+    +def test_truncated_state_base_tail_repairs_to_header_boundary():
+    +    record = encode_aof_state_base_record(SnapshotImage(7, ()))
+    +
+    +    scan = scan_aof_bytes(AOF_HEADER + record[:-1])
+    +
+    +    assert scan.state_base is None
+    +    assert scan.batches == ()
+    +    assert scan.valid_offset == len(AOF_HEADER)
+    +    assert scan.has_truncated_tail
+    +
+    +
+    +def test_legacy_batch_only_aof_has_no_state_base():
+    +    data = AOF_HEADER + encode_aof_record(batch(4))
+    +
+    +    scan = scan_aof_bytes(data)
+    +
+    +    assert scan.state_base is None
+    +    assert scan.batches == (batch(4),)
+    ```
+
+锁定 First-only Placement、唯一性、Base-to-delta Sequence Continuity、Base-only Log、Legacy Batch-only Compatibility 与 Truncated-base Boundary。
+
+??? note "文件差异：tests/unit/persistence/test_recovery.py"
+    ```diff
+    diff --git a/tests/unit/persistence/test_recovery.py b/tests/unit/persistence/test_recovery.py
+    index 5bbdc703d6b0fd661035099765fd3f47349062d8..1ef5ec6c75cac244b2e3f27a3e095eb6dbc195f1 100644
+    --- a/tests/unit/persistence/test_recovery.py
+    +++ b/tests/unit/persistence/test_recovery.py
+    @@ -1,3 +1,5 @@
+    +import pytest
+    +
+     from miniredis.core.commit import (
+         CommitBatch,
+         CommitTrigger,
+    @@ -9,9 +11,10 @@ from miniredis.core.commit import (
+     from miniredis.persistence.codec import (
+         AOF_HEADER,
+         encode_aof_record,
+    +    encode_aof_state_base_record,
+         encode_snapshot_file,
+     )
+    -from miniredis.persistence.recovery import recover_database
+    +from miniredis.persistence.recovery import RecoveryError, recover_database
+
+
+     def put(seq: int, key: bytes, value: bytes, expire_at_ms=None):
+    @@ -37,6 +40,14 @@ def write_aof(path, *batches):
+         )
+
+
+    +def write_aof_with_base(path, image, *batches):
+    +    path.write_bytes(
+    +        AOF_HEADER
+    +        + encode_aof_state_base_record(image)
+    +        + b"".join(encode_aof_record(item) for item in batches)
+    +    )
+    +
+    +
+     def test_aof_only_recovery_replays_without_reappend(tmp_path):
+         aof = tmp_path / "appendonly.mraof"
+         write_aof(aof, put(1, b"a", b"1"), put(2, b"b", b"2"))
+    @@ -187,3 +198,150 @@ def test_startup_clock_discards_expired_values_and_resets_lru(tmp_path):
+         assert recovered.entries[b"live"].last_access_tick == 0
+         assert recovered.access_tick == 0
+         assert recovered.commit_seq == 2
+    +
+    +
+    +def test_recovery_prefers_newer_aof_state_base(tmp_path):
+    +    snapshot_path = tmp_path / "dump.snapshot"
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    snapshot_path.write_bytes(
+    +        encode_snapshot_file(
+    +            SnapshotImage(
+    +                1,
+    +                ((b"k", StoredEntry(StoredString(b"snapshot"), None, 1)),),
+    +            )
+    +        )
+    +    )
+    +    base = SnapshotImage(
+    +        2,
+    +        ((b"k", StoredEntry(StoredString(b"base"), None, 2)),),
+    +    )
+    +    later = put(3, b"later", b"value")
+    +    write_aof_with_base(aof_path, base, later)
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=snapshot_path,
+    +        aof_path=aof_path,
+    +        now_ms=0,
+    +        repair_truncated_tail=False,
+    +    )
+    +
+    +    assert recovered.commit_seq == 3
+    +    assert recovered.export_stored_entries(0) == (
+    +        (b"k", StoredEntry(StoredString(b"base"), None, 2)),
+    +        (b"later", StoredEntry(StoredString(b"value"), None, 3)),
+    +    )
+    +
+    +
+    +def test_recovery_prefers_newer_snapshot_over_aof_state_base(tmp_path):
+    +    snapshot_path = tmp_path / "dump.snapshot"
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    snapshot = SnapshotImage(
+    +        4,
+    +        ((b"k", StoredEntry(StoredString(b"snapshot"), None, 4)),),
+    +    )
+    +    snapshot_path.write_bytes(encode_snapshot_file(snapshot))
+    +    write_aof_with_base(
+    +        aof_path,
+    +        SnapshotImage(
+    +            2,
+    +            ((b"k", StoredEntry(StoredString(b"base"), None, 2)),),
+    +        ),
+    +        put(3, b"k", b"three"),
+    +        put(4, b"k", b"four"),
+    +    )
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=snapshot_path,
+    +        aof_path=aof_path,
+    +        now_ms=0,
+    +        repair_truncated_tail=False,
+    +    )
+    +
+    +    assert recovered.commit_seq == 4
+    +    assert recovered.export_stored_entries(0) == snapshot.entries
+    +
+    +
+    +def test_equal_checkpoint_prefers_aof_state_base(tmp_path):
+    +    snapshot_path = tmp_path / "dump.snapshot"
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    snapshot_path.write_bytes(
+    +        encode_snapshot_file(
+    +            SnapshotImage(
+    +                2,
+    +                ((b"k", StoredEntry(StoredString(b"snapshot"), None, 2)),),
+    +            )
+    +        )
+    +    )
+    +    base = SnapshotImage(
+    +        2,
+    +        ((b"k", StoredEntry(StoredString(b"base"), None, 2)),),
+    +    )
+    +    write_aof_with_base(aof_path, base)
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=snapshot_path,
+    +        aof_path=aof_path,
+    +        now_ms=0,
+    +        repair_truncated_tail=False,
+    +    )
+    +
+    +    assert recovered.export_stored_entries(0) == base.entries
+    +
+    +
+    +def test_aof_state_base_recovers_without_snapshot(tmp_path):
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    base = SnapshotImage(
+    +        2,
+    +        ((b"k", StoredEntry(StoredString(b"base"), None, 2)),),
+    +    )
+    +    write_aof_with_base(aof_path, base)
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=None,
+    +        aof_path=aof_path,
+    +        now_ms=0,
+    +        repair_truncated_tail=False,
+    +    )
+    +
+    +    assert recovered.commit_seq == 2
+    +    assert recovered.export_stored_entries(0) == base.entries
+    +
+    +
+    +def test_missing_post_base_sequence_is_rejected(tmp_path):
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    aof_path.write_bytes(
+    +        AOF_HEADER
+    +        + encode_aof_state_base_record(SnapshotImage(2, ()))
+    +        + encode_aof_record(put(4, b"k", b"value"))
+    +    )
+    +
+    +    with pytest.raises(RecoveryError, match="expected AOF seq 3, got 4"):
+    +        recover_database(
+    +            snapshot_path=None,
+    +            aof_path=aof_path,
+    +            now_ms=0,
+    +            repair_truncated_tail=False,
+    +        )
+    +
+    +
+    +def test_truncated_final_delta_after_base_is_repaired(tmp_path):
+    +    aof_path = tmp_path / "appendonly.mraof"
+    +    base = SnapshotImage(
+    +        2,
+    +        ((b"k", StoredEntry(StoredString(b"base"), None, 2)),),
+    +    )
+    +    first = encode_aof_record(put(3, b"first", b"1"))
+    +    truncated = encode_aof_record(put(4, b"lost", b"2"))
+    +    expected = AOF_HEADER + encode_aof_state_base_record(base) + first
+    +    aof_path.write_bytes(expected + truncated[:-3])
+    +
+    +    recovered = recover_database(
+    +        snapshot_path=None,
+    +        aof_path=aof_path,
+    +        now_ms=0,
+    +        repair_truncated_tail=True,
+    +    )
+    +
+    +    assert recovered.commit_seq == 3
+    +    assert tuple(recovered.entries) == (b"k", b"first")
+    +    assert aof_path.read_bytes() == expected
+    ```
+
+锁定 Newer-base Selection、Equal-checkpoint AOF Preference、AOF-only Base Recovery、Contiguous Suffix Replay、Old-log Rejection 与 Base 后 Tail Repair。
+
+### 基本概念
+
+AOF State Base 是编码进普通 Length/CRC Framing 的 `SnapshotImage(checkpoint_seq, entries)`。它是 Logical Checkpoint，不是 Commit。`AofLog` 分离 Optional Base 与 Delta Batches。所选 Recovery Base 是 Snapshot File 与 AOF State Base 中较新的一个；Sequence 相等时偏好 AOF Base，因为它与 Suffix 属于同一 Log Generation。
+
+### 为什么需要这个机制
+
+Online Rewrite 必须发布一份无需协调两个 File Replacement 就能恢复的独立 AOF。First-record State Base 给新文件完整起点，严格 Placement/Sequence Rule 则让 Rewritten 与 Legacy Log 同样可审计。
+
+### 运行时心智模型
+
+Scanner 校验 Header 与每个 Framed Payload。若首 Payload 声明 `state_base`，解码一个 Checkpoint 并把 Expected Sequence 设为 N+1；之后任何 Base 都是 Corruption。Load 返回 `(base, batches)`。Recovery 选择最新 Base，校验 Log End，并只 Replay Sequence 大于所选 Checkpoint 的 Batch。
+
+### 机制板块
+
+#### 首 Record AOF State Base
+
+把 Checkpoint Image 编码成带 Checksum 的 AOF Record，它最多出现一次且只能位于连续 Commit Batch 之前。
+
+??? note "文件差异：src/miniredis/persistence/codec.py"
+    ```diff
+    diff --git a/src/miniredis/persistence/codec.py b/src/miniredis/persistence/codec.py
+    index 77f12a2a506b4f16de2e87833e2fadd349656aca..c05f7609d7e5f3c47df400482bdce4e27ba5d161 100644
+    --- a/src/miniredis/persistence/codec.py
+    +++ b/src/miniredis/persistence/codec.py
+    @@ -38,6 +38,7 @@ class CodecError(ValueError):
+
+     @dataclass(frozen=True, slots=True)
+     class AofScan:
+    +    state_base: SnapshotImage | None
+         batches: tuple[CommitBatch, ...]
+         valid_offset: int
+         has_truncated_tail: bool
+    @@ -440,33 +441,104 @@ def decode_snapshot_payload(payload: bytes) -> SnapshotImage:
+             raise CodecError(str(exc)) from exc
+
+
+    +def encode_aof_state_base_payload(image: SnapshotImage) -> bytes:
+    +    return _dumps(
+    +        {
+    +            "record": "state_base",
+    +            "version": PAYLOAD_VERSION,
+    +            "checkpoint_seq": image.checkpoint_seq,
+    +            "entries": [
+    +                {"key": _bytes(key), "entry": _encode_entry(entry)}
+    +                for key, entry in image.entries
+    +            ],
+    +        }
+    +    )
+    +
+    +
+    +def decode_aof_state_base_payload(payload: bytes) -> SnapshotImage:
+    +    root = _object(
+    +        _loads(payload),
+    +        frozenset(
+    +            {"record", "version", "checkpoint_seq", "entries"}
+    +        ),
+    +        "AOF state base",
+    +    )
+    +    if _text(root["record"], "record") != "state_base":
+    +        _fail("unknown AOF record type")
+    +    if _integer(root["version"], "version", minimum=1) != PAYLOAD_VERSION:
+    +        _fail("unsupported AOF state base payload version")
+    +    entries = []
+    +    for index, raw_entry in enumerate(_array(root["entries"], "entries")):
+    +        item = _object(
+    +            raw_entry,
+    +            frozenset({"key", "entry"}),
+    +            f"entries[{index}]",
+    +        )
+    +        entries.append(
+    +            (
+    +                _decode_bytes(item["key"], f"entries[{index}].key"),
+    +                _decode_entry(item["entry"]),
+    +            )
+    +        )
+    +    try:
+    +        return SnapshotImage(
+    +            checkpoint_seq=_integer(
+    +                root["checkpoint_seq"],
+    +                "checkpoint_seq",
+    +            ),
+    +            entries=tuple(entries),
+    +        )
+    +    except ValueError as exc:
+    +        raise CodecError(str(exc)) from exc
+    +
+    +
+     def _crc(payload: bytes) -> bytes:
+         return struct.pack(">I", zlib.crc32(payload))
+
+
+    -def encode_aof_record(batch: CommitBatch) -> bytes:
+    -    payload = encode_commit_payload(batch)
+    +def _encode_aof_payload_record(payload: bytes) -> bytes:
+         if len(payload) > MAX_PAYLOAD_BYTES:
+             raise CodecError("AOF payload exceeds limit")
+         return struct.pack(">I", len(payload)) + payload + _crc(payload)
+
+
+    +def encode_aof_record(batch: CommitBatch) -> bytes:
+    +    return _encode_aof_payload_record(encode_commit_payload(batch))
+    +
+    +
+    +def encode_aof_state_base_record(image: SnapshotImage) -> bytes:
+    +    return _encode_aof_payload_record(
+    +        encode_aof_state_base_payload(image)
+    +    )
+    +
+    +
+     def scan_aof_bytes(data: bytes) -> AofScan:
+         if not data.startswith(AOF_HEADER):
+             raise CodecError("invalid AOF header")
+         offset = len(AOF_HEADER)
+         valid_offset = offset
+    +    state_base: SnapshotImage | None = None
+         batches: list[CommitBatch] = []
+         previous_seq: int | None = None
+         while offset < len(data):
+             if len(data) - offset < 4:
+    -            return AofScan(tuple(batches), valid_offset, True)
+    +            return AofScan(
+    +                state_base,
+    +                tuple(batches),
+    +                valid_offset,
+    +                True,
+    +            )
+             payload_length = struct.unpack_from(">I", data, offset)[0]
+             if payload_length > MAX_PAYLOAD_BYTES:
+                 raise CodecError("AOF payload exceeds limit")
+             end = offset + 4 + payload_length + 4
+             if end > len(data):
+    -            return AofScan(tuple(batches), valid_offset, True)
+    +            return AofScan(
+    +                state_base,
+    +                tuple(batches),
+    +                valid_offset,
+    +                True,
+    +            )
+             payload_start = offset + 4
+             payload_end = payload_start + payload_length
+             payload = data[payload_start:payload_end]
+    @@ -474,6 +546,19 @@ def scan_aof_bytes(data: bytes) -> AofScan:
+             actual_crc = zlib.crc32(payload)
+             if actual_crc != expected_crc:
+                 raise CodecError(f"AOF checksum failure at offset {offset}")
+    +        decoded_payload = _loads(payload)
+    +        is_state_base = (
+    +            isinstance(decoded_payload, dict)
+    +            and decoded_payload.get("record") == "state_base"
+    +        )
+    +        if is_state_base:
+    +            if state_base is not None or batches:
+    +                raise CodecError("AOF state base must be first")
+    +            state_base = decode_aof_state_base_payload(payload)
+    +            previous_seq = state_base.checkpoint_seq
+    +            offset = end
+    +            valid_offset = end
+    +            continue
+             batch = decode_commit_payload(payload)
+             if previous_seq is not None and batch.seq != previous_seq + 1:
+                 raise CodecError(
+    @@ -483,7 +568,7 @@ def scan_aof_bytes(data: bytes) -> AofScan:
+             previous_seq = batch.seq
+             offset = end
+             valid_offset = end
+    -    return AofScan(tuple(batches), valid_offset, False)
+    +    return AofScan(state_base, tuple(batches), valid_offset, False)
+
+
+     def encode_snapshot_file(image: SnapshotImage) -> bytes:
+    ```
+
+加入严格 Payload Encode/Decode 与 Framed State-base Record，并让 Scanner 实现 First-record-only State Machine。
+
+```python
+if state_base is not None or batches:
+    raise CodecError("AOF state base must be first")
+```
+
+该条件同时禁止 Duplicate Base 与 Commit 后的 Base。
+
+#### 结构化 AOF Log 加载
+
+返回显式 Optional State Base 与 Delta Batches，同时保持 Truncated-tail Repair Boundary。
+
+??? note "文件差异：src/miniredis/persistence/aof.py"
+    ```diff
+    diff --git a/src/miniredis/persistence/aof.py b/src/miniredis/persistence/aof.py
+    index 2fc237a340657b585e2cd7f364f2826faac41aa2..fea7ff4a4d608819e194384d2dfff1c4d10b8dd3 100644
+    --- a/src/miniredis/persistence/aof.py
+    +++ b/src/miniredis/persistence/aof.py
+    @@ -8,7 +8,7 @@ from enum import StrEnum
+     from pathlib import Path
+     from typing import Protocol, TypeAlias
+
+    -from miniredis.core.commit import CommitBatch
+    +from miniredis.core.commit import CommitBatch, SnapshotImage
+     from miniredis.persistence.codec import (
+         AOF_HEADER,
+         CodecError,
+    @@ -40,6 +40,12 @@ class AofAppendFailed:
+     AofAppendOutcome: TypeAlias = AofAppendOk | AofAppendFailed
+
+
+    +@dataclass(frozen=True, slots=True)
+    +class AofLog:
+    +    state_base: SnapshotImage | None
+    +    batches: tuple[CommitBatch, ...]
+    +
+    +
+     class AofFileOps(Protocol):
+         def open_append(self, path: Path) -> int:
+             raise NotImplementedError
+    @@ -94,19 +100,19 @@ def load_aof(
+         path: Path,
+         *,
+         repair_truncated_tail: bool,
+    -) -> tuple[CommitBatch, ...]:
+    +) -> AofLog:
+         try:
+             data = path.read_bytes()
+         except FileNotFoundError:
+    -        return ()
+    +        return AofLog(None, ())
+         if data == b"":
+    -        return ()
+    +        return AofLog(None, ())
+         try:
+             scan = scan_aof_bytes(data)
+         except CodecError as exc:
+             raise AofCorruption(str(exc)) from exc
+         if not scan.has_truncated_tail:
+    -        return scan.batches
+    +        return AofLog(scan.state_base, scan.batches)
+         if not repair_truncated_tail:
+             raise AofCorruption("incomplete final AOF record")
+
+    @@ -116,7 +122,7 @@ def load_aof(
+             os.fsync(fd)
+         finally:
+             os.close(fd)
+    -    return scan.batches
+    +    return AofLog(scan.state_base, scan.batches)
+
+
+     @dataclass(slots=True)
+    ```
+
+引入 `AofLog`，并在普通 Load 与 Truncated-tail Repair 中保留 Base 与 Batches。
+
+#### 最新兼容 Recovery Base
+
+选择更新的 Snapshot 或 AOF State Base，只重放其后的连续 Delta，并拒绝早于所选 Checkpoint 结束的 AOF。
+
+??? note "文件差异：src/miniredis/persistence/recovery.py"
+    ```diff
+    diff --git a/src/miniredis/persistence/recovery.py b/src/miniredis/persistence/recovery.py
+    index 1721753330c0142f3159b9031736697f4736dad0..6d7642ab422f2ccb35beade233f1a9b33d7ff176 100644
+    --- a/src/miniredis/persistence/recovery.py
+    +++ b/src/miniredis/persistence/recovery.py
+    @@ -4,7 +4,7 @@ from pathlib import Path
+
+     from miniredis.core.commit import SnapshotImage
+     from miniredis.core.database import Database
+    -from miniredis.persistence.aof import AofCorruption, load_aof
+    +from miniredis.persistence.aof import AofCorruption, AofLog, load_aof
+     from miniredis.persistence.codec import CodecError, decode_snapshot_file
+
+
+    @@ -34,23 +34,39 @@ def recover_database(
+     ) -> Database:
+         image = _load_snapshot(snapshot_path)
+         try:
+    -        batches = (
+    +        log = (
+                 load_aof(
+                     aof_path,
+                     repair_truncated_tail=repair_truncated_tail,
+                 )
+                 if aof_path is not None
+    -            else ()
+    +            else AofLog(None, ())
+             )
+         except AofCorruption as exc:
+             raise RecoveryError(str(exc)) from exc
+
+    +    base = log.state_base
+    +    image = (
+    +        image
+    +        if base is None or image.checkpoint_seq > base.checkpoint_seq
+    +        else base
+    +    )
+    +    batches = log.batches
+         post_checkpoint = tuple(
+    -        batch for batch in batches if batch.seq > image.checkpoint_seq
+    +        batch
+    +        for batch in batches
+    +        if batch.seq > image.checkpoint_seq
+    +    )
+    +    aof_end = (
+    +        batches[-1].seq
+    +        if batches
+    +        else base.checkpoint_seq
+    +        if base is not None
+    +        else None
+         )
+    -    if batches and batches[-1].seq < image.checkpoint_seq:
+    +    if aof_end is not None and aof_end < image.checkpoint_seq:
+             raise RecoveryError(
+    -            f"AOF ends at seq {batches[-1].seq} before "
+    +            f"AOF ends at seq {aof_end} before "
+                 f"snapshot checkpoint {image.checkpoint_seq}"
+             )
+         if image.checkpoint_seq == 0 and batches and batches[0].seq != 1:
+    ```
+
+选择更新的兼容 Checkpoint Source，从 Base 或 Final Batch 推导 AOF End，并只 Replay Post-checkpoint Suffix。
+
+### 验证证据
+
+运行 `tests.txt` 中八个聚焦模块，累计构建 Stage 1–25，并要求 Owned-tree 与 `b9b363e` 一致。
+
+### 需要真正记住的内容
+
+- State Base 是 Checkpoint State，不是 Commit Delta。
+- 它只能出现一次、位于首位、先于连续 Suffix。
+- Recovery 选择一个最新 Base，绝不 Double Replay。
+- Rewritten AOF 可以自包含。
+
+### 用自己的话讲清楚
+
+为什么相同 Checkpoint Sequence 时偏好 AOF State Base？为什么第一个后续 Batch 必须恰好是 Checkpoint + 1？
+
+### 教材
+
+这是 Checkpoint-plus-suffix 形式的 Log Compaction。Base 汇总 State-transition Prefix，剩余 Delta 保留该 Prefix 之后的因果顺序。
+
+[在 GitHub 查看阶段差异](https://github.com/system-in-miniature/mini-redis/compare/b25b473...b9b363e)
+
+完成后可运行 `python -m journey.tools.build_journey check 25` 验收学习工作区。
+
+[Complete reference patch / 完整参考补丁](https://github.com/system-in-miniature/mini-redis/blob/main/journey/stages/25-aof-state-base/stage.patch)

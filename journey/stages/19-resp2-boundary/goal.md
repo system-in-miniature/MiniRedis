@@ -117,8 +117,10 @@ It buffers bounded fragments, parses recursive arrays and scalar frames, validat
 ##### Key code
 
 ```python
-frames.append(frame)
-del self._buffer[:consumed]
+    frames.append(frame)
+    offset = next_offset
+if offset:
+    del self._buffer[:offset]
 ```
 
 ##### Statement understanding
@@ -259,8 +261,10 @@ Bytes 进入 Decoder Buffer。完整 Frame 被移除并返回，未完成 Suffix
 ##### 关键代码
 
 ```python
-frames.append(frame)
-del self._buffer[:consumed]
+    frames.append(frame)
+    offset = next_offset
+if offset:
+    del self._buffer[:offset]
 ```
 
 ##### 关键语句理解

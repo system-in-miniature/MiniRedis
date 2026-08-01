@@ -240,7 +240,11 @@ It checks keys in order, stops at the first ready list, and proposes exactly one
 
 ```python
 for key in command.keys:
-    entry, expired = lookup(database, key, now_ms)
+    entry = database.entries.get(key)
+    if entry is None:
+        continue
+    if entry.expire_at_ms is not None and entry.expire_at_ms <= now_ms:
+        continue
 ```
 
 ##### Statement understanding
@@ -571,7 +575,11 @@ Planner 拥有立即、非阻塞 BLPOP Scan。
 
 ```python
 for key in command.keys:
-    entry, expired = lookup(database, key, now_ms)
+    entry = database.entries.get(key)
+    if entry is None:
+        continue
+    if entry.expire_at_ms is not None and entry.expire_at_ms <= now_ms:
+        continue
 ```
 
 ##### 关键语句理解

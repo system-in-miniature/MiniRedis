@@ -100,7 +100,10 @@ It registers token order, stores complete outbound bundles, cancels tokens as em
 ##### Key code
 
 ```python
-while self._request_order and self._request_order[0] in self._completed_requests:
+while (
+    self._request_order
+    and self._request_order[0] in self._completed_requests
+):
     token = self._request_order.popleft()
 ```
 
@@ -122,7 +125,12 @@ It assigns tokens, registers them before execution, packages multi-item Pub/Sub 
 ##### Key code
 
 ```python
-endpoint.register_request(token)
+endpoint = self._endpoints.get(session_id)
+if endpoint is not None:
+    endpoint.register_request(token)
+self._accepted_tokens.append(token)
+self._accepted_changed.set()
+self._on_debug_change()
 return SubmittedRequest(token, future, command)
 ```
 
@@ -335,7 +343,10 @@ TCP Reader 把 Frame 解码进有界 Deque，并在 Per-session Window 与全局
 ##### 关键代码
 
 ```python
-while self._request_order and self._request_order[0] in self._completed_requests:
+while (
+    self._request_order
+    and self._request_order[0] in self._completed_requests
+):
     token = self._request_order.popleft()
 ```
 
@@ -357,7 +368,12 @@ Executor 通过一条 Request 路径接纳 Typed Command 与 Parse Rejection，�
 ##### 关键代码
 
 ```python
-endpoint.register_request(token)
+endpoint = self._endpoints.get(session_id)
+if endpoint is not None:
+    endpoint.register_request(token)
+self._accepted_tokens.append(token)
+self._accepted_changed.set()
+self._on_debug_change()
 return SubmittedRequest(token, future, command)
 ```
 

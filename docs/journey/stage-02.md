@@ -1,0 +1,821 @@
+# Stage 02 · Typed commands and strict parsing
+
+### Goal
+
+Validate complete binary requests and freeze them into a closed typed-command vocabulary.
+
+??? note "Deliverable files"
+    - `src/miniredis/commands/model.py`
+    - `src/miniredis/commands/parser.py`
+    - `tests/unit/commands/test_parser.py`
+
+### The problem at this point
+
+Stage 01 can represent a request but cannot tell whether `SET k v NX EX 1`, a malformed integer, or an unknown command is legal. Passing raw argument arrays deeper would make every planner reimplement arity, option conflicts, numeric bounds, and binary normalization.
+
+### Test contract
+
+#### See the failure first
+
+The parser contract presents the complete invalid option set `SET k v NX XX`. Rejecting only the second option after planning starts would leave downstream code with a partially accepted command. Numeric cases also use non-canonical `-0`, oversized finite scores, and Python's huge-integer conversion limit to ensure validation is bounded before conversion.
+
+??? note "File diff: tests/unit/commands/test_parser.py"
+    ```diff
+    diff --git a/tests/unit/commands/test_parser.py b/tests/unit/commands/test_parser.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..d0214580f53a32ddd1efcd64df7d9ae1450560f7
+    --- /dev/null
+    +++ b/tests/unit/commands/test_parser.py
+    @@ -0,0 +1,199 @@
+    +from __future__ import annotations
+    +
+    +import math
+    +
+    +import pytest
+    +
+    +from miniredis.commands.model import (
+    +    Echo,
+    +    Ping,
+    +    SetString,
+    +    TimeToLive,
+    +    Exists,
+    +    Increment,
+    +    HashGetAll,
+    +    ListPop,
+    +    ListPush,
+    +    SetMembers,
+    +    ZRemove,
+    +    ZRangeByScore,
+    +)
+    +from miniredis.commands.parser import CommandParseError, parse_command_request
+    +from miniredis.commands.request import CommandRequest
+    +
+    +
+    +def parse(name: bytes, *args: bytes):
+    +    return parse_command_request(CommandRequest(name, args))
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    ("command_request", "expected"),
+    +    [
+    +        (CommandRequest(b"PING"), Ping()),
+    +        (CommandRequest(b"ping", (b"binary\x00message",)), Ping(b"binary\x00message")),
+    +        (CommandRequest(b"ECHO", (b"\xff\x00",)), Echo(b"\xff\x00")),
+    +    ],
+    +)
+    +def test_parse_ping_and_echo_binary_payloads(
+    +    command_request: CommandRequest, expected: object
+    +) -> None:
+    +    assert parse_command_request(command_request) == expected
+    +
+    +
+    +def test_parse_set_options_are_order_independent() -> None:
+    +    assert parse(b"SET", b"k", b"v", b"PX", b"20", b"NX") == SetString(
+    +        b"k", b"v", only_if="nx", expire_ms=20
+    +    )
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "args",
+    +    [
+    +        (b"k", b"v", b"NX", b"XX"),
+    +        (b"k", b"v", b"EX", b"1", b"PX", b"1"),
+    +        (b"k", b"v", b"EX", b"0"),
+    +        (b"k", b"v", b"PX", b"-1"),
+    +        (b"k", b"v", b"UNKNOWN"),
+    +    ],
+    +)
+    +def test_parse_set_rejects_invalid_entire_option_set(args: tuple[bytes, ...]) -> None:
+    +    with pytest.raises(CommandParseError):
+    +        parse(b"SET", *args)
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    ("command_request", "expected"),
+    +    [
+    +        (CommandRequest(b"EXISTS", (b"a", b"a")), Exists((b"a", b"a"))),
+    +        (CommandRequest(b"INCRBY", (b"a", b"2")), Increment(b"a", 2)),
+    +        (CommandRequest(b"HGETALL", (b"h",)), HashGetAll(b"h")),
+    +        (
+    +            CommandRequest(b"LPUSH", (b"l", b"a", b"b")),
+    +            ListPush(b"l", (b"a", b"b"), left=True),
+    +        ),
+    +        (CommandRequest(b"RPUSH", (b"l", b"a")), ListPush(b"l", (b"a",), left=False)),
+    +        (CommandRequest(b"LPOP", (b"l",)), ListPop(b"l", left=True)),
+    +        (CommandRequest(b"RPOP", (b"l",)), ListPop(b"l", left=False)),
+    +        (CommandRequest(b"SMEMBERS", (b"s",)), SetMembers(b"s")),
+    +        (CommandRequest(b"ZREM", (b"z", b"m")), ZRemove(b"z", (b"m",))),
+    +        (CommandRequest(b"TTL", (b"key",)), TimeToLive(b"key", milliseconds=False)),
+    +        (CommandRequest(b"PTTL", (b"key",)), TimeToLive(b"key", milliseconds=True)),
+    +    ],
+    +)
+    +def test_parse_representative_commands_return_exact_typed_command(
+    +    command_request: CommandRequest, expected: object
+    +) -> None:
+    +    assert parse_command_request(command_request) == expected
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "command_request",
+    +    [
+    +        CommandRequest(b"GET"),
+    +        CommandRequest(b"HSET", (b"h", b"f")),
+    +        CommandRequest(b"LRANGE", (b"l", b"0")),
+    +        CommandRequest(b"SADD", (b"s",)),
+    +        CommandRequest(b"ZADD", (b"z", b"1")),
+    +        CommandRequest(b"ZADD", (b"z", b"1_0", b"m")),
+    +        CommandRequest(b"ZRANGEBYSCORE", (b"z", b"Infinity", b"1")),
+    +        CommandRequest(b"TTL", (b"key", b"extra")),
+    +        CommandRequest(b"UNKNOWN"),
+    +    ],
+    +)
+    +def test_parse_rejects_invalid_requests_before_planning(
+    +    command_request: CommandRequest,
+    +) -> None:
+    +    with pytest.raises(CommandParseError):
+    +        parse_command_request(command_request)
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "value",
+    +    [
+    +        b"0",
+    +        b"-1",
+    +        b"9223372036854775807",
+    +        b"-9223372036854775808",
+    +    ],
+    +)
+    +def test_parse_strict_integer_accepts_int64_extrema(value: bytes) -> None:
+    +    assert parse(b"INCRBY", b"key", value) is not None
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "value",
+    +    [
+    +        b"-0",
+    +        b"01",
+    +        b"+1",
+    +        b" 1",
+    +        b"1 ",
+    +        b"9223372036854775808",
+    +        b"-9223372036854775809",
+    +    ],
+    +)
+    +def test_parse_strict_integer_rejects_noncanonical_and_out_of_range(
+    +    value: bytes,
+    +) -> None:
+    +    with pytest.raises(
+    +        CommandParseError, match="value is not an integer or out of range"
+    +    ):
+    +        parse(b"INCRBY", b"key", value)
+    +
+    +
+    +def test_parse_strict_integer_rejects_python_conversion_limit_before_int() -> None:
+    +    with pytest.raises(
+    +        CommandParseError, match="value is not an integer or out of range"
+    +    ):
+    +        parse(b"INCRBY", b"key", b"9" * 4301)
+    +
+    +
+    +@pytest.mark.parametrize("value", [b"1", b"-1.5", b"1e2", b"inf", b"-inf", b"(1.5"])
+    +def test_parse_score_and_score_bound_accept_canonical_forms(value: bytes) -> None:
+    +    assert parse(b"ZRANGEBYSCORE", b"z", value, b"1") is not None
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    ("bound", "inclusive"),
+    +    [(b"+inf", True), (b"(+inf", False), (b"+INF", True)],
+    +)
+    +def test_parse_bound_accepts_positive_infinity(bound: bytes, inclusive: bool) -> None:
+    +    command = parse(b"ZRANGEBYSCORE", b"z", bound, b"1")
+    +
+    +    assert isinstance(command, ZRangeByScore)
+    +    assert math.isinf(command.minimum.value) and command.minimum.value > 0
+    +    assert command.minimum.inclusive is inclusive
+    +
+    +
+    +@pytest.mark.parametrize("value", [b"inf", b"+inf", b"-inf"])
+    +def test_parse_score_accepts_exact_infinite_forms(value: bytes) -> None:
+    +    assert parse(b"ZADD", b"z", value, b"member") is not None
+    +
+    +
+    +@pytest.mark.parametrize("value", [b"1e999", b"-1e999"])
+    +def test_parse_score_rejects_finite_form_overflow(value: bytes) -> None:
+    +    with pytest.raises(CommandParseError, match="value is not a valid score"):
+    +        parse(b"ZADD", b"z", value, b"member")
+    +
+    +
+    +def test_parse_set_ex_normalizes_only_to_int64_milliseconds() -> None:
+    +    maximum_seconds = (2**63 - 1) // 1000
+    +    assert parse(
+    +        b"SET", b"key", b"value", b"EX", str(maximum_seconds).encode()
+    +    ) == SetString(b"key", b"value", expire_ms=maximum_seconds * 1000)
+    +    with pytest.raises(CommandParseError):
+    +        parse(b"SET", b"key", b"value", b"EX", str(maximum_seconds + 1).encode())
+    +
+    +
+    +def test_parse_set_px_accepts_int64_maximum() -> None:
+    +    assert parse(b"SET", b"key", b"value", b"PX", b"9223372036854775807") == SetString(
+    +        b"key", b"value", expire_ms=2**63 - 1
+    +    )
+    +
+    +
+    +@pytest.mark.parametrize(
+    +    "value", [b"Infinity", b"NaN", b"1_0", b" 1", b"+Infinity", b"\xff"]
+    +)
+    +def test_parse_score_rejects_noncanonical_forms(value: bytes) -> None:
+    +    with pytest.raises(CommandParseError, match="value is not a valid score"):
+    +        parse(b"ZRANGEBYSCORE", b"z", value, b"1")
+    ```
+
+**What this test locks**
+
+It locks exact arity, whole-option-set validation, binary payload preservation, canonical integer and score syntax, and one concrete typed result for each supported command family.
+
+**How it constructs the counterexample**
+
+Parameterized invalid requests vary one syntax boundary at a time and require `CommandParseError` before any planner or database exists.
+
+**Key test statement**
+
+```python
+with pytest.raises(CommandParseError):
+    parse_request(CommandRequest(b"SET", args))
+```
+
+**What a failure means**
+
+A failure means malformed input can cross the semantic boundary as a plausible command, forcing later layers to guess which parts were accepted.
+
+### Basic concepts
+
+Parsing is not command execution. It converts a transport-neutral `CommandRequest` into one immutable `Command` dataclass after validating the entire request. A closed union makes the downstream planner exhaustive and carries normalized values such as expiration milliseconds.
+
+Canonical numeric syntax accepts one representation for the same value. That prevents Python conveniences such as underscores, surrounding whitespace, `-0`, or unbounded integer conversion from silently widening the public protocol.
+
+### Why this mechanism is necessary
+
+If raw bytes and option flags survive into planning, validation becomes interleaved with state lookup and mutation. Whole-request parsing keeps invalid input side-effect free, lets Direct and RESP2 share the same rules, and makes command traits inspectable by type rather than by command-name strings.
+
+### Runtime mental model
+
+An adapter creates `CommandRequest(name, args)`. `parse_request` uppercases only the command name, checks arity and every option, converts bounded numeric fields, and returns one frozen dataclass. On any invalid byte sequence it raises before the request can enter state planning.
+
+### Mechanism blocks
+
+#### Closed command vocabulary and strict parser
+
+Validate the complete binary request first, then freeze it into one typed value that downstream planning can handle without reparsing options.
+
+??? note "File diff: src/miniredis/commands/model.py"
+    ```diff
+    diff --git a/src/miniredis/commands/model.py b/src/miniredis/commands/model.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..db978c7fbdac19c1bbe18ae254149a434b6d5df5
+    --- /dev/null
+    +++ b/src/miniredis/commands/model.py
+    @@ -0,0 +1,221 @@
+    +from __future__ import annotations
+    +
+    +from dataclasses import dataclass
+    +from typing import Literal, TypeAlias
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Ping:
+    +    message: bytes | None = None
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Echo:
+    +    message: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetString:
+    +    key: bytes
+    +    value: bytes
+    +    only_if: Literal["nx", "xx"] | None = None
+    +    expire_ms: int | None = None
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class GetString:
+    +    key: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Delete:
+    +    keys: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Exists:
+    +    keys: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class TypeOf:
+    +    key: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Increment:
+    +    key: bytes
+    +    amount: int
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class HashSet:
+    +    key: bytes
+    +    pairs: tuple[tuple[bytes, bytes], ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class HashGet:
+    +    key: bytes
+    +    field: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class HashDelete:
+    +    key: bytes
+    +    fields: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class HashGetAll:
+    +    key: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class HashIncrement:
+    +    key: bytes
+    +    field: bytes
+    +    amount: int
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ListPush:
+    +    key: bytes
+    +    values: tuple[bytes, ...]
+    +    left: bool
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ListPop:
+    +    key: bytes
+    +    left: bool
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ListRange:
+    +    key: bytes
+    +    start: int
+    +    stop: int
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetAdd:
+    +    key: bytes
+    +    members: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetRemove:
+    +    key: bytes
+    +    members: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetIsMember:
+    +    key: bytes
+    +    member: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetMembers:
+    +    key: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class SetIntersection:
+    +    keys: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ScoreBound:
+    +    value: float
+    +    inclusive: bool
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZAdd:
+    +    key: bytes
+    +    pairs: tuple[tuple[float, bytes], ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZRemove:
+    +    key: bytes
+    +    members: tuple[bytes, ...]
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZScore:
+    +    key: bytes
+    +    member: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZRank:
+    +    key: bytes
+    +    member: bytes
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZRange:
+    +    key: bytes
+    +    start: int
+    +    stop: int
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ZRangeByScore:
+    +    key: bytes
+    +    minimum: ScoreBound
+    +    maximum: ScoreBound
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Expire:
+    +    key: bytes
+    +    seconds: int
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class TimeToLive:
+    +    key: bytes
+    +    milliseconds: bool
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class Persist:
+    +    key: bytes
+    +
+    +
+    +Command: TypeAlias = (
+    +    Ping
+    +    | Echo
+    +    | SetString
+    +    | GetString
+    +    | Delete
+    +    | Exists
+    +    | TypeOf
+    +    | Increment
+    +    | HashSet
+    +    | HashGet
+    +    | HashDelete
+    +    | HashGetAll
+    +    | HashIncrement
+    +    | ListPush
+    +    | ListPop
+    +    | ListRange
+    +    | SetAdd
+    +    | SetRemove
+    +    | SetIsMember
+    +    | SetMembers
+    +    | SetIntersection
+    +    | ZAdd
+    +    | ZRemove
+    +    | ZScore
+    +    | ZRank
+    +    | ZRange
+    +    | ZRangeByScore
+    +    | Expire
+    +    | TimeToLive
+    +    | Persist
+    +)
+    ```
+
+**What it is and why it appears**
+
+The model is a closed vocabulary of immutable command values such as `SetString`, `HashSet`, and `ZRangeByScore`.
+
+**Runtime role**
+
+Planners pattern-match on these types and receive already-normalized options instead of revisiting raw argument positions.
+
+**Key code**
+
+```python
+class SetString:
+    key: bytes
+    value: bytes
+    only_if: Literal["nx", "xx"] | None = None
+    expire_ms: int | None = None
+```
+
+**Statement understanding**
+
+The type can represent only one condition and one normalized duration; conflicting raw options have no valid constructed state.
+
+??? note "File diff: src/miniredis/commands/parser.py"
+    ```diff
+    diff --git a/src/miniredis/commands/parser.py b/src/miniredis/commands/parser.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..aaeb44009f85d5b6256d323d4c23a3ddd22072c7
+    --- /dev/null
+    +++ b/src/miniredis/commands/parser.py
+    @@ -0,0 +1,249 @@
+    +from __future__ import annotations
+    +
+    +import math
+    +import re
+    +from typing import Literal
+    +
+    +from miniredis.commands.model import (
+    +    Command,
+    +    Delete,
+    +    Echo,
+    +    Exists,
+    +    Expire,
+    +    GetString,
+    +    HashDelete,
+    +    HashGet,
+    +    HashGetAll,
+    +    HashIncrement,
+    +    HashSet,
+    +    Increment,
+    +    ListPop,
+    +    ListPush,
+    +    ListRange,
+    +    Persist,
+    +    Ping,
+    +    ScoreBound,
+    +    SetAdd,
+    +    SetIntersection,
+    +    SetIsMember,
+    +    SetMembers,
+    +    SetRemove,
+    +    SetString,
+    +    TimeToLive,
+    +    TypeOf,
+    +    ZAdd,
+    +    ZRange,
+    +    ZRangeByScore,
+    +    ZRank,
+    +    ZRemove,
+    +    ZScore,
+    +)
+    +from miniredis.commands.request import CommandRequest
+    +
+    +
+    +class CommandParseError(ValueError):
+    +    pass
+    +
+    +
+    +INT64_MIN = -(2**63)
+    +INT64_MAX = 2**63 - 1
+    +_INTEGER = re.compile(rb"-?(?:0|[1-9][0-9]*)\Z")
+    +_SCORE = re.compile(
+    +    rb"-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?(?:0|[1-9][0-9]*))?\Z"
+    +)
+    +
+    +
+    +def parse_int64(value: bytes) -> int:
+    +    if _INTEGER.fullmatch(value) is None or value == b"-0":
+    +        raise CommandParseError("value is not an integer or out of range")
+    +    if len(value.removeprefix(b"-")) > 19:
+    +        raise CommandParseError("value is not an integer or out of range")
+    +    try:
+    +        number = int(value)
+    +    except ValueError as error:
+    +        raise CommandParseError("value is not an integer or out of range") from error
+    +    if not INT64_MIN <= number <= INT64_MAX:
+    +        raise CommandParseError("value is not an integer or out of range")
+    +    return number
+    +
+    +
+    +def parse_score(value: bytes) -> float:
+    +    try:
+    +        normalized = value.decode("ascii").lower()
+    +    except UnicodeDecodeError as error:
+    +        raise CommandParseError("value is not a valid score") from error
+    +    if normalized in {"inf", "+inf", "-inf"}:
+    +        return float(normalized)
+    +    if _SCORE.fullmatch(value) is None:
+    +        raise CommandParseError("value is not a valid score")
+    +    number = float(normalized)
+    +    if math.isnan(number) or math.isinf(number):
+    +        raise CommandParseError("value is not a valid score")
+    +    return number
+    +
+    +
+    +def _parse_bound(value: bytes) -> ScoreBound:
+    +    if not value:
+    +        raise CommandParseError("value is not a valid score")
+    +    exclusive = value.startswith(b"(")
+    +    score = value[1:] if exclusive else value
+    +    if not score:
+    +        raise CommandParseError("value is not a valid score")
+    +    return ScoreBound(parse_score(score), inclusive=not exclusive)
+    +
+    +
+    +def _require_arity(name: bytes, args: tuple[bytes, ...], *allowed: int) -> None:
+    +    if len(args) not in allowed:
+    +        raise CommandParseError(
+    +            f"wrong number of arguments for {name.decode('ascii', 'replace')}"
+    +        )
+    +
+    +
+    +def _require_min_arity(name: bytes, args: tuple[bytes, ...], minimum: int) -> None:
+    +    if len(args) < minimum:
+    +        raise CommandParseError(
+    +            f"wrong number of arguments for {name.decode('ascii', 'replace')}"
+    +        )
+    +
+    +
+    +def _byte_pairs(values: tuple[bytes, ...]) -> tuple[tuple[bytes, bytes], ...]:
+    +    return tuple(zip(values[::2], values[1::2], strict=True))
+    +
+    +
+    +def _score_pairs(values: tuple[bytes, ...]) -> tuple[tuple[float, bytes], ...]:
+    +    return tuple(
+    +        (parse_score(score), member)
+    +        for score, member in zip(values[::2], values[1::2], strict=True)
+    +    )
+    +
+    +
+    +def _parse_set(args: tuple[bytes, ...]) -> SetString:
+    +    _require_min_arity(b"SET", args, 2)
+    +    only_if: Literal["nx", "xx"] | None = None
+    +    expire_ms: int | None = None
+    +    index = 2
+    +    while index < len(args):
+    +        option = args[index].lower()
+    +        if option in {b"nx", b"xx"}:
+    +            requested: Literal["nx", "xx"] = "nx" if option == b"nx" else "xx"
+    +            if only_if is not None:
+    +                raise CommandParseError("conflicting SET condition")
+    +            only_if = requested
+    +            index += 1
+    +        elif option in {b"ex", b"px"}:
+    +            if expire_ms is not None or index + 1 >= len(args):
+    +                raise CommandParseError("invalid SET expiration")
+    +            duration = parse_int64(args[index + 1])
+    +            if duration <= 0:
+    +                raise CommandParseError("invalid SET expiration")
+    +            if option == b"ex" and duration > INT64_MAX // 1000:
+    +                raise CommandParseError("invalid SET expiration")
+    +            expire_ms = duration * 1000 if option == b"ex" else duration
+    +            index += 2
+    +        else:
+    +            raise CommandParseError("invalid SET option")
+    +    return SetString(args[0], args[1], only_if=only_if, expire_ms=expire_ms)
+    +
+    +
+    +def parse_command_request(request: CommandRequest) -> Command:
+    +    name = request.name.upper()
+    +    args = request.args
+    +    match name:
+    +        case b"PING":
+    +            _require_arity(name, args, 0, 1)
+    +            return Ping(args[0] if args else None)
+    +        case b"ECHO":
+    +            _require_arity(name, args, 1)
+    +            return Echo(args[0])
+    +        case b"DEL":
+    +            _require_min_arity(name, args, 1)
+    +            return Delete(args)
+    +        case b"EXISTS":
+    +            _require_min_arity(name, args, 1)
+    +            return Exists(args)
+    +        case b"TYPE":
+    +            _require_arity(name, args, 1)
+    +            return TypeOf(args[0])
+    +        case b"GET":
+    +            _require_arity(name, args, 1)
+    +            return GetString(args[0])
+    +        case b"SET":
+    +            return _parse_set(args)
+    +        case b"INCR":
+    +            _require_arity(name, args, 1)
+    +            return Increment(args[0], 1)
+    +        case b"INCRBY":
+    +            _require_arity(name, args, 2)
+    +            return Increment(args[0], parse_int64(args[1]))
+    +        case b"HSET":
+    +            _require_min_arity(name, args, 3)
+    +            if len(args) % 2 == 0:
+    +                raise CommandParseError("wrong number of arguments for HSET")
+    +            return HashSet(args[0], _byte_pairs(args[1:]))
+    +        case b"HGET":
+    +            _require_arity(name, args, 2)
+    +            return HashGet(args[0], args[1])
+    +        case b"HDEL":
+    +            _require_min_arity(name, args, 2)
+    +            return HashDelete(args[0], args[1:])
+    +        case b"HGETALL":
+    +            _require_arity(name, args, 1)
+    +            return HashGetAll(args[0])
+    +        case b"HINCRBY":
+    +            _require_arity(name, args, 3)
+    +            return HashIncrement(args[0], args[1], parse_int64(args[2]))
+    +        case b"LPUSH" | b"RPUSH":
+    +            _require_min_arity(name, args, 2)
+    +            return ListPush(args[0], args[1:], left=name == b"LPUSH")
+    +        case b"LPOP" | b"RPOP":
+    +            _require_arity(name, args, 1)
+    +            return ListPop(args[0], left=name == b"LPOP")
+    +        case b"LRANGE":
+    +            _require_arity(name, args, 3)
+    +            return ListRange(args[0], parse_int64(args[1]), parse_int64(args[2]))
+    +        case b"SADD":
+    +            _require_min_arity(name, args, 2)
+    +            return SetAdd(args[0], args[1:])
+    +        case b"SREM":
+    +            _require_min_arity(name, args, 2)
+    +            return SetRemove(args[0], args[1:])
+    +        case b"SISMEMBER":
+    +            _require_arity(name, args, 2)
+    +            return SetIsMember(args[0], args[1])
+    +        case b"SMEMBERS":
+    +            _require_arity(name, args, 1)
+    +            return SetMembers(args[0])
+    +        case b"SINTER":
+    +            _require_min_arity(name, args, 1)
+    +            return SetIntersection(args)
+    +        case b"ZADD":
+    +            _require_min_arity(name, args, 3)
+    +            if len(args) % 2 == 0:
+    +                raise CommandParseError("wrong number of arguments for ZADD")
+    +            return ZAdd(args[0], _score_pairs(args[1:]))
+    +        case b"ZREM":
+    +            _require_min_arity(name, args, 2)
+    +            return ZRemove(args[0], args[1:])
+    +        case b"ZSCORE":
+    +            _require_arity(name, args, 2)
+    +            return ZScore(args[0], args[1])
+    +        case b"ZRANK":
+    +            _require_arity(name, args, 2)
+    +            return ZRank(args[0], args[1])
+    +        case b"ZRANGE":
+    +            _require_arity(name, args, 3)
+    +            return ZRange(args[0], parse_int64(args[1]), parse_int64(args[2]))
+    +        case b"ZRANGEBYSCORE":
+    +            _require_arity(name, args, 3)
+    +            return ZRangeByScore(args[0], _parse_bound(args[1]), _parse_bound(args[2]))
+    +        case b"EXPIRE":
+    +            _require_arity(name, args, 2)
+    +            return Expire(args[0], parse_int64(args[1]))
+    +        case b"TTL" | b"PTTL":
+    +            _require_arity(name, args, 1)
+    +            return TimeToLive(args[0], milliseconds=name == b"PTTL")
+    +        case b"PERSIST":
+    +            _require_arity(name, args, 1)
+    +            return Persist(args[0])
+    +        case _:
+    +            raise CommandParseError("unknown command")
+    ```
+
+**What it is and why it appears**
+
+The parser owns public syntax, arity, option conflicts, and bounded numeric conversion.
+
+**Runtime role**
+
+It maps one complete request to one typed command or raises `CommandParseError` without touching runtime state.
+
+**Key code**
+
+```python
+if not INT64_MIN <= number <= INT64_MAX:
+    raise CommandParseError("value is not an integer or out of range")
+```
+
+**Statement understanding**
+
+Successful Python conversion is not enough; the protocol's signed 64-bit boundary remains an explicit contract.
+
+### Verification evidence
+
+Run `uv run pytest -q $(cat journey/stages/02-typed-commands/tests.txt)`. It proves syntax-to-type behavior, not planner replies or serialized execution.
+
+### Durable takeaways
+
+Requests stay binary. Parsing validates the whole request before state access. Typed commands carry normalized meaning, and protocol numeric bounds are explicit rather than inherited from Python.
+
+### Explain it in your own words
+
+The parser is a semantic firewall: adapters provide bytes, it either produces one fully valid typed command or nothing crosses the boundary. Every later layer can reason about command meaning without reparsing public syntax.
+
+### Textbook
+
+[Chapter 2](https://github.com/system-in-miniature/mini-redis/blob/main/docs/tutorial/02-command-life.md)
+
+[Compare this stage on GitHub](https://github.com/system-in-miniature/mini-redis/compare/f68b061...67f0d73)
+
+After finishing, run `python -m journey.tools.build_journey check 2` to verify the learner workspace.
+
+[Complete reference patch / 完整参考补丁](https://github.com/system-in-miniature/mini-redis/blob/main/journey/stages/02-typed-commands/stage.patch)

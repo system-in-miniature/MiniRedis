@@ -127,8 +127,11 @@ It turns one mailbox event into one outcome and prevents later events from obser
 ##### Key code
 
 ```python
-event = await self.mailbox.take()
-await self._handle_event(event)
+message = await self.mailbox.take()
+await self._run_gate.wait()
+if isinstance(message, _StopExecutor):
+    return
+await self._execute(message)
 ```
 
 ##### Statement understanding
@@ -149,9 +152,8 @@ It submits binary requests, awaits executor-owned outcomes, and maps inactive li
 ##### Key code
 
 ```python
-submitted = self._runtime.submit_request(
-    session_id=self.session_id,
-    request=request,
+submitted = self.runtime.executor.submit(
+    session_id=self.session_id, command=command
 )
 ```
 
@@ -372,8 +374,11 @@ Executor 拥有已接受 Token、Mailbox Worker、规划、Control Event 与终�
 ##### 关键代码
 
 ```python
-event = await self.mailbox.take()
-await self._handle_event(event)
+message = await self.mailbox.take()
+await self._run_gate.wait()
+if isinstance(message, _StopExecutor):
+    return
+await self._execute(message)
 ```
 
 ##### 关键语句理解
@@ -394,9 +399,8 @@ Direct Adapter 是第一个公开 Client，不包含数据结构语义。
 ##### 关键代码
 
 ```python
-submitted = self._runtime.submit_request(
-    session_id=self.session_id,
-    request=request,
+submitted = self.runtime.executor.submit(
+    session_id=self.session_id, command=command
 )
 ```
 

@@ -1,0 +1,567 @@
+# Stage 06 · Set and Sorted Set projections
+
+### Goal
+
+Add uniqueness and score-order semantics with deterministic public projections.
+
+??? note "Deliverable files"
+    - `src/miniredis/core/planner.py`
+    - `src/miniredis/core/set_planner.py`
+    - `src/miniredis/core/zset_planner.py`
+    - `tests/contract/test_sets.py`
+    - `tests/contract/test_sorted_sets.py`
+
+### The problem at this point
+
+Python sets have no stable iteration order, and a Sorted Set must define ties as well as score order. Multi-item parse failures must also reject the whole request before an early valid pair can mutate anything.
+
+### Test contract
+
+#### See the failure first
+
+One contract intersects a missing Set with a later String and still requires `WRONGTYPE`; stopping after the missing key would hide an invalid operand. Another submits a valid ZADD pair followed by `nan` and requires no member or commit to appear.
+
+??? note "File diff: tests/contract/test_sets.py"
+    ```diff
+    diff --git a/tests/contract/test_sets.py b/tests/contract/test_sets.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..e4489f857b21b59496aa28d9d005e28ccabfac63
+    --- /dev/null
+    +++ b/tests/contract/test_sets.py
+    @@ -0,0 +1,41 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest, MiniRedis
+    +from miniredis.core.reply import Bytes, Failure, Items, Number
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_set_counts_and_membership():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        assert await c.execute(
+    +            CommandRequest(b"SADD", (b"s", b"a", b"a", b"b"))
+    +        ) == Number(2)
+    +        assert await c.execute(CommandRequest(b"SISMEMBER", (b"s", b"a"))) == Number(1)
+    +        assert await c.execute(CommandRequest(b"SREM", (b"s", b"a", b"x"))) == Number(1)
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_sinter_does_not_hide_later_wrongtype_after_missing_key():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        await c.execute(CommandRequest(b"SET", (b"wrong", b"x")))
+    +        reply = await c.execute(CommandRequest(b"SINTER", (b"missing", b"wrong")))
+    +        assert isinstance(reply, Failure)
+    +        assert reply.code == "WRONGTYPE"
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_smembers_sinter_and_last_member_removal():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        await c.execute(CommandRequest(b"SADD", (b"a", b"x", b"y")))
+    +        await c.execute(CommandRequest(b"SADD", (b"b", b"y", b"z")))
+    +        assert await c.execute(CommandRequest(b"SMEMBERS", (b"a",))) == Items(
+    +            (Bytes(b"x"), Bytes(b"y"))
+    +        )
+    +        assert await c.execute(CommandRequest(b"SINTER", (b"a", b"b"))) == Items(
+    +            (Bytes(b"y"),)
+    +        )
+    +        assert await c.execute(CommandRequest(b"SREM", (b"b", b"y", b"z"))) == Number(2)
+    +        assert await c.execute(CommandRequest(b"TYPE", (b"b",))) == Bytes(b"none")
+    ```
+
+**What this test locks**
+
+It locks uniqueness counts, deterministic members, full-operand type checks, intersection, and last-member removal.
+
+**How it constructs the counterexample**
+
+It places a missing key before a wrong-type key so an incorrect early-empty optimization returns the wrong semantic result.
+
+**Key test statement**
+
+```python
+assert reply.code == "WRONGTYPE"
+```
+
+**What a failure means**
+
+Optimization changed validation semantics or unordered storage leaked into a public reply.
+
+??? note "File diff: tests/contract/test_sorted_sets.py"
+    ```diff
+    diff --git a/tests/contract/test_sorted_sets.py b/tests/contract/test_sorted_sets.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..c09f296c8792a896b9cf6bebb9419e6054280bba
+    --- /dev/null
+    +++ b/tests/contract/test_sorted_sets.py
+    @@ -0,0 +1,47 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest, MiniRedis
+    +from miniredis.core.reply import Bytes, Failure, Items, Number
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_zset_orders_equal_scores_by_member_bytes():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        assert await c.execute(
+    +            CommandRequest(b"ZADD", (b"z", b"1", b"b", b"1", b"a", b"2", b"c"))
+    +        ) == Number(3)
+    +        assert await c.execute(CommandRequest(b"ZRANGE", (b"z", b"0", b"-1"))) == Items(
+    +            (Bytes(b"a"), Bytes(b"b"), Bytes(b"c"))
+    +        )
+    +        assert await c.execute(CommandRequest(b"ZRANK", (b"z", b"b"))) == Number(1)
+    +        assert await c.execute(
+    +            CommandRequest(b"ZRANGEBYSCORE", (b"z", b"(1", b"+inf"))
+    +        ) == Items((Bytes(b"c"),))
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_nan_in_later_pair_prevents_all_mutation():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        before = runtime.debug_commit_seq
+    +        reply = await c.execute(
+    +            CommandRequest(b"ZADD", (b"z", b"1", b"a", b"nan", b"b"))
+    +        )
+    +        assert isinstance(reply, Failure)
+    +        assert runtime.debug_commit_seq == before
+    +        assert await c.execute(CommandRequest(b"ZRANGE", (b"z", b"0", b"-1"))) == Items(
+    +            ()
+    +        )
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_zscore_zrem_and_empty_key_removal():
+    +    async with MiniRedis.open() as runtime:
+    +        c = runtime.direct_client()
+    +        await c.execute(CommandRequest(b"ZADD", (b"z", b"1.5", b"a")))
+    +        assert await c.execute(CommandRequest(b"ZSCORE", (b"z", b"a"))) == Bytes(b"1.5")
+    +        assert await c.execute(
+    +            CommandRequest(b"ZREM", (b"z", b"a", b"missing"))
+    +        ) == Number(1)
+    +        assert await c.execute(CommandRequest(b"TYPE", (b"z",))) == Bytes(b"none")
+    ```
+
+**What this test locks**
+
+It locks score/member ordering, binary tie-breaks, exclusive bounds, ranks, score formatting, whole-request validation, and empty-key removal.
+
+**How it constructs the counterexample**
+
+Equal scores arrive in reverse binary order, and a later NaN follows an earlier valid pair.
+
+**Key test statement**
+
+```python
+assert runtime.debug_commit_seq == before
+```
+
+**What a failure means**
+
+Score validation was incremental, or result order depends on dictionary insertion rather than the public ordering rule.
+
+### Basic concepts
+
+Set storage owns uniqueness but not presentation order. MiniRedis sorts members by bytes when materializing replies and stored state. Sorted Set storage maps member to score; its total order is `(score, member_bytes)`, which makes equal-score behavior deterministic.
+
+### Why this mechanism is necessary
+
+Deterministic projection separates mathematical collection semantics from Python container iteration. Whole-request parsing and copy-on-plan ensure a later invalid operand cannot leave earlier partial state.
+
+### Runtime mental model
+
+Typed commands already contain validated members and scores. A family planner copies the live collection, calculates counts and ordering, proposes a frozen replacement or deletion, and returns deterministic `Items`/`Number`/`Bytes` replies.
+
+### Mechanism blocks
+
+#### Deterministic Set projection
+
+Keep uniqueness semantics in a set while materializing public multi-item replies in binary order.
+
+??? note "File diff: src/miniredis/core/set_planner.py"
+    ```diff
+    diff --git a/src/miniredis/core/set_planner.py b/src/miniredis/core/set_planner.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..ba915cb4fb370fbc39fd26c0b29d42d6066af9fa
+    --- /dev/null
+    +++ b/src/miniredis/core/set_planner.py
+    @@ -0,0 +1,113 @@
+    +from miniredis.commands import model as cmd
+    +from miniredis.core.commit import (
+    +    CommitOperation,
+    +    DeleteKey,
+    +    DeleteReason,
+    +)
+    +from miniredis.core.database import Database
+    +from miniredis.core.executor import ExecutionPlan
+    +from miniredis.core.planning import (
+    +    WRONGTYPE,
+    +    dedupe_operations,
+    +    lookup,
+    +    make_put,
+    +)
+    +from miniredis.core.reply import Bytes, Items, Number
+    +from miniredis.core.values import SetValue
+    +
+    +
+    +def plan_set(
+    +    command: cmd.Command,
+    +    database: Database,
+    +    now_ms: int,
+    +) -> ExecutionPlan | None:
+    +    match command:
+    +        case cmd.SetAdd(key, members):
+    +            previous, expired = lookup(database, key, now_ms)
+    +            if previous is not None and not isinstance(previous.value, SetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            items = set() if previous is None else set(previous.value.items)
+    +            before = len(items)
+    +            items.update(members)
+    +            put = make_put(
+    +                key,
+    +                SetValue(items),
+    +                previous,
+    +                None if previous is None else previous.expire_at_ms,
+    +            )
+    +            return ExecutionPlan(
+    +                Number(len(items) - before),
+    +                expired + (put,),
+    +            )
+    +        case cmd.SetRemove(key, members):
+    +            previous, expired = lookup(database, key, now_ms)
+    +            if previous is None:
+    +                return ExecutionPlan(Number(0), expired)
+    +            if not isinstance(previous.value, SetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            items = set(previous.value.items)
+    +            removed = 0
+    +            for member in dict.fromkeys(members):
+    +                if member in items:
+    +                    items.remove(member)
+    +                    removed += 1
+    +            if removed == 0:
+    +                return ExecutionPlan(Number(0), (), (key,))
+    +            if items:
+    +                operation = make_put(
+    +                    key,
+    +                    SetValue(items),
+    +                    previous,
+    +                    previous.expire_at_ms,
+    +                )
+    +            else:
+    +                operation = DeleteKey(key, DeleteReason.CLIENT)
+    +            return ExecutionPlan(Number(removed), expired + (operation,))
+    +        case cmd.SetIsMember(key, member):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Number(0), expired)
+    +            if not isinstance(entry.value, SetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            return ExecutionPlan(
+    +                Number(int(member in entry.value.items)),
+    +                expired,
+    +                (key,),
+    +            )
+    +        case cmd.SetMembers(key):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Items(()), expired)
+    +            if not isinstance(entry.value, SetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            return ExecutionPlan(
+    +                Items(tuple(Bytes(member) for member in sorted(entry.value.items))),
+    +                expired,
+    +                (key,),
+    +            )
+    +        case cmd.SetIntersection(keys):
+    +            operations: list[CommitOperation] = []
+    +            sets: list[set[bytes] | None] = []
+    +            touches: list[bytes] = []
+    +            for key in keys:
+    +                entry, expired = lookup(database, key, now_ms)
+    +                operations.extend(expired)
+    +                if entry is None:
+    +                    sets.append(None)
+    +                    continue
+    +                if not isinstance(entry.value, SetValue):
+    +                    return ExecutionPlan(WRONGTYPE)
+    +                sets.append(set(entry.value.items))
+    +                touches.append(key)
+    +            if any(items is None for items in sets):
+    +                intersection: set[bytes] = set()
+    +            else:
+    +                concrete = [items for items in sets if items is not None]
+    +                intersection = set.intersection(*concrete)
+    +            return ExecutionPlan(
+    +                Items(tuple(Bytes(member) for member in sorted(intersection))),
+    +                dedupe_operations(operations),
+    +                tuple(touches),
+    +            )
+    +        case _:
+    +            return None
+    ```
+
+**What it is and why it appears**
+
+Set planning owns uniqueness-changing operations and deterministic read projections.
+
+**Runtime role**
+
+It uses live sets for membership math and binary sorting only when returning public items.
+
+**Key code**
+
+```python
+Items(tuple(Bytes(member) for member in sorted(entry.value.items))),
+```
+
+**Statement understanding**
+
+Sorting is a projection rule, not a claim that the live Set is an ordered container.
+
+#### Score order with binary tie-breaks
+
+Order members by score then member bytes, and validate the complete score/member list before proposing mutation.
+
+??? note "File diff: src/miniredis/core/zset_planner.py"
+    ```diff
+    diff --git a/src/miniredis/core/zset_planner.py b/src/miniredis/core/zset_planner.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..07d1b1646d48b659818d53ec35b868460a4d3b5e
+    --- /dev/null
+    +++ b/src/miniredis/core/zset_planner.py
+    @@ -0,0 +1,137 @@
+    +import math
+    +
+    +from miniredis.commands import model as cmd
+    +from miniredis.core.commit import DeleteKey, DeleteReason
+    +from miniredis.core.database import Database
+    +from miniredis.core.executor import ExecutionPlan
+    +from miniredis.core.list_planner import inclusive_slice
+    +from miniredis.core.planning import WRONGTYPE, lookup, make_put
+    +from miniredis.core.reply import Bytes, Items, Number
+    +from miniredis.core.values import ZSetValue
+    +
+    +
+    +def _ordered(scores: dict[bytes, float]) -> list[tuple[bytes, float]]:
+    +    return sorted(scores.items(), key=lambda item: (item[1], item[0]))
+    +
+    +
+    +def _format_score(score: float) -> bytes:
+    +    if math.isinf(score):
+    +        return b"inf" if score > 0 else b"-inf"
+    +    return repr(score).encode("ascii")
+    +
+    +
+    +def _within(score: float, bound: cmd.ScoreBound, *, lower: bool) -> bool:
+    +    if lower:
+    +        return score >= bound.value if bound.inclusive else score > bound.value
+    +    return score <= bound.value if bound.inclusive else score < bound.value
+    +
+    +
+    +def plan_zset(
+    +    command: cmd.Command,
+    +    database: Database,
+    +    now_ms: int,
+    +) -> ExecutionPlan | None:
+    +    match command:
+    +        case cmd.ZAdd(key, pairs):
+    +            previous, expired = lookup(database, key, now_ms)
+    +            if previous is not None and not isinstance(previous.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            scores = {} if previous is None else dict(previous.value.scores)
+    +            previously_present = set(scores)
+    +            newly_added: set[bytes] = set()
+    +            for score, member in pairs:
+    +                if member not in previously_present:
+    +                    newly_added.add(member)
+    +                scores[member] = score
+    +            put = make_put(
+    +                key,
+    +                ZSetValue(scores),
+    +                previous,
+    +                None if previous is None else previous.expire_at_ms,
+    +            )
+    +            return ExecutionPlan(
+    +                Number(len(newly_added)),
+    +                expired + (put,),
+    +            )
+    +        case cmd.ZRemove(key, members):
+    +            previous, expired = lookup(database, key, now_ms)
+    +            if previous is None:
+    +                return ExecutionPlan(Number(0), expired)
+    +            if not isinstance(previous.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            scores = dict(previous.value.scores)
+    +            removed = 0
+    +            for member in dict.fromkeys(members):
+    +                if member in scores:
+    +                    del scores[member]
+    +                    removed += 1
+    +            if removed == 0:
+    +                return ExecutionPlan(Number(0), (), (key,))
+    +            if scores:
+    +                operation = make_put(
+    +                    key,
+    +                    ZSetValue(scores),
+    +                    previous,
+    +                    previous.expire_at_ms,
+    +                )
+    +            else:
+    +                operation = DeleteKey(key, DeleteReason.CLIENT)
+    +            return ExecutionPlan(Number(removed), expired + (operation,))
+    +        case cmd.ZScore(key, member):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Bytes(None), expired)
+    +            if not isinstance(entry.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            score = entry.value.scores.get(member)
+    +            return ExecutionPlan(
+    +                Bytes(None if score is None else _format_score(score)),
+    +                expired,
+    +                (key,),
+    +            )
+    +        case cmd.ZRank(key, member):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Bytes(None), expired)
+    +            if not isinstance(entry.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            rank = next(
+    +                (
+    +                    index
+    +                    for index, (candidate, _score) in enumerate(
+    +                        _ordered(entry.value.scores)
+    +                    )
+    +                    if candidate == member
+    +                ),
+    +                None,
+    +            )
+    +            reply = Bytes(None) if rank is None else Number(rank)
+    +            return ExecutionPlan(reply, expired, (key,))
+    +        case cmd.ZRange(key, start, stop):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Items(()), expired)
+    +            if not isinstance(entry.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            ordered = _ordered(entry.value.scores)
+    +            begin, end = inclusive_slice(len(ordered), start, stop)
+    +            return ExecutionPlan(
+    +                Items(tuple(Bytes(member) for member, _score in ordered[begin:end])),
+    +                expired,
+    +                (key,),
+    +            )
+    +        case cmd.ZRangeByScore(key, minimum, maximum):
+    +            entry, expired = lookup(database, key, now_ms)
+    +            if entry is None:
+    +                return ExecutionPlan(Items(()), expired)
+    +            if not isinstance(entry.value, ZSetValue):
+    +                return ExecutionPlan(WRONGTYPE)
+    +            selected = tuple(
+    +                Bytes(member)
+    +                for member, score in _ordered(entry.value.scores)
+    +                if _within(score, minimum, lower=True)
+    +                and _within(score, maximum, lower=False)
+    +            )
+    +            return ExecutionPlan(Items(selected), expired, (key,))
+    +        case _:
+    +            return None
+    ```
+
+**What it is and why it appears**
+
+Sorted Set planning defines one total member order and score-bound filtering.
+
+**Runtime role**
+
+It copies the member-score map, applies typed pairs, and projects ranges and ranks through `_ordered`.
+
+**Key code**
+
+```python
+return sorted(scores.items(), key=lambda item: (item[1], item[0]))
+```
+
+**Statement understanding**
+
+Member bytes are the stable tie-break when scores compare equal, so results do not inherit insertion order.
+
+#### Set-family routing
+
+Extend the stable planner facade with Set and Sorted Set handlers.
+
+??? note "File diff: src/miniredis/core/planner.py"
+    ```diff
+    diff --git a/src/miniredis/core/planner.py b/src/miniredis/core/planner.py
+    index d8de65d98cbbc4f3382ab5f6700140f9f7262eab..6ab2e0b94da903fcd461e9f293b730f22d55c3a8 100644
+    --- a/src/miniredis/core/planner.py
+    +++ b/src/miniredis/core/planner.py
+    @@ -6,6 +6,8 @@ from miniredis.core.hash_planner import plan_hash
+     from miniredis.core.list_planner import plan_list
+     from miniredis.core.planning import plan_general_and_strings
+     from miniredis.core.reply import Failure
+    +from miniredis.core.set_planner import plan_set
+    +from miniredis.core.zset_planner import plan_zset
+
+
+     class CommandPlanner:
+    @@ -23,6 +25,10 @@ class CommandPlanner:
+                 plan = plan_hash(command, database, now_ms)
+             if plan is None:
+                 plan = plan_list(command, database, now_ms)
+    +        if plan is None:
+    +            plan = plan_set(command, database, now_ms)
+    +        if plan is None:
+    +            plan = plan_zset(command, database, now_ms)
+             if plan is not None:
+                 return plan
+             return ExecutionPlan(Failure("ERR", "unknown command"))
+    ```
+
+**What it is and why it appears**
+
+The planner facade adds Set and Sorted Set handlers after earlier families.
+
+**Runtime role**
+
+It keeps one executor-facing planning call while preserving per-family ownership.
+
+**Key code**
+
+```python
+if plan is None:
+    plan = plan_zset(command, database, now_ms)
+```
+
+**Statement understanding**
+
+Routing order does not alter semantics because each typed command has exactly one owning family.
+
+### Verification evidence
+
+Run `uv run pytest -q $(cat journey/stages/06-sets-and-sorted-sets/tests.txt)`. It proves deterministic projections and all-or-nothing validation for both families.
+
+### Durable takeaways
+
+Container order and public order are separate. Equal scores require an explicit tie-break. A later invalid argument prevents every earlier proposed mutation.
+
+### Explain it in your own words
+
+Sets use Python containers for efficient mathematical operations but sort at the boundary. Sorted Sets define a complete `(score, bytes)` order. Both planners return one deterministic proposal rather than mutating as they parse.
+
+### Textbook
+
+[Chapter 3](https://github.com/system-in-miniature/mini-redis/blob/main/docs/tutorial/03-data-types.md)
+
+[Compare this stage on GitHub](https://github.com/system-in-miniature/mini-redis/compare/eb41b6e...79fc734)
+
+After finishing, run `python -m journey.tools.build_journey check 6` to verify the learner workspace.
+
+[Complete reference patch / 完整参考补丁](https://github.com/system-in-miniature/mini-redis/blob/main/journey/stages/06-sets-and-sorted-sets/stage.patch)

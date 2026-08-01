@@ -241,7 +241,10 @@ It detaches from a live source, cancels streaming ownership, clears queued old h
 
 ```python
 result = await self._replica.executor.promote_replica(self._generation)
-self._state = ReplicaSinkState.PROMOTED
+if not result.writable:
+    self._state = ReplicaSinkState.FAILED
+    self._signal_status_change()
+    raise RuntimeError("replica generation is no longer promotable")
 ```
 
 ##### Statement understanding
@@ -263,7 +266,8 @@ Mailbox order places promotion after earlier applies; generation equality author
 
 ```python
 if message.generation != self._active_source_generation:
-    message.future.set_result(PromotionResult(self.database.commit_seq, False))
+    message.future.set_result(False)
+    return
 ```
 
 ##### Statement understanding
@@ -328,10 +332,22 @@ It recovers before opening admission, turns worker failure into runtime failure,
 ##### Key code
 
 ```python
-await self._snapshot_manager.close()
-await self._aof_writer.close()
-await sink.drain_and_stop(self.config.replica_drain_grace_ms)
-await self.executor.stop_after_shutdown_barrier()
+if self._snapshot_manager is not None:
+    await self._snapshot_manager.close()
+self._trace_lifecycle("snapshot-job-done")
+
+if self._aof_writer is not None:
+    if crash:
+        await asyncio.shield(self._aof_writer.crash_close())
+    else:
+        await asyncio.shield(self._aof_writer.close())
+self._trace_lifecycle("aof-closed")
+
+for sink in tuple(self._owned_replica_sinks):
+    if crash:
+        await sink.source_crashed()
+    else:
+        await sink.drain_and_stop(self.config.replica_drain_grace_ms)
 ```
 
 ##### Statement understanding
@@ -596,7 +612,10 @@ Sink 增加 Promotion、Source Loss、有界 Drain 与 Stopped 状态转换。
 
 ```python
 result = await self._replica.executor.promote_replica(self._generation)
-self._state = ReplicaSinkState.PROMOTED
+if not result.writable:
+    self._state = ReplicaSinkState.FAILED
+    self._signal_status_change()
+    raise RuntimeError("replica generation is no longer promotable")
 ```
 
 ##### 关键语句理解
@@ -618,7 +637,8 @@ Mailbox 顺序把 Promotion 放在更早 Apply 后面；Generation 相等才授�
 
 ```python
 if message.generation != self._active_source_generation:
-    message.future.set_result(PromotionResult(self.database.commit_seq, False))
+    message.future.set_result(False)
+    return
 ```
 
 ##### 关键语句理解
@@ -683,10 +703,22 @@ Runtime 成为 Recovery、Durability Worker、Snapshot、Replica Link 与 Execut
 ##### 关键代码
 
 ```python
-await self._snapshot_manager.close()
-await self._aof_writer.close()
-await sink.drain_and_stop(self.config.replica_drain_grace_ms)
-await self.executor.stop_after_shutdown_barrier()
+if self._snapshot_manager is not None:
+    await self._snapshot_manager.close()
+self._trace_lifecycle("snapshot-job-done")
+
+if self._aof_writer is not None:
+    if crash:
+        await asyncio.shield(self._aof_writer.crash_close())
+    else:
+        await asyncio.shield(self._aof_writer.close())
+self._trace_lifecycle("aof-closed")
+
+for sink in tuple(self._owned_replica_sinks):
+    if crash:
+        await sink.source_crashed()
+    else:
+        await sink.drain_and_stop(self.config.replica_drain_grace_ms)
 ```
 
 ##### 关键语句理解

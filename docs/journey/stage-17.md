@@ -1,0 +1,1238 @@
+# Stage 17 · Asynchronous replication
+
+### Goal
+
+Attach a replica without losing the commits concurrent with snapshot installation, while keeping replica delay and failure outside the primary write path.
+
+??? note "Deliverable files"
+    - `src/miniredis/commands/model.py`
+    - `src/miniredis/config.py`
+    - `src/miniredis/core/executor.py`
+    - `src/miniredis/replication/sink.py`
+    - `src/miniredis/runtime.py`
+    - `tests/helpers/runtime.py`
+    - `tests/replication/test_sink_attach.py`
+    - `tests/replication/test_sink_failure_isolation.py`
+    - `tests/replication/test_sink_lag.py`
+    - `tests/replication/test_sink_overflow.py`
+    - `tests/unit/commands/test_command_traits.py`
+
+### The problem at this point
+
+A snapshot alone is already stale when installation finishes. The primary must establish one ordered boundary: state through sequence N is in the image, and every commit after N belongs to the stream. That stream cannot be an unbounded queue or a synchronous dependency of acknowledged writes.
+
+### Test contract
+
+#### See the failure first
+
+A write committed while installation is paused can disappear between snapshot and stream. A paused follower can consume unlimited memory or stall the primary. A replica apply exception can kill healthy primary traffic. Finally, a read-only check based on a short command-name list can accidentally allow a new mutating command.
+
+??? note "File diff: tests/helpers/runtime.py"
+    ```diff
+    diff --git a/tests/helpers/runtime.py b/tests/helpers/runtime.py
+    index ce21d46eb6dc3c067db30674e9c00a74513a2c70..73d7f4cb16db30bca888f59c6dee1daa75990fcd 100644
+    --- a/tests/helpers/runtime.py
+    +++ b/tests/helpers/runtime.py
+    @@ -39,6 +39,7 @@ async def open_test_runtime(
+         aof_appender=None,
+         config=None,
+         snapshot_write_gate: bool = False,
+    +    replica_apply_failure: BaseException | None = None,
+     ) -> TestMiniRedis:
+         loop = asyncio.get_running_loop()
+         snapshot_gate = GateSnapshotFileOps(loop) if snapshot_write_gate else None
+    @@ -49,6 +50,7 @@ async def open_test_runtime(
+             test_hooks=_RuntimeTestHooks(
+                 aof_appender=aof_appender,
+                 snapshot_ops=snapshot_gate,
+    +            replica_apply_failure=replica_apply_failure,
+             ),
+         )
+         if snapshot_gate is not None:
+    ```
+
+**What this test locks**
+
+The helper exposes production-shaped gates and one-shot apply failure injection without replacing the replication machinery.
+
+**How it constructs the counterexample**
+
+It passes the failure through runtime-owned test hooks into the real executor.
+
+**Key test statement**
+
+```python
+replica_apply_failure=replica_apply_failure,
+```
+
+**What a failure means**
+
+The tests would prove a fake link rather than the runtime path learners inspect.
+
+??? note "File diff: tests/replication/test_sink_attach.py"
+    ```diff
+    diff --git a/tests/replication/test_sink_attach.py b/tests/replication/test_sink_attach.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..8d585882b79399e5686b5be3bca84cce2b2280e0
+    --- /dev/null
+    +++ b/tests/replication/test_sink_attach.py
+    @@ -0,0 +1,66 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.reply import Bytes, Ok
+    +from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_attach_registers_incremental_stream_with_snapshot_capture():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    client = primary.direct_client()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"before", b"1"))
+    +    ) == Ok()
+    +
+    +    install_gate = asyncio.Event()
+    +    sink = ReplicaSink(
+    +        replica,
+    +        queue_limit=4,
+    +        install_gate=install_gate,
+    +    )
+    +    attaching = asyncio.create_task(primary.attach_replica(sink))
+    +    await sink.attachment_captured.wait()
+    +
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"during", b"2"))
+    +    ) == Ok()
+    +    assert sink.status.baseline_seq == 1
+    +    assert sink.status.queued == 1
+    +
+    +    install_gate.set()
+    +    await attaching
+    +    await sink.wait_until_applied(2)
+    +
+    +    replica_client = replica.direct_client()
+    +    assert await replica_client.execute(
+    +        CommandRequest(b"GET", (b"before",))
+    +    ) == Bytes(b"1")
+    +    assert await replica_client.execute(
+    +        CommandRequest(b"GET", (b"during",))
+    +    ) == Bytes(b"2")
+    +    assert sink.status.state is ReplicaSinkState.STREAMING
+    +    assert sink.status.applied_seq == 2
+    +    await primary.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_attached_replica_rejects_user_writes():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +
+    +    reply = await replica.direct_client().execute(
+    +        CommandRequest(b"SET", (b"k", b"v"))
+    +    )
+    +
+    +    assert reply.code == "READONLY"
+    +    assert replica.debug_commit_seq == sink.status.applied_seq
+    +    await primary.close()
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks the snapshot-to-stream handoff and the replica read-only boundary.
+
+**How it constructs the counterexample**
+
+It pauses snapshot installation after attachment capture, commits another write, then verifies both baseline and queued state on the replica.
+
+**Key test statement**
+
+```python
+assert sink.status.baseline_seq == 1
+assert sink.status.queued == 1
+```
+
+**What a failure means**
+
+Capture and stream registration were not one ordered primary action, or a following runtime still accepts dataset writes.
+
+??? note "File diff: tests/replication/test_sink_failure_isolation.py"
+    ```diff
+    diff --git a/tests/replication/test_sink_failure_isolation.py b/tests/replication/test_sink_failure_isolation.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..46c30763015431dd48eea639540c9b00b5e164ae
+    --- /dev/null
+    +++ b/tests/replication/test_sink_failure_isolation.py
+    @@ -0,0 +1,28 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.reply import Ok
+    +from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_replica_apply_exception_detaches_only_that_sink():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime(
+    +        replica_apply_failure=RuntimeError("replica failed"),
+    +    )
+    +    sink = ReplicaSink(replica, queue_limit=2)
+    +    await primary.attach_replica(sink)
+    +
+    +    assert await primary.direct_client().execute(
+    +        CommandRequest(b"SET", (b"k", b"v"))
+    +    ) == Ok()
+    +    await sink.wait_until_stopped()
+    +
+    +    assert sink.status.state is ReplicaSinkState.FAILED
+    +    assert primary.debug_commit_seq == 1
+    +    assert primary.state.name == "RUNNING"
+    +    assert primary.debug_stats().replica_links == 0
+    +    await primary.close()
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks failure isolation between one replica link and the primary executor.
+
+**How it constructs the counterexample**
+
+It injects an exception into replica application after the primary accepts a commit.
+
+**Key test statement**
+
+```python
+assert sink.status.state is ReplicaSinkState.FAILED
+assert primary.state.name == "RUNNING"
+```
+
+**What a failure means**
+
+Replica work still owns or contaminates the primary request outcome.
+
+??? note "File diff: tests/replication/test_sink_lag.py"
+    ```diff
+    diff --git a/tests/replication/test_sink_lag.py b/tests/replication/test_sink_lag.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..143690b69530e078f9eac7e818b03b45afbe9f38
+    --- /dev/null
+    +++ b/tests/replication/test_sink_lag.py
+    @@ -0,0 +1,27 @@
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.replication.sink import ReplicaSink
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_pause_gate_exposes_exact_sequence_lag():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=4)
+    +    await primary.attach_replica(sink)
+    +    sink.pause()
+    +
+    +    client = primary.direct_client()
+    +    await client.execute(CommandRequest(b"SET", (b"a", b"1")))
+    +    await client.execute(CommandRequest(b"SET", (b"b", b"2")))
+    +
+    +    assert sink.status.primary_seq == 2
+    +    assert sink.status.applied_seq == 0
+    +    assert sink.status.lag == 2
+    +    sink.resume()
+    +    await sink.wait_until_applied(2)
+    +    assert sink.status.lag == 0
+    +    await primary.close()
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks lag as an exact sequence difference rather than a timer or queue-size estimate.
+
+**How it constructs the counterexample**
+
+It pauses apply, commits two batches, inspects lag, then resumes and waits for sequence two.
+
+**Key test statement**
+
+```python
+assert sink.status.lag == 2
+await sink.wait_until_applied(2)
+```
+
+**What a failure means**
+
+The reported replication position cannot be correlated with committed history.
+
+??? note "File diff: tests/replication/test_sink_overflow.py"
+    ```diff
+    diff --git a/tests/replication/test_sink_overflow.py b/tests/replication/test_sink_overflow.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..7348b563b30c1d6039ade2eb529f7690db0d2d14
+    --- /dev/null
+    +++ b/tests/replication/test_sink_overflow.py
+    @@ -0,0 +1,96 @@
+    +import asyncio
+    +
+    +import pytest
+    +
+    +from miniredis import CommandRequest
+    +from miniredis.core.reply import Bytes, Ok
+    +from miniredis.replication.sink import ReplicaSink, ReplicaSinkState
+    +from tests.helpers.runtime import open_test_runtime
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_full_sink_detaches_as_needs_resync_without_blocking_primary():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=1)
+    +    await primary.attach_replica(sink)
+    +    sink.pause()
+    +    client = primary.direct_client()
+    +
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"a", b"1"))
+    +    ) == Ok()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"b", b"2"))
+    +    ) == Ok()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"c", b"3"))
+    +    ) == Ok()
+    +
+    +    assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+    +    assert sink.status.queued == 0
+    +    assert primary.debug_commit_seq == 3
+    +    assert primary.debug_stats().replica_links == 0
+    +    await primary.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_overflow_wakes_applied_sequence_waiters_without_a_sleep():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    sink = ReplicaSink(replica, queue_limit=1)
+    +    await primary.attach_replica(sink)
+    +    sink.pause()
+    +    client = primary.direct_client()
+    +    waiting = asyncio.create_task(sink.wait_until_applied(2))
+    +
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"a", b"1"))
+    +    ) == Ok()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"b", b"2"))
+    +    ) == Ok()
+    +
+    +    with pytest.raises(RuntimeError, match="replica stopped at seq 0"):
+    +        await asyncio.wait_for(waiting, timeout=1)
+    +    assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+    +    await primary.close()
+    +    await replica.close()
+    +
+    +
+    +@pytest.mark.asyncio
+    +async def test_bootstrap_overflow_never_installs_the_stale_snapshot():
+    +    primary = await open_test_runtime()
+    +    replica = await open_test_runtime()
+    +    replica_client = replica.direct_client()
+    +    assert await replica_client.execute(
+    +        CommandRequest(b"SET", (b"local", b"keep"))
+    +    ) == Ok()
+    +    install_gate = asyncio.Event()
+    +    sink = ReplicaSink(
+    +        replica,
+    +        queue_limit=1,
+    +        install_gate=install_gate,
+    +    )
+    +    attaching = asyncio.create_task(primary.attach_replica(sink))
+    +    await sink.attachment_captured.wait()
+    +
+    +    client = primary.direct_client()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"a", b"1"))
+    +    ) == Ok()
+    +    assert await client.execute(
+    +        CommandRequest(b"SET", (b"b", b"2"))
+    +    ) == Ok()
+    +    assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+    +    install_gate.set()
+    +
+    +    status = await attaching
+    +    assert status.state is ReplicaSinkState.NEEDS_RESYNC
+    +    assert await replica_client.execute(
+    +        CommandRequest(b"GET", (b"local",))
+    +    ) == Bytes(b"keep")
+    +    assert primary.debug_stats().replica_links == 0
+    +    await primary.close()
+    +    await replica.close()
+    ```
+
+**What this test locks**
+
+It locks bounded buffering, non-blocking primary progress, waiter wake-up, and rejection of a stale bootstrap image after overflow.
+
+**How it constructs the counterexample**
+
+It pauses a one-item sink and produces more commits than it can retain, including during bootstrap.
+
+**Key test statement**
+
+```python
+assert sink.status.state is ReplicaSinkState.NEEDS_RESYNC
+assert primary.debug_commit_seq == 3
+```
+
+**What a failure means**
+
+Backpressure crossed into the primary or incomplete history was allowed to look synchronized.
+
+??? note "File diff: tests/unit/commands/test_command_traits.py"
+    ```diff
+    diff --git a/tests/unit/commands/test_command_traits.py b/tests/unit/commands/test_command_traits.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..26c6ae2110a3a499d517bfd4c0f0448ef96c5ac9
+    --- /dev/null
+    +++ b/tests/unit/commands/test_command_traits.py
+    @@ -0,0 +1,28 @@
+    +from typing import get_args
+    +
+    +from miniredis.commands import model
+    +
+    +
+    +def test_every_frozen_command_type_has_exactly_one_dataset_trait():
+    +    command_types = frozenset(get_args(model.Command))
+    +    assert (
+    +        model._DATASET_MUTATING_TYPES
+    +        | model._NON_DATASET_MUTATING_TYPES
+    +    ) == command_types
+    +    assert (
+    +        model._DATASET_MUTATING_TYPES
+    +        & model._NON_DATASET_MUTATING_TYPES
+    +    ) == frozenset()
+    +
+    +
+    +def test_blpop_is_mutating_and_pubsub_is_explicitly_non_dataset():
+    +    assert model.is_dataset_mutating(model.BlPop((b"q",), 0)) is True
+    +    assert (
+    +        model.is_dataset_mutating(model.Subscribe((b"c",))) is False
+    +    )
+    +    assert (
+    +        model.is_dataset_mutating(model.Unsubscribe((b"c",))) is False
+    +    )
+    +    assert (
+    +        model.is_dataset_mutating(model.Publish(b"c", b"p")) is False
+    +    )
+    ```
+
+**What this test locks**
+
+It locks an exhaustive, disjoint classification of every command as dataset-mutating or non-mutating.
+
+**How it constructs the counterexample**
+
+It compares both trait sets with the complete `Command` union and checks subtle cases such as blocking pop and Pub/Sub.
+
+**Key test statement**
+
+```python
+assert (_DATASET_MUTATING_TYPES | _NON_DATASET_MUTATING_TYPES) == command_types
+```
+
+**What a failure means**
+
+A newly added command can bypass read-only policy or be rejected without an explicit semantic decision.
+
+### Basic concepts
+
+A replica attachment is a generation plus a snapshot image. The generation identifies one source relationship; the image supplies a baseline sequence; later `CommitBatch` values advance that sequence. Lag is `primary_seq - applied_seq`. `NEEDS_RESYNC` is an explicit loss-of-continuity state, not a retry hint.
+
+### Why this mechanism is necessary
+
+Asynchronous replication keeps primary latency independent of follower speed, but that independence needs a bounded failure mode. Atomic attachment closes the snapshot/stream gap; typed mutation traits enforce read-only behavior; explicit terminal states stop incomplete history from being presented as current.
+
+### Runtime mental model
+
+The primary executor captures `(generation, image)` and registers the sink in one turn. Later commits are offered to its bounded queue. The replica installs the image, marks that generation active and read-only, then applies queued batches through its own executor. Overflow or apply failure clears continuity and detaches the link while primary commits continue.
+
+### Mechanism blocks
+
+#### Typed read-only boundary
+
+Classify every command by whether it mutates dataset state, then reject only those commands while a runtime follows a primary.
+
+??? note "File diff: src/miniredis/commands/model.py"
+    ```diff
+    diff --git a/src/miniredis/commands/model.py b/src/miniredis/commands/model.py
+    index e0d48a4d6d518f5c8f357d869bedfd6a9425367d..a35ef7c39779d6045e3909f2f07df78b544b4b96 100644
+    --- a/src/miniredis/commands/model.py
+    +++ b/src/miniredis/commands/model.py
+    @@ -245,3 +245,57 @@ Command: TypeAlias = (
+         | TimeToLive
+         | Persist
+     )
+    +
+    +
+    +_DATASET_MUTATING_TYPES = frozenset(
+    +    {
+    +        SetString,
+    +        Delete,
+    +        Increment,
+    +        HashSet,
+    +        HashDelete,
+    +        HashIncrement,
+    +        ListPush,
+    +        ListPop,
+    +        BlPop,
+    +        SetAdd,
+    +        SetRemove,
+    +        ZAdd,
+    +        ZRemove,
+    +        Expire,
+    +        Persist,
+    +    }
+    +)
+    +
+    +_NON_DATASET_MUTATING_TYPES = frozenset(
+    +    {
+    +        Ping,
+    +        Echo,
+    +        GetString,
+    +        Exists,
+    +        TypeOf,
+    +        HashGet,
+    +        HashGetAll,
+    +        ListRange,
+    +        SetIsMember,
+    +        SetMembers,
+    +        SetIntersection,
+    +        ZScore,
+    +        ZRank,
+    +        ZRange,
+    +        ZRangeByScore,
+    +        TimeToLive,
+    +        Subscribe,
+    +        Unsubscribe,
+    +        Publish,
+    +    }
+    +)
+    +
+    +
+    +def is_dataset_mutating(command: Command) -> bool:
+    +    command_type = type(command)
+    +    if command_type in _DATASET_MUTATING_TYPES:
+    +        return True
+    +    if command_type in _NON_DATASET_MUTATING_TYPES:
+    +        return False
+    +    raise AssertionError(f"unclassified command type: {command_type.__name__}")
+    ```
+
+**What it is and why it appears**
+
+The command model gains one exhaustive dataset-mutation trait.
+
+**Runtime role**
+
+The replica executor consults semantic command type rather than duplicating a name blacklist.
+
+**Key code**
+
+```python
+if command_type in _DATASET_MUTATING_TYPES:
+    return True
+```
+
+**Statement understanding**
+
+Unknown command types fail loudly, forcing every future command to make an explicit read-only-policy choice.
+
+#### Atomic attachment handoff
+
+Capture snapshot sequence and state, register the sink, and enqueue every later commit in the same executor order.
+
+??? note "File diff: src/miniredis/core/executor.py"
+    ```diff
+    diff --git a/src/miniredis/core/executor.py b/src/miniredis/core/executor.py
+    index 0126d8027bf47cfb54cda842f29eaef2de67d0d0..17421ea1ed3c88f056bebb8ac1573db2211f8b10 100644
+    --- a/src/miniredis/core/executor.py
+    +++ b/src/miniredis/core/executor.py
+    @@ -16,6 +16,7 @@ from miniredis.commands.model import (
+         Publish,
+         Subscribe,
+         Unsubscribe,
+    +    is_dataset_mutating,
+     )
+     from miniredis.core.blocking import (
+         WaiterId,
+    @@ -58,6 +59,7 @@ from miniredis.persistence.aof import (
+         AofAppendOk,
+         AofAppendOutcome,
+     )
+    +from miniredis.replication.sink import ReplicaAttachment
+
+     if TYPE_CHECKING:
+         from miniredis.replication.sink import ReplicaSink
+    @@ -105,6 +107,33 @@ class SnapshotBarrier:
+         future: asyncio.Future[SnapshotImage]
+
+
+    +@dataclass(slots=True)
+    +class AttachReplica:
+    +    sink: ReplicaSink
+    +    future: asyncio.Future[ReplicaAttachment]
+    +
+    +
+    +@dataclass(slots=True)
+    +class DetachReplica:
+    +    generation: int
+    +    future: asyncio.Future[bool] | None
+    +
+    +
+    +@dataclass(slots=True)
+    +class InstallReplicaSnapshot:
+    +    sink: ReplicaSink
+    +    generation: int
+    +    image: SnapshotImage
+    +    future: asyncio.Future[bool]
+    +
+    +
+    +@dataclass(slots=True)
+    +class ApplyReplicaBatch:
+    +    generation: int
+    +    batch: CommitBatch
+    +    future: asyncio.Future[bool]
+    +
+    +
+     @dataclass(frozen=True, slots=True)
+     class ExecutionPlan:
+         reply: Reply | None
+    @@ -170,6 +199,7 @@ class CommandExecutor:
+             on_debug_change: Callable[[], None],
+             on_terminal_failure: Callable[[BaseException], None] | None = None,
+             on_fatal: Callable[[str], None] | None = None,
+    +        replica_apply_failure: BaseException | None = None,
+         ) -> None:
+             self.database = database
+             self.planner = planner
+    @@ -203,6 +233,10 @@ class CommandExecutor:
+             self._accepted_changed = asyncio.Event()
+             self._applied_batches: list[CommitBatch] = []
+             self._replica_sinks: dict[int, ReplicaSink] = {}
+    +        self._next_replica_generation = 1
+    +        self._active_source_generation: int | None = None
+    +        self._replica_read_only = False
+    +        self._replica_apply_failure = replica_apply_failure
+             self._handling_message = False
+             self._failure: BaseException | None = None
+             self._terminal_cleanup_complete = False
+    @@ -350,6 +384,43 @@ class CommandExecutor:
+                 image = self.database.snapshot_image(self.clock.now_ms())
+                 if not message.future.done():
+                     message.future.set_result(image)
+    +        elif isinstance(message, AttachReplica):
+    +            generation = self._next_replica_generation
+    +            self._next_replica_generation += 1
+    +            image = self.database.snapshot_image(self.clock.now_ms())
+    +            attachment = ReplicaAttachment(generation, image)
+    +            message.sink.register_attachment(attachment)
+    +            self._replica_sinks[generation] = message.sink
+    +            message.future.set_result(attachment)
+    +        elif isinstance(message, DetachReplica):
+    +            removed = self._replica_sinks.pop(message.generation, None) is not None
+    +            if message.future is not None and not message.future.done():
+    +                message.future.set_result(removed)
+    +        elif isinstance(message, InstallReplicaSnapshot):
+    +            if not message.sink.install_allowed(message.generation):
+    +                message.future.set_result(False)
+    +                return
+    +            self.database.install_snapshot(
+    +                message.image,
+    +                now_ms=self.clock.now_ms(),
+    +            )
+    +            self._active_source_generation = message.generation
+    +            self._replica_read_only = True
+    +            message.future.set_result(True)
+    +        elif isinstance(message, ApplyReplicaBatch):
+    +            if message.generation != self._active_source_generation:
+    +                message.future.set_result(False)
+    +                return
+    +            try:
+    +                if self._replica_apply_failure is not None:
+    +                    error = self._replica_apply_failure
+    +                    self._replica_apply_failure = None
+    +                    raise error
+    +                self.database.apply_batch(message.batch, track_access=False)
+    +            except BaseException as exc:
+    +                message.future.set_exception(exc)
+    +            else:
+    +                message.future.set_result(True)
+             else:
+                 raise AssertionError(f"unknown executor message: {message!r}")
+
+    @@ -442,6 +513,12 @@ class CommandExecutor:
+
+         async def _execute(self, request: ExecuteRequest) -> None:
+             command = request.command
+    +        if self._replica_read_only and is_dataset_mutating(command):
+    +            self._finish_reply(
+    +                request.token,
+    +                Failure("READONLY", "replica is read only"),
+    +            )
+    +            return
+             if self.pubsub.count(request.session_id) > 0 and not isinstance(
+                 command, (Ping, Subscribe, Unsubscribe)
+             ):
+    @@ -641,6 +718,45 @@ class CommandExecutor:
+                 raise RuntimeError("executor control admission is closed")
+             return await asyncio.shield(future)
+
+    +    async def attach_replica(self, sink: ReplicaSink) -> ReplicaAttachment:
+    +        future: asyncio.Future[ReplicaAttachment] = (
+    +            asyncio.get_running_loop().create_future()
+    +        )
+    +        if not self.post_control(AttachReplica(sink, future)):
+    +            raise RuntimeError("executor control admission is closed")
+    +        return await asyncio.shield(future)
+    +
+    +    async def detach_replica(self, generation: int) -> bool:
+    +        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    +        if not self.post_control(DetachReplica(generation, future)):
+    +            return False
+    +        return await asyncio.shield(future)
+    +
+    +    async def install_replica_snapshot(
+    +        self,
+    +        sink: ReplicaSink,
+    +        generation: int,
+    +        image: SnapshotImage,
+    +    ) -> bool:
+    +        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    +        if not self.post_control(
+    +            InstallReplicaSnapshot(sink, generation, image, future)
+    +        ):
+    +            return False
+    +        return await asyncio.shield(future)
+    +
+    +    async def apply_replica_batch(
+    +        self,
+    +        generation: int,
+    +        batch: CommitBatch,
+    +    ) -> bool:
+    +        future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
+    +        if not self.post_control(
+    +            ApplyReplicaBatch(generation, batch, future)
+    +        ):
+    +            return False
+    +        return await asyncio.shield(future)
+    +
+         async def _active_expire_once(self, now_ms: int) -> int:
+             keys = sorted(
+                 key
+    @@ -754,6 +870,10 @@ class CommandExecutor:
+         def endpoint_count(self) -> int:
+             return len(self._endpoints)
+
+    +    @property
+    +    def replica_link_count(self) -> int:
+    +        return len(self._replica_sinks)
+    +
+         @property
+         def worker_task(self) -> asyncio.Task[None] | None:
+             return self._worker_task
+    ```
+
+**What it is and why it appears**
+
+The single writer gains ordered attach, detach, install, and apply control messages.
+
+**Runtime role**
+
+It captures the image and registers the sink before another commit can interleave, then validates source generation on the replica.
+
+**Key code**
+
+```python
+image = self.database.snapshot_image(self.clock.now_ms())
+attachment = ReplicaAttachment(generation, image)
+message.sink.register_attachment(attachment)
+self._replica_sinks[generation] = message.sink
+message.future.set_result(attachment)
+```
+
+**Statement understanding**
+
+The executor turn is the handoff boundary: through N is in the image; after N is offered to the registered sink.
+
+#### Bounded asynchronous replica sink
+
+Install the baseline, apply contiguous batches asynchronously, expose exact lag, and detach a slow or failed follower without stalling the primary.
+
+??? note "File diff: src/miniredis/replication/sink.py"
+    ```diff
+    diff --git a/src/miniredis/replication/sink.py b/src/miniredis/replication/sink.py
+    new file mode 100644
+    index 0000000000000000000000000000000000000000..48a1ac101fd4d303da97d89969fc09c755c5ed09
+    --- /dev/null
+    +++ b/src/miniredis/replication/sink.py
+    @@ -0,0 +1,236 @@
+    +from __future__ import annotations
+    +
+    +import asyncio
+    +from collections import deque
+    +from dataclasses import dataclass
+    +from enum import StrEnum
+    +from typing import TYPE_CHECKING
+    +
+    +from miniredis.core.commit import CommitBatch, SnapshotImage
+    +
+    +if TYPE_CHECKING:
+    +    from miniredis.runtime import MiniRedis
+    +
+    +
+    +class ReplicaSinkState(StrEnum):
+    +    DETACHED = "detached"
+    +    BOOTSTRAPPING = "bootstrapping"
+    +    STREAMING = "streaming"
+    +    NEEDS_RESYNC = "needs_resync"
+    +    FAILED = "failed"
+    +    PROMOTING = "promoting"
+    +    PROMOTED = "promoted"
+    +    SOURCE_LOST = "source_lost"
+    +    STOPPED = "stopped"
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ReplicaAttachment:
+    +    generation: int
+    +    image: SnapshotImage
+    +
+    +
+    +@dataclass(frozen=True, slots=True)
+    +class ReplicaStatus:
+    +    generation: int | None
+    +    state: ReplicaSinkState
+    +    baseline_seq: int
+    +    applied_seq: int
+    +    primary_seq: int
+    +    lag: int
+    +    queued: int
+    +
+    +
+    +class ReplicaSink:
+    +    def __init__(
+    +        self,
+    +        replica: MiniRedis,
+    +        *,
+    +        queue_limit: int,
+    +        install_gate: asyncio.Event | None = None,
+    +    ) -> None:
+    +        if queue_limit <= 0:
+    +            raise ValueError("replica queue limit must be positive")
+    +        self._replica = replica
+    +        self._queue_limit = queue_limit
+    +        self._install_gate = install_gate
+    +        self._primary: MiniRedis | None = None
+    +        self._generation: int | None = None
+    +        self._baseline_seq = 0
+    +        self._applied_seq = 0
+    +        self._primary_seq = 0
+    +        self._state = ReplicaSinkState.DETACHED
+    +        self._queue: deque[CommitBatch] = deque()
+    +        self._queue_ready = asyncio.Event()
+    +        self._apply_allowed = asyncio.Event()
+    +        self._apply_allowed.set()
+    +        self._attachment_captured = asyncio.Event()
+    +        self._status_changed = asyncio.Event()
+    +        self._attach_task: asyncio.Task[ReplicaStatus] | None = None
+    +        self._task: asyncio.Task[None] | None = None
+    +
+    +    def _signal_status_change(self) -> None:
+    +        self._status_changed.set()
+    +
+    +    @property
+    +    def attachment_captured(self) -> asyncio.Event:
+    +        return self._attachment_captured
+    +
+    +    @property
+    +    def status(self) -> ReplicaStatus:
+    +        return ReplicaStatus(
+    +            generation=self._generation,
+    +            state=self._state,
+    +            baseline_seq=self._baseline_seq,
+    +            applied_seq=self._applied_seq,
+    +            primary_seq=self._primary_seq,
+    +            lag=max(0, self._primary_seq - self._applied_seq),
+    +            queued=len(self._queue),
+    +        )
+    +
+    +    def pause(self) -> None:
+    +        self._apply_allowed.clear()
+    +
+    +    def resume(self) -> None:
+    +        self._apply_allowed.set()
+    +
+    +    def register_attachment(
+    +        self,
+    +        attachment: ReplicaAttachment,
+    +    ) -> None:
+    +        if self._state is not ReplicaSinkState.BOOTSTRAPPING:
+    +            raise RuntimeError("sink is not bootstrapping")
+    +        self._generation = attachment.generation
+    +        self._baseline_seq = attachment.image.checkpoint_seq
+    +        self._applied_seq = attachment.image.checkpoint_seq
+    +        self._primary_seq = attachment.image.checkpoint_seq
+    +        self._attachment_captured.set()
+    +        self._signal_status_change()
+    +
+    +    async def attach(self, primary: MiniRedis) -> ReplicaStatus:
+    +        if self._state is not ReplicaSinkState.DETACHED:
+    +            raise RuntimeError("replica sink is already attached")
+    +        current = asyncio.current_task()
+    +        assert current is not None
+    +        self._attach_task = current
+    +        self._primary = primary
+    +        self._state = ReplicaSinkState.BOOTSTRAPPING
+    +        self._signal_status_change()
+    +        try:
+    +            attachment = await primary.executor.attach_replica(self)
+    +            if self._install_gate is not None:
+    +                await self._install_gate.wait()
+    +            if self._state is not ReplicaSinkState.BOOTSTRAPPING:
+    +                return self.status
+    +            installed = (
+    +                await self._replica.executor.install_replica_snapshot(
+    +                    self,
+    +                    attachment.generation,
+    +                    attachment.image,
+    +                )
+    +            )
+    +            if not installed:
+    +                return self.status
+    +            if self._state is not ReplicaSinkState.BOOTSTRAPPING:
+    +                return self.status
+    +            self._state = ReplicaSinkState.STREAMING
+    +            self._signal_status_change()
+    +            self._task = asyncio.create_task(
+    +                self._run_apply(),
+    +                name=f"miniredis-replica-{attachment.generation}",
+    +            )
+    +            return self.status
+    +        finally:
+    +            self._attach_task = None
+    +
+    +    def install_allowed(self, generation: int) -> bool:
+    +        return (
+    +            self._state is ReplicaSinkState.BOOTSTRAPPING
+    +            and self._generation == generation
+    +        )
+    +
+    +    def offer(self, batch: CommitBatch) -> bool:
+    +        if self._state not in {
+    +            ReplicaSinkState.BOOTSTRAPPING,
+    +            ReplicaSinkState.STREAMING,
+    +        }:
+    +            return False
+    +        self._primary_seq = batch.seq
+    +        if len(self._queue) >= self._queue_limit:
+    +            self._queue.clear()
+    +            self._state = ReplicaSinkState.NEEDS_RESYNC
+    +            self._queue_ready.set()
+    +            self._signal_status_change()
+    +            return False
+    +        self._queue.append(batch)
+    +        self._queue_ready.set()
+    +        self._signal_status_change()
+    +        return True
+    +
+    +    async def _run_apply(self) -> None:
+    +        try:
+    +            while self._state is ReplicaSinkState.STREAMING:
+    +                await self._queue_ready.wait()
+    +                await self._apply_allowed.wait()
+    +                if not self._queue:
+    +                    self._queue_ready.clear()
+    +                    continue
+    +                batch = self._queue.popleft()
+    +                if not self._queue:
+    +                    self._queue_ready.clear()
+    +                assert self._generation is not None
+    +                applied = await self._replica.executor.apply_replica_batch(
+    +                    self._generation,
+    +                    batch,
+    +                )
+    +                if not applied:
+    +                    self._queue.clear()
+    +                    self._state = ReplicaSinkState.NEEDS_RESYNC
+    +                    self._signal_status_change()
+    +                    if self._primary is not None:
+    +                        await self._primary.executor.detach_replica(
+    +                            self._generation
+    +                        )
+    +                    return
+    +                self._applied_seq = batch.seq
+    +                self._signal_status_change()
+    +        except asyncio.CancelledError:
+    +            raise
+    +        except BaseException:
+    +            self._state = ReplicaSinkState.FAILED
+    +            self._queue.clear()
+    +            self._signal_status_change()
+    +            if self._primary is not None and self._generation is not None:
+    +                await self._primary.executor.detach_replica(
+    +                    self._generation
+    +                )
+    +        finally:
+    +            self._signal_status_change()
+    +
+    +    async def wait_until_applied(self, seq: int) -> None:
+    +        terminal = {
+    +            ReplicaSinkState.NEEDS_RESYNC,
+    +            ReplicaSinkState.FAILED,
+    +            ReplicaSinkState.SOURCE_LOST,
+    +            ReplicaSinkState.STOPPED,
+    +        }
+    +        while True:
+    +            if self._applied_seq >= seq:
+    +                return
+    +            if self._state in terminal:
+    +                raise RuntimeError(
+    +                    f"replica stopped at seq {self._applied_seq}"
+    +                )
+    +            self._status_changed.clear()
+    +            if self._applied_seq >= seq:
+    +                return
+    +            if self._state in terminal:
+    +                raise RuntimeError(
+    +                    f"replica stopped at seq {self._applied_seq}"
+    +                )
+    +            await self._status_changed.wait()
+    +
+    +    async def wait_until_stopped(self) -> None:
+    +        task = self._task
+    +        if task is not None:
+    +            await asyncio.shield(task)
+    ```
+
+**What it is and why it appears**
+
+The sink owns attachment state, bounded queued history, apply progress, and link termination.
+
+**Runtime role**
+
+It installs the baseline, drains batches asynchronously, reports lag, wakes waiters, and isolates overflow or failure.
+
+**Key code**
+
+```python
+if len(self._queue) >= self._queue_limit:
+    self._queue.clear()
+    self._state = ReplicaSinkState.NEEDS_RESYNC
+```
+
+**Statement understanding**
+
+Once one batch is missing, retaining later batches cannot restore a contiguous history; the honest state is resynchronization required.
+
+#### Replication ownership and limits
+
+Validate queue and drain limits, own attachment tasks and sinks in the runtime, and report live link counts.
+
+??? note "File diff: src/miniredis/config.py"
+    ```diff
+    diff --git a/src/miniredis/config.py b/src/miniredis/config.py
+    index aac0e9f7ec7ad70e7234688fb8e877e46b571a48..999209a5a6ad80cb8c5f48ee2e984be0b8ac061e 100644
+    --- a/src/miniredis/config.py
+    +++ b/src/miniredis/config.py
+    @@ -23,6 +23,8 @@ class MiniRedisConfig:
+         aof_repair_truncated_tail: bool = True
+         aof_fsync_interval_seconds: float = 1.0
+         snapshot_path: Path | None = None
+    +    replica_queue_limit: int = 64
+    +    replica_drain_grace_ms: int = 1000
+
+         def __post_init__(self) -> None:
+             if self.max_pending_commands <= 0:
+    @@ -41,3 +43,7 @@ class MiniRedisConfig:
+                 raise ValueError("active_expire_interval_ms must be positive")
+             if self.aof_fsync_interval_seconds <= 0:
+                 raise ValueError("aof_fsync_interval_seconds must be positive")
+    +        if self.replica_queue_limit <= 0:
+    +            raise ValueError("replica_queue_limit must be positive")
+    +        if self.replica_drain_grace_ms < 0:
+    +            raise ValueError("replica_drain_grace_ms cannot be negative")
+    ```
+
+**What it is and why it appears**
+
+Configuration makes queue capacity and shutdown drain grace explicit.
+
+**Runtime role**
+
+It rejects impossible limits before a link starts.
+
+**Key code**
+
+```python
+if self.replica_queue_limit <= 0:
+    raise ValueError("replica_queue_limit must be positive")
+```
+
+**Statement understanding**
+
+Bounded memory and bounded shutdown waiting are part of the replication contract, not incidental tuning.
+
+??? note "File diff: src/miniredis/runtime.py"
+    ```diff
+    diff --git a/src/miniredis/runtime.py b/src/miniredis/runtime.py
+    index 78b33aea879a2825b1c9b8c93a7c711161386226..8e6d41b18a22e563c92475eb3a5ebe1f4a059ba7 100644
+    --- a/src/miniredis/runtime.py
+    +++ b/src/miniredis/runtime.py
+    @@ -46,6 +46,7 @@ from miniredis.persistence.snapshot import (
+         SnapshotManager,
+         SnapshotOutcome,
+     )
+    +from miniredis.replication.sink import ReplicaSink, ReplicaStatus
+
+
+     class RuntimeState(str, Enum):
+    @@ -65,12 +66,14 @@ class RuntimeStats:
+         sessions: int
+         timer_handles: int
+         owned_tasks: int
+    +    replica_links: int
+
+
+     @dataclass(slots=True)
+     class _RuntimeTestHooks:
+         aof_appender: CommitBarrier | None = None
+         snapshot_ops: SnapshotFileOps | None = None
+    +    replica_apply_failure: BaseException | None = None
+
+
+     def _direct_transport_close(_reason: str) -> None:
+    @@ -114,6 +117,11 @@ class MiniRedis:
+                 on_debug_change=self._debug_notify,
+                 on_terminal_failure=self._on_executor_terminal_failure,
+                 on_fatal=self._transition_failed,
+    +            replica_apply_failure=(
+    +                None
+    +                if self._test_hooks is None
+    +                else self._test_hooks.replica_apply_failure
+    +            ),
+             )
+             self._snapshot_manager = (
+                 SnapshotManager(
+    @@ -137,6 +145,7 @@ class MiniRedis:
+             self._owned_tasks: set[asyncio.Task[object]] = set()
+             self._failure_reason: str | None = None
+             self._shutdown_complete = False
+    +        self._owned_replica_sinks: set[ReplicaSink] = set()
+
+         @classmethod
+         def open(
+    @@ -378,6 +387,34 @@ class MiniRedis:
+             self._owned_tasks.add(task)
+             task.add_done_callback(self._owned_tasks.discard)
+
+    +    async def attach_replica(self, sink: ReplicaSink) -> ReplicaStatus:
+    +        if self.state is not RuntimeState.RUNNING:
+    +            raise RuntimeError("primary is not running")
+    +        self._owned_replica_sinks.add(sink)
+    +        task = asyncio.create_task(
+    +            sink.attach(self),
+    +            name="miniredis:replica-attach",
+    +        )
+    +        task.add_done_callback(
+    +            lambda completed: self._replica_attach_done(sink, completed)
+    +        )
+    +        try:
+    +            return await asyncio.shield(task)
+    +        except BaseException:
+    +            if task.done() and (
+    +                task.cancelled() or task.exception() is not None
+    +            ):
+    +                self._owned_replica_sinks.discard(sink)
+    +            raise
+    +
+    +    def _replica_attach_done(
+    +        self,
+    +        sink: ReplicaSink,
+    +        task: asyncio.Task[ReplicaStatus],
+    +    ) -> None:
+    +        if task.cancelled() or task.exception() is not None:
+    +            self._owned_replica_sinks.discard(sink)
+    +
+         async def __aenter__(self) -> Self:
+             await self.start()
+             return self
+    @@ -455,6 +492,7 @@ class MiniRedis:
+                     for task in self._owned_tasks
+                     if task is not asyncio.current_task()
+                 ),
+    +            replica_links=self.executor.replica_link_count,
+             )
+
+         def _debug_notify(self) -> None:
+    ```
+
+**What it is and why it appears**
+
+The runtime owns replica attachment tasks and live sinks.
+
+**Runtime role**
+
+It admits attachment only while running, shields shared work from caller cancellation, and exposes link counts for lifecycle checks.
+
+**Key code**
+
+```python
+self._owned_replica_sinks.add(sink)
+task = asyncio.create_task(
+    sink.attach(self),
+    name="miniredis:replica-attach",
+)
+```
+
+**Statement understanding**
+
+The runtime, not the initiating caller, owns the link once attachment begins.
+
+### Verification evidence
+
+Run the five focused test modules from `tests.txt`, then build Stages 1–17 cumulatively and compare the result with commit `e18be82`.
+
+### Durable takeaways
+
+- Snapshot and stream registration need one ordered boundary.
+- Async replication needs bounded loss-of-continuity semantics.
+- Lag is a sequence relationship, not elapsed time.
+- Read-only policy belongs to command semantics.
+
+### Explain it in your own words
+
+Why does queue overflow move the sink to `NEEDS_RESYNC` instead of keeping the newest batches, and why does this not fail the primary write?
+
+### Textbook
+
+This stage is a compact primary–backup replication design: state transfer establishes a checkpoint, an ordered log carries subsequent transitions, and a bounded asynchronous channel trades acknowledged-primary durability for primary availability and latency isolation.
+
+[Compare this stage on GitHub](https://github.com/system-in-miniature/mini-redis/compare/b267f92...e18be82)
+
+After finishing, run `python -m journey.tools.build_journey check 17` to verify the learner workspace.
+
+[Complete reference patch / 完整参考补丁](https://github.com/system-in-miniature/mini-redis/blob/main/journey/stages/17-asynchronous-replication/stage.patch)

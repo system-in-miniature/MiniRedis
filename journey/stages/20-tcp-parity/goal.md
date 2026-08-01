@@ -145,9 +145,14 @@ It incrementally reads RESP2, bounds decoded frames, submits one session command
 ##### Key code
 
 ```python
-if self._pending_command is not None or not self._frames:
+if (
+    self._closed
+    or self._reader_quiescing
+    or self._pending_command is not None
+    or not self._frames
+):
     return
-self._pending_command = asyncio.create_task(...)
+request = self._frames.popleft()
 ```
 
 ##### Statement understanding
@@ -213,7 +218,8 @@ It registers endpoints, submits/abandons session requests, isolates slow endpoin
 
 ```python
 await asyncio.gather(
-    *(server.finish_runtime_close() for server in tuple(self._tcp_servers))
+    *(server.finish_runtime_close() for server in tuple(self._tcp_servers)),
+    return_exceptions=False,
 )
 ```
 
@@ -425,9 +431,14 @@ Server 接受 Socket 并注册 `SessionEndpoint`。Reader 解码到有界 Frame 
 ##### 关键代码
 
 ```python
-if self._pending_command is not None or not self._frames:
+if (
+    self._closed
+    or self._reader_quiescing
+    or self._pending_command is not None
+    or not self._frames
+):
     return
-self._pending_command = asyncio.create_task(...)
+request = self._frames.popleft()
 ```
 
 ##### 关键语句理解
@@ -493,7 +504,8 @@ Runtime 暴露 Session Operation 并持有每个已启动 TCP Server。
 
 ```python
 await asyncio.gather(
-    *(server.finish_runtime_close() for server in tuple(self._tcp_servers))
+    *(server.finish_runtime_close() for server in tuple(self._tcp_servers)),
+    return_exceptions=False,
 )
 ```
 

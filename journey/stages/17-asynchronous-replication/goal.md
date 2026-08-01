@@ -213,8 +213,10 @@ It captures the image and registers the sink before another commit can interleav
 
 ```python
 image = self.database.snapshot_image(self.clock.now_ms())
-message.sink.register_attachment(ReplicaAttachment(generation, image))
+attachment = ReplicaAttachment(generation, image)
+message.sink.register_attachment(attachment)
 self._replica_sinks[generation] = message.sink
+message.future.set_result(attachment)
 ```
 
 ##### Statement understanding
@@ -281,7 +283,10 @@ It admits attachment only while running, shields shared work from caller cancell
 
 ```python
 self._owned_replica_sinks.add(sink)
-return await asyncio.shield(task)
+task = asyncio.create_task(
+    sink.attach(self),
+    name="miniredis:replica-attach",
+)
 ```
 
 ##### Statement understanding
@@ -518,8 +523,10 @@ Single Writer 增加有序 Attach、Detach、Install 与 Apply Control Message�
 
 ```python
 image = self.database.snapshot_image(self.clock.now_ms())
-message.sink.register_attachment(ReplicaAttachment(generation, image))
+attachment = ReplicaAttachment(generation, image)
+message.sink.register_attachment(attachment)
 self._replica_sinks[generation] = message.sink
+message.future.set_result(attachment)
 ```
 
 ##### 关键语句理解
@@ -586,7 +593,10 @@ Runtime 持有 Replica Attachment Task 与存活 Sink。
 
 ```python
 self._owned_replica_sinks.add(sink)
-return await asyncio.shield(task)
+task = asyncio.create_task(
+    sink.attach(self),
+    name="miniredis:replica-attach",
+)
 ```
 
 ##### 关键语句理解

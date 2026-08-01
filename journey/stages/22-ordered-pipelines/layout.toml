@@ -1,0 +1,36 @@
+failure_files = [
+  "tests/adapters/test_direct_pipeline.py",
+  "tests/adapters/test_tcp_async_semantics.py",
+]
+
+[[blocks]]
+id = "ordered-outbound"
+title_en = "Token-ordered pipeline completion"
+title_zh = "按 Token 排序的 Pipeline Completion"
+summary_en = "Register every admitted request, buffer out-of-order completions, and flush replies only from the oldest completed prefix."
+summary_zh = "注册每个已接纳 Request，缓存乱序 Completion，并只从最老的连续完成前缀 Flush Reply。"
+files = ["src/miniredis/core/outbound.py", "src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "direct-pipeline"
+title_en = "Direct pipeline submission"
+title_zh = "Direct Pipeline Submission"
+summary_en = "Submit all queued requests before awaiting results, preserve one result slot per input, and make parse failures enter mailbox order."
+summary_zh = "等待结果前提交全部排队 Request，为每个输入保留一个结果槽，并让 Parse Failure 进入 Mailbox Order。"
+files = ["src/miniredis/adapters/direct.py"]
+
+[[blocks]]
+id = "tcp-pipeline"
+title_en = "Bounded TCP pipeline admission"
+title_zh = "有界 TCP Pipeline Admission"
+summary_en = "Admit multiple decoded frames without serial reply waits, retry temporary BUSY admission, and settle every command/admission task on close."
+summary_zh = "无需逐个等待 Reply 地接纳多个已解码 Frame，重试临时 BUSY Admission，并在 Close 时收敛全部 Command/Admission Task。"
+files = ["src/miniredis/adapters/tcp.py", "src/miniredis/runtime.py"]
+
+[[blocks]]
+id = "pipeline-public-surface"
+title_en = "Pipeline public surface"
+title_zh = "Pipeline 公共接口"
+summary_en = "Expose DirectPipeline through the package while keeping the normal direct-client semantics as its reusable primitive."
+summary_zh = "通过 Package 暴露 DirectPipeline，同时让普通 Direct-client 语义继续作为其可复用原语。"
+files = ["src/miniredis/__init__.py"]

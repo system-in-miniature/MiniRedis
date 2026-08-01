@@ -8,8 +8,8 @@ htmlcov/
 .venv/
 dist/
 build/
+.worktrees/
 data/
 *.aof
 *.snapshot
 *.tmp
-

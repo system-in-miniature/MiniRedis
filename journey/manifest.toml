@@ -1,0 +1,228 @@
+[project]
+name = "MiniRedis"
+package = "miniredis"
+repository_url = "https://github.com/system-in-miniature/mini-redis"
+owned_roots = [
+  "src/miniredis",
+  "examples",
+  "tests/adapters",
+  "tests/concurrency",
+  "tests/contract",
+  "tests/helpers",
+  "tests/interop",
+  "tests/mechanisms",
+  "tests/reliability",
+  "tests/replication",
+  "tests/unit",
+]
+owned_files = ["pyproject.toml", "uv.lock", "tests/__init__.py"]
+
+[[stages]]
+number = 1
+slug = "domain-state"
+endpoint = "f68b061"
+chapter = 2
+tests = ["tests/unit/core/test_domain_types.py"]
+
+[[stages]]
+number = 2
+slug = "typed-commands"
+endpoint = "67f0d73"
+chapter = 2
+tests = ["tests/unit/commands/test_parser.py"]
+
+[[stages]]
+number = 3
+slug = "serialized-direct-executor"
+endpoint = "a5f7a27"
+chapter = 2
+tests = ["tests/concurrency/test_direct_executor.py"]
+
+[[stages]]
+number = 4
+slug = "atomic-strings"
+endpoint = "be7969d"
+chapter = 3
+tests = ["tests/contract/test_strings.py"]
+
+[[stages]]
+number = 5
+slug = "hashes-and-lists"
+endpoint = "eb41b6e"
+chapter = 3
+tests = ["tests/contract/test_hashes.py", "tests/contract/test_lists.py"]
+
+[[stages]]
+number = 6
+slug = "sets-and-sorted-sets"
+endpoint = "79fc734"
+chapter = 3
+tests = ["tests/contract/test_sets.py", "tests/contract/test_sorted_sets.py"]
+
+[[stages]]
+number = 7
+slug = "absolute-ttl"
+endpoint = "ddfd69e"
+chapter = 4
+tests = ["tests/contract/test_ttl.py"]
+
+[[stages]]
+number = 8
+slug = "deterministic-eviction"
+endpoint = "7628635"
+chapter = 5
+tests = ["tests/contract/test_eviction.py", "tests/contract/test_domain_invariants.py"]
+
+[[stages]]
+number = 9
+slug = "request-outcomes"
+endpoint = "319d14a"
+chapter = 2
+tests = ["tests/concurrency/test_request_ownership.py"]
+
+[[stages]]
+number = 10
+slug = "ordered-outbox"
+endpoint = "5436512"
+chapter = 2
+tests = ["tests/unit/core/test_outbound.py", "tests/concurrency/test_slow_endpoint.py"]
+
+[[stages]]
+number = 11
+slug = "blocking-pop-races"
+endpoint = "bb842dd"
+chapter = 9
+tests = ["tests/mechanisms/test_blpop.py", "tests/concurrency/test_blpop_races.py", "tests/mechanisms/test_blpop_push_batch.py"]
+
+[[stages]]
+number = 12
+slug = "pubsub-and-shutdown"
+endpoint = "6ff1e5f"
+chapter = 9
+tests = ["tests/mechanisms/test_pubsub.py", "tests/concurrency/test_shutdown.py", "tests/concurrency/test_async_invariants.py"]
+
+[[stages]]
+number = 13
+slug = "stable-commit-batches"
+endpoint = "5a40b5f"
+chapter = 6
+tests = ["tests/unit/core/test_commit.py"]
+
+[[stages]]
+number = 14
+slug = "framed-persistence-codec"
+endpoint = "633bbe6"
+chapter = 6
+tests = ["tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py"]
+
+[[stages]]
+number = 15
+slug = "aof-commit-barrier"
+endpoint = "b03560a"
+chapter = 6
+tests = ["tests/unit/persistence/test_aof_writer.py", "tests/reliability/test_commit_barrier.py"]
+
+[[stages]]
+number = 16
+slug = "snapshot-recovery"
+endpoint = "b267f92"
+chapter = 7
+tests = ["tests/unit/persistence/test_snapshot_manager.py", "tests/unit/persistence/test_recovery.py", "tests/reliability/test_restart.py"]
+
+[[stages]]
+number = 17
+slug = "asynchronous-replication"
+endpoint = "e18be82"
+chapter = 8
+tests = ["tests/replication/test_sink_attach.py", "tests/replication/test_sink_lag.py", "tests/replication/test_sink_overflow.py"]
+
+[[stages]]
+number = 18
+slug = "promotion-lifecycle"
+endpoint = "0fbaeee"
+chapter = 8
+tests = ["tests/replication/test_promotion.py", "tests/reliability/test_final_acceptance.py", "tests/reliability/test_reliability_shutdown.py"]
+
+[[stages]]
+number = 19
+slug = "resp2-boundary"
+endpoint = "c088652"
+chapter = 10
+tests = ["tests/adapters/test_resp2_decode.py", "tests/adapters/test_resp2_encode.py", "tests/adapters/test_resp2_mapping.py"]
+
+[[stages]]
+number = 20
+slug = "tcp-parity"
+endpoint = "5419f99"
+chapter = 10
+tests = ["tests/adapters/test_tcp_smoke.py", "tests/adapters/test_direct_resp_parity.py", "tests/interop/test_redis_py_resp2.py"]
+
+[[stages]]
+number = 21
+slug = "bulk-and-directional-pop"
+endpoint = "40d00de"
+chapter = 3
+tests = ["tests/contract/test_strings.py", "tests/mechanisms/test_blpop.py"]
+
+[[stages]]
+number = 22
+slug = "ordered-pipelines"
+endpoint = "0016059"
+chapter = 10
+tests = ["tests/adapters/test_direct_pipeline.py", "tests/adapters/test_tcp_async_semantics.py"]
+
+[[stages]]
+number = 23
+slug = "transactions-and-atomics"
+endpoint = "b195a43"
+chapter = 9
+tests = ["tests/mechanisms/test_transactions.py", "tests/mechanisms/test_watch.py", "tests/contract/test_atomic_functions.py"]
+
+[[stages]]
+number = 24
+slug = "decaying-lfu"
+endpoint = "b25b473"
+chapter = 5
+tests = ["tests/unit/core/test_frequency.py", "tests/contract/test_eviction.py"]
+
+[[stages]]
+number = 25
+slug = "aof-state-base"
+endpoint = "b9b363e"
+chapter = 7
+tests = ["tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py", "tests/unit/persistence/test_recovery.py"]
+
+[[stages]]
+number = 26
+slug = "online-aof-rewrite"
+endpoint = "8cd6d5e"
+chapter = 7
+tests = ["tests/unit/persistence/test_aof_writer.py", "tests/reliability/test_aof_rewrite.py"]
+
+[[stages]]
+number = 27
+slug = "replication-backlog"
+endpoint = "e65b568"
+chapter = 8
+tests = ["tests/unit/replication/test_backlog.py", "tests/replication/test_sink_attach.py"]
+
+[[stages]]
+number = 28
+slug = "partial-resynchronization"
+endpoint = "c07182f"
+chapter = 8
+tests = ["tests/replication/test_partial_resync.py", "tests/replication/test_promotion.py"]
+
+[[stages]]
+number = 29
+slug = "primary-owned-expiry"
+endpoint = "94109b0"
+chapter = 8
+tests = ["tests/contract/test_ttl.py", "tests/replication/test_sink_attach.py", "tests/reliability/test_final_acceptance.py"]
+
+[[stages]]
+number = 30
+slug = "public-parity"
+endpoint = "8151fae"
+chapter = 1
+tests = ["tests/reliability/test_final_acceptance.py"]

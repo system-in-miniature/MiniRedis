@@ -1,0 +1,23 @@
+failure_files = [
+  "tests/contract/test_domain_invariants.py",
+  "tests/contract/test_eviction.py",
+]
+
+[[blocks]]
+id = "eviction-planning"
+title_en = "Logical memory and deterministic victims"
+title_zh = "逻辑内存与确定 Victim"
+summary_en = "Project post-commit usage, purge expired entries first, and select exact-LRU victims without mutating live state."
+summary_zh = "投影提交后用量，先清理过期 Entry，再在不修改实时状态的前提下选择精确 LRU Victim。"
+files = ["src/miniredis/core/eviction.py"]
+
+[[blocks]]
+id = "policy-integration"
+title_en = "Policy enforcement and replay visibility"
+title_zh = "Policy 执行与重放可见性"
+summary_en = "Enforce maxmemory after semantic planning and expose logical state only for commit-replay contract evidence."
+summary_zh = "在语义规划后执行 Maxmemory，并仅为 Commit 重放契约暴露逻辑状态。"
+files = [
+  "src/miniredis/core/planner.py",
+  "src/miniredis/runtime.py",
+]

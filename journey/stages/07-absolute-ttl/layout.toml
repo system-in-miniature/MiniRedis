@@ -1,0 +1,40 @@
+failure_files = [
+  "tests/contract/test_ttl.py",
+  "tests/helpers/time.py",
+]
+
+[[blocks]]
+id = "ttl-planning"
+title_en = "Absolute TTL planning"
+title_zh = "绝对 TTL 规划"
+summary_en = "Translate EXPIRE, TTL/PTTL, and PERSIST into absolute deadlines and ordinary commit operations."
+summary_zh = "把 EXPIRE、TTL/PTTL 与 PERSIST 翻译成绝对截止时间和普通提交操作。"
+files = ["src/miniredis/core/ttl_planner.py"]
+
+[[blocks]]
+id = "active-expiry"
+title_en = "Serialized active expiry"
+title_zh = "串行化主动过期"
+summary_en = "Sample bounded TTL keys through the executor mailbox and publish expired deletes through the same commit barrier."
+summary_zh = "通过 Executor Mailbox 有界采样 TTL Key，再经同一 Commit Barrier 发布过期删除。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "ttl-routing-runtime"
+title_en = "TTL routing and injectable time"
+title_zh = "TTL 路由与可注入时间"
+summary_en = "Route typed TTL commands and expose one public construction path that can receive a deterministic clock."
+summary_zh = "路由类型化 TTL 命令，并用单一公开构造路径接收可确定 Clock。"
+files = [
+  "src/miniredis/core/planner.py",
+  "src/miniredis/runtime.py",
+]
+
+[[blocks]]
+id = "test-import-support"
+title_en = "Deterministic test import support"
+title_zh = "确定性测试 Import 支撑"
+summary_en = "Let contract tests import their shared fake clock without treating test-path wiring as a runtime mechanism."
+summary_zh = "让契约测试导入共享 Fake Clock，但不把测试路径接线当作运行时机制。"
+files = ["pyproject.toml"]
+supporting = true

@@ -113,7 +113,7 @@ number = 14
 slug = "framed-persistence-codec"
 endpoint = "633bbe6"
 chapter = 6
-tests = ["tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py"]
+tests = ["tests/unit/persistence/test_codec.py", "tests/unit/persistence/test_framing.py", "tests/unit/persistence/test_aof_repair.py"]
 
 [[stages]]
 number = 15

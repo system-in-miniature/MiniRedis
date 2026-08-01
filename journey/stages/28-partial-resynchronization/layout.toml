@@ -1,0 +1,30 @@
+failure_files = [
+  "tests/reliability/test_restart.py",
+  "tests/replication/test_partial_resync.py",
+  "tests/replication/test_promotion.py",
+  "tests/replication/test_sink_overflow.py",
+]
+
+[[blocks]]
+id = "resume-fencing"
+title_en = "Replica resume fencing"
+title_zh = "Replica Resume Fencing"
+summary_en = "Install source identity with full snapshots, validate identity and exact applied sequence before partial resume, and mint a new identity with an empty backlog on promotion."
+summary_zh = "Full Snapshot 安装时写入 Source Identity，Partial Resume 前校验 Identity 与精确 Applied Sequence，并在 Promotion 时生成新 Identity、清空 Backlog。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "partial-sink"
+title_en = "Catch-up before live streaming"
+title_zh = "Catch-up 先于 Live Streaming"
+summary_en = "Retain a cursor across disconnect, apply the frozen backlog suffix before concurrently queued live batches, detect sequence gaps, and reattach after overflow or source loss."
+summary_zh = "Disconnect 后保留 Cursor，先应用 Frozen Backlog Suffix 再应用并发排队 Live Batch，检测 Sequence Gap，并在 Overflow 或 Source Loss 后重新 Attach。"
+files = ["src/miniredis/replication/sink.py"]
+
+[[blocks]]
+id = "resume-observability"
+title_en = "Resume observability"
+title_zh = "Resume 可观测性"
+summary_en = "Expose retained backlog count and oldest sequence so tests and operators can explain partial versus full fallback."
+summary_zh = "暴露 Retained Backlog Count 与 Oldest Sequence，使测试与 Operator 能解释 Partial 与 Full Fallback。"
+files = ["src/miniredis/runtime.py"]

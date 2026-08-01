@@ -1,0 +1,29 @@
+failure_files = [
+  "tests/helpers/runtime.py",
+  "tests/reliability/test_aof_rewrite.py",
+  "tests/unit/persistence/test_aof_writer.py",
+]
+
+[[blocks]]
+id = "rewrite-writer"
+title_en = "Atomic online AOF rewrite"
+title_zh = "原子 Online AOF Rewrite"
+summary_en = "Write a state-base temp file off the append path, capture every concurrent committed delta in writer order, then fsync, rename, fsync the parent, and swap descriptors."
+summary_zh = "在 Append Path 外写 State-base Temp File，按 Writer Order 捕获每个并发 Committed Delta，再 Fsync、Rename、Fsync Parent 并切换 Descriptor。"
+files = ["src/miniredis/persistence/aof.py"]
+
+[[blocks]]
+id = "rewrite-registration"
+title_en = "Gap-free executor registration"
+title_zh = "无 Capture Gap 的 Executor Registration"
+summary_en = "Capture the checkpoint and register rewrite delta collection in one executor control turn before later commits can interleave."
+summary_zh = "在一个 Executor Control Turn 中 Capture Checkpoint 并注册 Rewrite Delta Collection，之后 Commit 才能插入。"
+files = ["src/miniredis/core/executor.py"]
+
+[[blocks]]
+id = "rewrite-runtime"
+title_en = "Rewrite lifecycle ownership"
+title_zh = "Rewrite Lifecycle Ownership"
+summary_en = "Validate the delta bound, expose one runtime rewrite operation and stats, and distinguish graceful join from crash abort."
+summary_zh = "校验 Delta Bound，暴露一个 Runtime Rewrite Operation 与 Stats，并区分 Graceful Join 和 Crash Abort。"
+files = ["src/miniredis/config.py", "src/miniredis/runtime.py"]

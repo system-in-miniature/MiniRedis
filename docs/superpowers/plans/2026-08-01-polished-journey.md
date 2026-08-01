@@ -69,11 +69,13 @@ The builder must use `src/miniredis`, `examples`, and the declared behavior test
 roots rather than MiniS3 hard-coded paths. It must never require the learner to
 switch branches.
 
-- [ ] **Step 4: Verify all 30 stages in `--check` mode**
+- [ ] **Step 4: Verify builder behavior against temporary fixture chains**
 
-Run: `uv run python journey/tools/build_journey.py --check`
+Run: `uv run pytest -q journey/tools/tests/test_build_journey.py`
 
-Expected: 30 Stage PASS lines followed by guard-chain and goal-parity PASS.
+Expected: clean-chain, coverage-error, missing-test, numbering, and final-parity
+fixtures all pass. The real 30-Stage `--check` runs in Task 3 after its
+canonical Stage artifacts exist.
 
 - [ ] **Step 5: Commit**
 
@@ -109,7 +111,9 @@ Run: `uv run pytest -q journey/tools/tests/test_stage_contracts.py`
 - [ ] **Step 4: Run each batch's cumulative Stage tests**
 
 Run `build_journey.py check N` for every newly authored Stage before moving to
-the next batch.
+the next batch. After Stage 30, run
+`uv run python journey/tools/build_journey.py --check` and require 30 Stage PASS
+lines followed by guard-chain and goal-parity PASS.
 
 - [ ] **Step 5: Commit each authored batch**
 
@@ -242,4 +246,3 @@ Agent usage route.
 Require exact owned-file parity, no generated drift, `git diff --check`, and a
 clean worktree after the final commit. Do not push without explicit user
 authorization.
-

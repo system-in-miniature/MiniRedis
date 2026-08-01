@@ -10,6 +10,23 @@ blocking operations, ordered adapter pipelines, Pub/Sub, persistence, and
 asynchronous replication loss. It is not a production-compatible Redis
 replacement.
 
+## Learn MiniRedis
+
+**[Open the online learning site →](https://system-in-miniature.github.io/mini-redis/)**
+
+MiniRedis is designed to be learned as well as read. Choose the path that
+matches how you want to understand or rebuild the system:
+
+| Learning mode | What it gives you | Start here |
+|---|---|---|
+| Mechanism Tutorial | Understand the completed system through Redis mechanisms, runtime flow, and ownership boundaries. | [Start the tutorial](https://system-in-miniature.github.io/mini-redis/tutorial/) |
+| Self-Guided Rebuild | Rebuild MiniRedis through 30 browser-native Stages with test contracts, grouped diffs, critical statements, and cumulative evidence. | [Start Stage 01](https://system-in-miniature.github.io/mini-redis/journey/) |
+| Agent-Guided Rebuild | Ask Codex to prepare or resume a Stage and guide the implementation interactively. | [Open the usage guide](https://system-in-miniature.github.io/mini-redis/agent-guided/) |
+
+The three modes use the same implementation and mechanism boundaries. Tests
+make failure motivation and completion evidence executable without forcing
+every lesson into a test-first narrative.
+
 ## Why Direct-first
 
 The primary API accepts binary-safe `CommandRequest` values. Direct calls and
@@ -230,22 +247,6 @@ uv run python tools/count_sloc.py
 
 SLOC reports production Python, test Python, and Markdown documentation
 separately. It is reported, never accepted or rejected by a size range.
-
-## Learning modes
-
-1. **[Mechanism Tutorial](docs/tutorial/index.md)** — study the completed system
-   by Redis mechanism and ownership boundary.
-2. **[Self-Guided Rebuild](docs/journey/index.md)** — rebuild the project across
-   30 browser-native Stages with explicit test contracts, grouped mechanism
-   diffs, critical statements, and cumulative evidence.
-3. **[Agent-Guided Rebuild](docs/agent-guided.md)** — open Codex in this
-   repository and say `开始 Agent 带教 Stage NN`; Codex prepares or resumes the
-   correct Stage baseline and guides the implementation interactively.
-
-Tests make failure motivation and completion evidence executable. They do not
-force every lesson into a test-first teaching sequence. The Agent-Guided web
-page is intentionally only a usage guide; the root `AGENTS.md` owns the actual
-interactive teaching contract.
 
 ## Trademark Notice
 

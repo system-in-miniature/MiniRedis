@@ -6,6 +6,20 @@
 
 MiniRedis 是一个紧凑的、受 Redis 启发的参考项目，用于学习类型化内存数据结构、串行化命令原子性、过期、淘汰、阻塞操作、有序适配器流水线、发布/订阅（Pub/Sub）、持久化以及异步复制中的数据丢失。它不是可用于生产环境、与 Redis 兼容的替代品。
 
+## 学习 MiniRedis
+
+**[进入在线学习站点 →](https://system-in-miniature.github.io/mini-redis/zh/)**
+
+MiniRedis 不只是供人阅读的实现，也是一套可以真正走完的学习模型。你可以按自己的目标选择路径：
+
+| 学习模式 | 你会获得什么 | 从这里开始 |
+|---|---|---|
+| 机制教程 | 按 Redis 机制、运行链路与所有权边界理解完成后的系统。 | [开始教程](https://system-in-miniature.github.io/mini-redis/zh/tutorial/) |
+| 自主重建 | 通过 30 个浏览器原生 Stage 重建 MiniRedis，逐步理解测试契约、机制分组、关键语句与累计证据。 | [从 Stage 01 开始](https://system-in-miniature.github.io/mini-redis/zh/journey/) |
+| Agent 带教 | 让 Codex 准备或续接指定 Stage，并互动带你完成实现。 | [查看使用教程](https://system-in-miniature.github.io/mini-redis/zh/agent-guided/) |
+
+三种模式使用同一套实现与机制边界。测试负责把错误动机和完成证据变成可执行契约，但不会强制每一课采用测试优先叙事。
+
 ## 为什么采用 Direct-first
 
 主 API 接受二进制安全的 `CommandRequest` 值。Direct 调用和 RESP2/TCP 调用汇合到同一个解析器、类型化命令模型和串行化执行器；套接字和 RESP 帧并不拥有命令语义。
@@ -171,17 +185,6 @@ uv run python tools/count_sloc.py
 ```
 
 SLOC 分别报告生产 Python、测试 Python 和 Markdown 文档。它只负责报告，绝不会根据规模范围判定接受或拒绝。
-
-## 学习模式
-
-1. **[机制教程](docs/zh/tutorial/index.md)**：按 Redis 机制与所有权边界理解完成后的系统。
-2. **[自主重建](docs/zh/journey/index.md)**：通过 30 个浏览器原生 Stage 重建项目，
-   每个 Stage 都包含明确的测试契约、分组机制差异、关键语句与累计证据。
-3. **[Agent 带教](docs/zh/agent-guided.md)**：在当前仓库打开 Codex，直接说
-   `开始 Agent 带教 Stage NN`；Codex 会自动准备或续接正确的 Stage 基线并互动带完实现。
-
-测试把错误动机与完成证据变成可执行契约，但不强制整套课程采用测试优先叙事。
-Agent 带教网页只提供使用教程；真正的互动教学契约由根目录 `AGENTS.md` 持有。
 
 ## 商标声明
 

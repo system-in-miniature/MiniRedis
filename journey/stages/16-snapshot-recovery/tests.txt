@@ -1,3 +1,4 @@
 tests/unit/persistence/test_snapshot_manager.py
 tests/unit/persistence/test_recovery.py
-tests/reliability/test_restart.py
+tests/unit/persistence/test_corruption.py
+tests/reliability/test_snapshot_barrier.py

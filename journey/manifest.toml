@@ -127,7 +127,7 @@ number = 16
 slug = "snapshot-recovery"
 endpoint = "b267f92"
 chapter = 7
-tests = ["tests/unit/persistence/test_snapshot_manager.py", "tests/unit/persistence/test_recovery.py", "tests/reliability/test_restart.py"]
+tests = ["tests/unit/persistence/test_snapshot_manager.py", "tests/unit/persistence/test_recovery.py", "tests/unit/persistence/test_corruption.py", "tests/reliability/test_snapshot_barrier.py"]
 
 [[stages]]
 number = 17

@@ -204,14 +204,14 @@ number = 27
 slug = "replication-backlog"
 endpoint = "e65b568"
 chapter = 8
-tests = ["tests/unit/replication/test_backlog.py", "tests/replication/test_sink_attach.py"]
+tests = ["tests/replication/test_partial_resync.py", "tests/unit/replication/test_backlog.py"]
 
 [[stages]]
 number = 28
 slug = "partial-resynchronization"
 endpoint = "c07182f"
 chapter = 8
-tests = ["tests/replication/test_partial_resync.py", "tests/replication/test_promotion.py"]
+tests = ["tests/reliability/test_restart.py", "tests/replication/test_partial_resync.py", "tests/replication/test_promotion.py", "tests/replication/test_sink_overflow.py"]
 
 [[stages]]
 number = 29

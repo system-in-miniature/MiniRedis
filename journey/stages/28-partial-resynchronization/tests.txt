@@ -1,2 +1,4 @@
+tests/reliability/test_restart.py
 tests/replication/test_partial_resync.py
 tests/replication/test_promotion.py
+tests/replication/test_sink_overflow.py
